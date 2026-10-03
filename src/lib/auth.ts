@@ -1,8 +1,14 @@
 import { SignJWT, jwtVerify } from "jose";
 import { cookies } from "next/headers";
 
+const configuredJwtSecret = process.env.JWT_SECRET;
+
+if (!configuredJwtSecret && process.env.NODE_ENV === "production") {
+  throw new Error("JWT_SECRET is required in production");
+}
+
 const JWT_SECRET = new TextEncoder().encode(
-  process.env.JWT_SECRET || "super-secret-messenger-key-2024"
+  configuredJwtSecret || "development-only-secret-do-not-use-in-production"
 );
 
 export async function createToken(userId: number, username: string) {
