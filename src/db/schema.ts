@@ -1,0 +1,57 @@
+import {
+  pgTable,
+  serial,
+  text,
+  timestamp,
+  integer,
+  boolean,
+  varchar,
+  bigint,
+} from "drizzle-orm/pg-core";
+
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  username: varchar("username", { length: 50 }).notNull().unique(),
+  displayName: varchar("display_name", { length: 100 }).notNull(),
+  passwordHash: text("password_hash").notNull(),
+  avatarColor: varchar("avatar_color", { length: 7 }).notNull().default("#6C5CE7"),
+  lastSeen: timestamp("last_seen").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const chats = pgTable("chats", {
+  id: serial("id").primaryKey(),
+  name: varchar("name", { length: 100 }),
+  isGroup: boolean("is_group").notNull().default(false),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const chatMembers = pgTable("chat_members", {
+  id: serial("id").primaryKey(),
+  chatId: integer("chat_id")
+    .references(() => chats.id, { onDelete: "cascade" })
+    .notNull(),
+  userId: integer("user_id")
+    .references(() => users.id, { onDelete: "cascade" })
+    .notNull(),
+  joinedAt: timestamp("joined_at").defaultNow().notNull(),
+});
+
+export const messages = pgTable("messages", {
+  id: serial("id").primaryKey(),
+  chatId: integer("chat_id")
+    .references(() => chats.id, { onDelete: "cascade" })
+    .notNull(),
+  senderId: integer("sender_id")
+    .references(() => users.id, { onDelete: "cascade" })
+    .notNull(),
+  content: text("content"),
+  messageType: varchar("message_type", { length: 20 }).notNull().default("text"),
+  // Telegram file storage
+  telegramFileId: text("telegram_file_id"),
+  fileName: varchar("file_name", { length: 500 }),
+  fileSize: bigint("file_size", { mode: "number" }),
+  mimeType: varchar("mime_type", { length: 200 }),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
