@@ -67,6 +67,27 @@ export function isMatrixConfigured(): boolean {
   }
 }
 
+/** A secret-free probe for the app host's configured Synapse client API. */
+export async function getMatrixHealthStatus(): Promise<"ok" | "not_configured" | "unavailable"> {
+  let config: MatrixConfig | null;
+  try {
+    config = getMatrixConfig();
+  } catch {
+    return "unavailable";
+  }
+  if (!config) return "not_configured";
+
+  try {
+    const response = await fetch(`${config.internalUrl}/_matrix/client/versions`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(3_000),
+    });
+    return response.ok ? "ok" : "unavailable";
+  } catch {
+    return "unavailable";
+  }
+}
+
 export function getMatrixUserId(appUserId: number): string | null {
   try {
     const config = getMatrixConfig();

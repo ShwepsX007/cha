@@ -83,7 +83,15 @@ export default function ChatSidebar({
                 className={`mt-1 text-[10px] leading-tight ${
                   matrixState === "connected" ? "text-amber-400" : "text-gray-500"
                 }`}
-                title="E2EE пока не включено для отправки новых личных сообщений"
+                title={
+                  matrixState === "unavailable"
+                    ? user.matrixSession
+                      ? "Matrix-сессия есть, но синхронизация не прошла. Проверьте подключение; если не поможет, выйдите и войдите снова. Не очищайте данные сайта: там хранятся ключи устройства."
+                      : "В этой вкладке нет Matrix-сессии. Выйдите из аккаунта и войдите снова, чтобы восстановить её. Не очищайте данные сайта: там хранятся ключи устройства."
+                    : matrixState === "not_configured"
+                      ? "На сервере не настроен Matrix; личные чаты E2EE недоступны."
+                      : "E2EE пока не включено для отправки новых личных сообщений"
+                }
               >
                 {matrixState === "connected"
                   ? "Matrix подключён · E2EE активно в личных чатах"
@@ -91,7 +99,9 @@ export default function ChatSidebar({
                     ? "Проверка Matrix…"
                     : matrixState === "not_configured"
                       ? "E2EE не настроено на сервере"
-                      : "Matrix недоступен · E2EE выключено"}
+                      : !user.matrixSession
+                        ? "Нет Matrix-сессии · выйдите и войдите снова"
+                        : "Matrix не синхронизируется · выйдите и войдите снова"}
               </div>
             </div>
           </div>

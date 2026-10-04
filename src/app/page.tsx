@@ -44,9 +44,11 @@ export default function Home() {
           }
 
           const storedAvailability = sessionStorage.getItem("chata_matrix_availability");
-          const matrixAvailability = storedAvailability === "ready" || storedAvailability === "not_configured"
-            ? storedAvailability
-            : "unavailable";
+          const matrixAvailability = storedAvailability === "not_configured"
+            ? "not_configured"
+            : matrixSession && storedAvailability === "ready"
+              ? "ready"
+              : "unavailable";
           setUser({ ...data.user, matrixSession, matrixAvailability });
         }
       })

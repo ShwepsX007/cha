@@ -63,9 +63,9 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
   const [matrixState, setMatrixState] = useState<"checking" | "connected" | "not_configured" | "unavailable">(
     user.matrixSession
       ? "checking"
-      : user.matrixAvailability === "ready"
-        ? "connected"
-        : user.matrixAvailability || "not_configured",
+      : user.matrixAvailability === "not_configured"
+        ? "not_configured"
+        : "unavailable",
   );
   const [selectedChatId, setSelectedChatId] = useState<number | null>(null);
   const [showSidebar, setShowSidebar] = useState(true);
@@ -90,8 +90,9 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
       .then(() => {
         if (!cancelled) setMatrixState("connected");
       })
-      .catch(() => {
-        console.error("Matrix client unavailable");
+      .catch((error) => {
+        const detail = error instanceof Error ? `${error.name}: ${error.message}` : "Unknown Matrix sync error";
+        console.error("Matrix client unavailable:", detail);
         if (!cancelled) setMatrixState("unavailable");
       });
 
