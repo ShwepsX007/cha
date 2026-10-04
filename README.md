@@ -63,8 +63,14 @@ curl -fsS http://127.0.0.1:8010/api/health
 ```
 
 `ecosystem.config.cjs` запускает `next start --hostname 127.0.0.1 --port 8010`
-(правильно для nginx-прокси). Чтобы слушать все интерфейсы:
-`HOSTNAME=0.0.0.0 PORT=8010 npx pm2 start ecosystem.config.cjs --update-env`.
+(правильно для nginx-прокси). **Не передавайте адрес и порт позиционными
+аргументами** (`next start 127.0.0.1 8010`): Next воспримет первый аргумент как
+путь к каталогу проекта и завершится с `Invalid project directory`.
+Параметры передаются только флагами `--hostname` и `--port`.
+
+Чтобы слушать все интерфейсы напрямую (не рекомендуется без firewall/TLS):
+`CHATA_HOSTNAME=0.0.0.0 PORT=8010 npx pm2 start ecosystem.config.cjs --update-env`.
+Используется именно `CHATA_HOSTNAME`, а не системная переменная `HOSTNAME`.
 
 Пример nginx-прокси (TLS завершается на nginx):
 
@@ -125,6 +131,10 @@ SMOKE_ALLOW_WRITES=1 npm run smoke   # + регистрация, сообщен�
 перезапуск pm2 → health check).
 
 ## Диагностика
+
+| Сообщение в `pm2 logs` | Причина и исправление |
+|---|---|
+| `Invalid project directory provided, no such directory: .../127.0.0.1` и в `pm2-out.log` строка `next start 127.0.0.1 8010` | Неверные позиционные аргументы; остановите старый процесс (`pm2 delete chata`) и запустите `pm2 start ecosystem.config.cjs --update-env`. Без ecosystem-конфига: `npm run start -- --hostname 127.0.0.1 --port 8010`. |
 
 | Симптом | Причина и решение |
 |---|---|

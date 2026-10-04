@@ -7,9 +7,12 @@
  *
  * The app binds to 127.0.0.1 by default, which is correct when nginx (or
  * another reverse proxy) terminates TLS and proxies to it. To serve the app
- * directly, start pm2 with HOSTNAME=0.0.0.0.
+ * directly, start pm2 with CHATA_HOSTNAME=0.0.0.0.
  */
-const hostname = process.env.HOSTNAME || "127.0.0.1";
+// Do not use the generic HOSTNAME environment variable here: Linux/systemd
+// commonly sets it to the machine name, which is not necessarily a bindable
+// interface. Use an app-specific override and default to loopback for nginx.
+const hostname = process.env.CHATA_HOSTNAME || "127.0.0.1";
 const port = process.env.PORT || "8010";
 
 module.exports = {

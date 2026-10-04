@@ -27,8 +27,11 @@ echo "==> Building the production bundle"
 npm run build
 
 if command -v pm2 >/dev/null 2>&1; then
-  echo "==> Reloading pm2 process"
-  pm2 startOrReload ecosystem.config.cjs --update-env
+  echo "==> Replacing pm2 process with the repository configuration"
+  # Remove stale CLI arguments (for example `next start 127.0.0.1 8010`)
+  # before registering the known-good ecosystem config.
+  pm2 delete chata >/dev/null 2>&1 || true
+  pm2 start ecosystem.config.cjs --update-env
   pm2 save
   HOSTPORT="${PORT:-8010}"
   echo "==> Health check"
