@@ -166,7 +166,27 @@ export async function ensureMatrixIdentity(
 interface MatrixStateEvent {
   type?: string;
   state_key?: string;
+  sender?: string;
   content?: Record<string, unknown>;
+}
+
+function hasImplicitCreatorPower(event: MatrixStateEvent | undefined, userId: string): boolean {
+  const roomVersion = event?.content?.room_version;
+  if (typeof roomVersion !== "string" || !/^\d+$/.test(roomVersion) || Number(roomVersion) < 12) {
+    return false;
+  }
+
+  const additionalCreators = event?.content?.additional_creators;
+  return event?.sender === userId ||
+    (Array.isArray(additionalCreators) && additionalCreators.includes(userId));
+}
+
+function isValidMatrixRoomId(roomId: string): boolean {
+  if (roomId.length > 255) return false;
+
+  // Room versions 1–11 use !opaque:server IDs; v12+ uses the create-event
+  // hash with a ! sigil and no server-name suffix.
+  return /^![^:]+:.+$/.test(roomId) || /^![A-Za-z0-9_-]+$/.test(roomId);
 }
 
 export async function verifyEncryptedRoom(input: {
@@ -178,7 +198,7 @@ export async function verifyEncryptedRoom(input: {
 }): Promise<void> {
   const config = getMatrixConfig();
   if (!config) throw new Error("Matrix is not configured");
-  if (!/^![^:]+:.+$/.test(input.roomId) || input.roomId.length > 255) {
+  if (!isValidMatrixRoomId(input.roomId)) {
     throw new Error("Invalid Matrix room ID");
   }
   if (!input.accessToken || input.accessToken.length > 8192) {
@@ -207,11 +227,15 @@ export async function verifyEncryptedRoom(input: {
 
   const state = (await stateResponse.json()) as MatrixStateEvent[];
   const findState = (type: string) => state.find((event) => event.type === type && (event.state_key || "") === "");
+  const createEvent = findState("m.room.create");
   const encryption = findState("m.room.encryption")?.content;
   const joinRules = findState("m.room.join_rules")?.content;
   const historyVisibility = findState("m.room.history_visibility")?.content;
   const powerLevels = findState("m.room.power_levels")?.content;
 
+  if (!createEvent || createEvent.sender !== creatorMxid) {
+    throw new Error("Matrix room creator does not match the app chat creator");
+  }
   if (encryption?.algorithm !== "m.megolm.v1.aes-sha2") {
     throw new Error("Matrix room is not end-to-end encrypted");
   }
@@ -223,9 +247,13 @@ export async function verifyEncryptedRoom(input: {
   const users = (powerLevels.users as Record<string, number> | undefined) || {};
   const eventLevels = (powerLevels.events as Record<string, number> | undefined) || {};
   const usersDefault = Number(powerLevels.users_default ?? 0);
-  const creatorLevel = Number(users[creatorMxid] ?? usersDefault);
-  const authenticatedLevel = Number(users[authenticatedMxid] ?? usersDefault);
   const inviteLevel = Number(powerLevels.invite ?? 0);
+  const creatorLevel = hasImplicitCreatorPower(createEvent, creatorMxid)
+    ? inviteLevel
+    : Number(users[creatorMxid] ?? usersDefault);
+  const authenticatedLevel = hasImplicitCreatorPower(createEvent, authenticatedMxid)
+    ? inviteLevel
+    : Number(users[authenticatedMxid] ?? usersDefault);
   const stateDefault = Number(powerLevels.state_default ?? 50);
   const powerLevelsStateLevel = Number(eventLevels["m.room.power_levels"] ?? stateDefault);
   if (
@@ -279,7 +307,7 @@ export async function inviteMatrixUserToRoom(
 ): Promise<void> {
   const config = getMatrixConfig();
   if (!config) throw new Error("Matrix is not configured");
-  if (!/^![^:]+:.+$/.test(roomId) || roomId.length > 255) {
+  if (!isValidMatrixRoomId(roomId)) {
     throw new Error("Invalid Matrix room ID");
   }
 

@@ -1,8 +1,10 @@
 # Matrix E2EE rollout
 
-## Current status — code implemented, deployment still required
+## Current status — production homeserver configured; app fix needs rollout
 
-The app now has a Matrix client/authentication path, encrypted-room creation and verification, encrypted text messaging, encrypted attachment handling, device verification/recovery UI, and fail-closed behavior for private chats. The production homeserver is **not deployed or configured yet**, so E2EE is **not active on the live app** until Synapse and the required environment variables are set and end-to-end tests pass.
+The production Synapse homeserver and server-side Matrix settings are configured, and the `chata` app process has been restarted with them. Room creation exposed a compatibility issue with Synapse 1.162 using Matrix room version 12: the old app code explicitly listed the creator in `m.room.power_levels.users`, which v12 forbids. The code update now omits that entry, recognizes v12 implicit creator power, and accepts v12's hash-based room IDs. Deploy this update and complete the end-to-end checks below before treating E2EE as verified on the live app.
+
+The app has a Matrix client/authentication path, encrypted-room creation and verification, encrypted text messaging, encrypted attachment handling, device verification/recovery UI, and fail-closed behavior for private chats.
 
 What is implemented in the code:
 
@@ -17,10 +19,10 @@ What is implemented in the code:
 - The **Устройства и ключи Matrix** panel uses `matrix-js-sdk` QR verification plus `@zxing/browser` scanning: the new device requests verification, the already trusted device accepts and displays the SDK-generated QR, the new device scans it, and the trusted device explicitly confirms the scan. The Matrix Rust SDK performs the cross-signing/secret-sharing protocol; the app does not encode keys or invent its own crypto.
 - The same panel can initialize Matrix cross-signing, secret storage and a room-key backup, then show the Matrix recovery key once for the user to save. A recovery-key form can restore stored cross-signing secrets and a trusted key backup; QR pairing can also request restoration of a backup shared from the trusted device. Recovery keys stay in memory only during use and are not put in PostgreSQL, localStorage or sessionStorage.
 
-Still not deployed or verified against a live homeserver:
+Still to complete against the live homeserver:
 
-- Synapse deployment, reverse proxy, and production environment configuration.
-- Two-account/two-device acceptance tests against a real homeserver, including QR verification and recovery, and verifying that a newly invited group member cannot decrypt pre-join history. The SDK QR/backup flow has only been wired into the app; Synapse behavior must be tested before production use.
+- Deploy this room-version-12 compatibility update before retrying encrypted-room creation.
+- Run two-account/two-device acceptance tests, including QR verification and recovery, and verify that a newly invited group member cannot decrypt pre-join history. The SDK QR/backup flow has been wired into the app, but Synapse behavior must be tested before production use.
 
 ## Agreed product behavior
 
@@ -75,7 +77,7 @@ Back up the chat database first. The schema change is represented in `src/db/sch
 
 1. Deploy Synapse, configure the reverse proxy and server-only variables, then confirm the Matrix client API and Synapse admin API are reachable from the app host.
 2. Apply the chat-app database schema update and deploy the app. Until this step is complete, the app UI reports Matrix unavailable/not configured; private chat sending remains blocked rather than falling back to plaintext.
-3. Test with two separate app accounts: create a direct chat and a private group, inspect the Matrix room's `m.room.encryption`, `m.room.join_rules`, `m.room.history_visibility`, and power levels, and confirm new text is readable by members but absent from PostgreSQL.
+3. Test with two separate app accounts: create a direct chat and a private group, inspect the Matrix room's `m.room.encryption`, `m.room.join_rules`, `m.room.history_visibility`, and power levels, and confirm new text is readable by members but absent from PostgreSQL. For room version 12, the creator must not appear in the power-level `users` map but must retain effective creator permissions; also confirm the app accepts the hash-based room ID.
 4. Upload a harmless test file in a private room. Verify Telegram receives only an opaque, randomly named binary document; verify original filename/MIME/size and decryption information are only present after decrypting the Matrix event; then download/decrypt on the other account.
 5. In a group, invite a third account. Confirm a regular member cannot invite. Confirm the newly added member can read messages sent after joining but cannot decrypt earlier group messages.
 6. Verify old PostgreSQL messages/files remain readable and visibly labeled legacy. Verify `Общий чат` continues to send/read plaintext messages and files.

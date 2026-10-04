@@ -411,7 +411,9 @@ export async function createEncryptedRoom(
       },
     ],
     power_level_content_override: {
-      users: { [session.userId]: 100 },
+      // The homeserver grants the creator the default power in older room
+      // versions, and room version 12+ makes creator power implicit. Never put
+      // the creator in `users`: Synapse rejects that for room version 12.
       users_default: 0,
       invite: 50,
       kick: 50,
@@ -506,9 +508,28 @@ export async function hasMatrixInvitePermission(
   const powerEvent = room.currentState.getStateEvents(EventType.RoomPowerLevels, "");
   const power = powerEvent?.getContent<Record<string, unknown>>();
   if (!power) return false;
+
   const users = (power.users as Record<string, number> | undefined) || {};
-  const userLevel = users[session.userId] ?? Number(power.users_default || 0);
+  const userLevelFromEvent = users[session.userId] ?? Number(power.users_default || 0);
   const inviteLevel = Number(power.invite ?? 0);
+  const createEvent = room.currentState.getStateEvents("m.room.create", "");
+  const createContent = createEvent?.getContent<Record<string, unknown>>();
+  const roomVersionValue = createContent?.room_version;
+  const roomVersion = typeof roomVersionValue === "string" && /^\d+$/.test(roomVersionValue)
+    ? Number(roomVersionValue)
+    : Number.NaN;
+  const additionalCreators = createContent?.additional_creators;
+  const isImplicitRoomCreator =
+    Number.isInteger(roomVersion) &&
+    roomVersion >= 12 &&
+    (
+      createEvent?.getSender() === session.userId ||
+      (Array.isArray(additionalCreators) && additionalCreators.includes(session.userId))
+    );
+
+  // In room version 12 and later, creators have infinite power and are
+  // intentionally absent from m.room.power_levels.users.
+  const userLevel = isImplicitRoomCreator ? inviteLevel : userLevelFromEvent;
   return inviteLevel >= 50 && userLevel >= inviteLevel;
 }
 
