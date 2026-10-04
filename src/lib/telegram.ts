@@ -1,6 +1,3 @@
-import { randomBytes } from "node:crypto";
-import { writeFile, mkdir, unlink } from "node:fs/promises";
-import { join } from "node:path";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim() || "";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID?.trim() || "";
@@ -117,25 +114,4 @@ export async function getFileFromTelegram(fileId: string): Promise<TelegramFileR
     buffer,
     fileSize: data.result.file_size,
   };
-}
-
-/** Minimal local-file helper for small server-written assets like avatars. */
-export async function saveLocalBuffer(relativeDir: string, fileName: string, buffer: Buffer): Promise<string> {
-  const absDir = join(process.cwd(), "public", relativeDir);
-  await mkdir(absDir, { recursive: true });
-  const uniqueName = `${randomBytes(6).toString("hex")}-${Date.now()}-${sanitizeName(fileName, "asset")}`;
-  const absPath = join(absDir, uniqueName);
-  await writeFile(absPath, buffer);
-  return `/${relativeDir}/${uniqueName}`;
-}
-
-export async function removeLocalFile(publicPath?: string | null): Promise<void> {
-  if (!publicPath || typeof publicPath !== "string" || !publicPath.startsWith("/")) return;
-  const absPath = join(process.cwd(), "public", publicPath);
-  if (!absPath.startsWith(join(process.cwd(), "public"))) return;
-  try {
-    await unlink(absPath);
-  } catch {
-    // File may already be gone; that is fine.
-  }
 }

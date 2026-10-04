@@ -53,7 +53,10 @@ export async function GET() {
         bannedUntil: user.bannedUntil instanceof Date ? user.bannedUntil.toISOString() : user.bannedUntil ?? null,
       },
     });
-  } catch {
-    return NextResponse.json({ user: null }, { status: 401 });
+  } catch (error) {
+    // Do not report infrastructure failures as "not logged in": that silently
+    // logs everyone out on a database hiccup and hides the real problem.
+    console.error("Session check failed:", error);
+    return NextResponse.json({ error: "Session check failed" }, { status: 500 });
   }
 }

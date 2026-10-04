@@ -9,4 +9,13 @@ coverage/
 .env*
 !.env.example
 
+# Runtime data: uploaded avatars and other local storage (see UPLOAD_DIR).
+.data/
+logs/
+
+# User uploads must never be committed; the folder itself is kept via .gitkeep.
+public/avatars/*
+!public/avatars/.gitkeep
+
 npm-debug.log*
+.tmp-pg/

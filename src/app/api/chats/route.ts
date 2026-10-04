@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { chats, chatMembers, users, messages } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { verifyEncryptedRoom } from "@/lib/matrix/server";
+import { ensureGeneralChatMembership, GENERAL_CHAT_NAME } from "@/lib/chats";
 import { eq, and, desc, inArray, sql } from "drizzle-orm";
 
 export async function GET() {
@@ -12,20 +13,34 @@ export async function GET() {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const memberRows = await db
-      .select({ chatId: chatMembers.chatId })
-      .from(chatMembers)
-      .where(eq(chatMembers.userId, payload.userId));
+    const loadMemberships = async () => {
+      const rows = await db
+        .select({ chatId: chatMembers.chatId })
+        .from(chatMembers)
+        .where(eq(chatMembers.userId, payload.userId));
+      const ids = rows.map((r) => r.chatId);
+      const list = ids.length
+        ? await db.select().from(chats).where(inArray(chats.id, ids))
+        : [];
+      return { ids, list };
+    };
 
-    const chatIds = memberRows.map((r) => r.chatId);
+    let { ids: chatIds, list: chatList } = await loadMemberships();
+
+    // Accounts that lost their membership (deleted chat, admin wipe, manual
+    // cleanup in the database) used to be stuck with an empty chat list
+    // forever: only registration could join the public chat. Restore it.
+    const hasGeneralChat = chatList.some(
+      (chat) => chat.isGroup && chat.securityMode === "public" && chat.name === GENERAL_CHAT_NAME,
+    );
+    if (!hasGeneralChat) {
+      await ensureGeneralChatMembership(payload.userId);
+      ({ ids: chatIds, list: chatList } = await loadMemberships());
+    }
+
     if (chatIds.length === 0) {
       return NextResponse.json({ chats: [] });
     }
-
-    const chatList = await db
-      .select()
-      .from(chats)
-      .where(inArray(chats.id, chatIds));
 
     const result = await Promise.all(
       chatList.map(async (chat) => {

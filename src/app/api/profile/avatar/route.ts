@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { users } from "@/db/schema";
 import { requireProfile } from "@/lib/profile";
-import { removeLocalFile, saveLocalBuffer } from "@/lib/telegram";
+import { removeAvatarFile, saveAvatarFile } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
 
@@ -34,11 +34,11 @@ export async function POST(req: NextRequest) {
 
     const processed = await parseAvatar(file);
     const previousAvatar = auth.user.avatarUrl;
-    const avatarUrl = await saveLocalBuffer("avatars", `${auth.user.id}-${randomBytes(4).toString("hex")}.webp`, processed);
+    const avatarUrl = await saveAvatarFile(`${auth.user.id}-${randomBytes(4).toString("hex")}.webp`, processed);
 
     const now = new Date();
     await db.update(users).set({ avatarUrl, avatarUpdatedAt: now }).where(eq(users.id, auth.user.id));
-    if (previousAvatar) await removeLocalFile(previousAvatar);
+    if (previousAvatar) await removeAvatarFile(previousAvatar);
 
     return NextResponse.json({ avatarUrl, avatarUpdatedAt: now.toISOString() }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
@@ -54,7 +54,7 @@ export async function DELETE() {
     const previousAvatar = auth.user.avatarUrl;
     const now = new Date();
     await db.update(users).set({ avatarUrl: null, avatarUpdatedAt: now }).where(eq(users.id, auth.user.id));
-    if (previousAvatar) await removeLocalFile(previousAvatar);
+    if (previousAvatar) await removeAvatarFile(previousAvatar);
     return NextResponse.json({ avatarUrl: null, avatarUpdatedAt: now.toISOString() }, { headers: { "Cache-Control": "no-store" } });
   } catch {
     return NextResponse.json({ error: "Не удалось удалить аватарку" }, { status: 500 });
