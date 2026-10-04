@@ -11,10 +11,12 @@ interface User {
   displayName: string;
   avatarColor?: string;
   avatarUrl?: string | null;
+  avatarUpdatedAt?: string | null;
   role?: "user" | "admin";
   bannedUntil?: string | null;
   banReason?: string | null;
   matrixResetRequired?: boolean;
+  pushEnabled?: boolean;
   matrixAvailability?: MatrixAvailability;
   matrixSession?: MatrixSession | null;
   initialRecoveryKey?: string | null;

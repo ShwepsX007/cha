@@ -25,6 +25,7 @@ export const users = pgTable("users", {
   matrixResetRequired: boolean("matrix_reset_required").notNull().default(false),
   avatarColor: varchar("avatar_color", { length: 7 }).notNull().default("#6C5CE7"),
   avatarUrl: text("avatar_url"),
+  avatarUpdatedAt: timestamp("avatar_updated_at", { withTimezone: true }),
   lastSeen: timestamp("last_seen").defaultNow(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
@@ -78,5 +79,29 @@ export const messages = pgTable("messages", {
   fileName: varchar("file_name", { length: 500 }),
   fileSize: bigint("file_size", { mode: "number" }),
   mimeType: varchar("mime_type", { length: 200 }),
+  deliveryStatus: varchar("delivery_status", { length: 20 }).notNull().default("sent"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const messageReceipts = pgTable("message_receipts", {
+  id: serial("id").primaryKey(),
+  messageId: integer("message_id")
+    .references(() => messages.id, { onDelete: "cascade" })
+    .notNull(),
+  userId: integer("user_id")
+    .references(() => users.id, { onDelete: "cascade" })
+    .notNull(),
+  status: varchar("status", { length: 20 }).notNull().default("delivered"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const pushSubscriptions = pgTable("push_subscriptions", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id")
+    .references(() => users.id, { onDelete: "cascade" })
+    .notNull(),
+  endpoint: text("endpoint").notNull().unique(),
+  p256dh: text("p256dh").notNull(),
+  auth: text("auth").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });

@@ -109,6 +109,7 @@ export async function POST(req: NextRequest) {
         displayName: user.displayName,
         avatarColor: user.avatarColor,
         avatarUrl: user.avatarUrl,
+        avatarUpdatedAt: null,
         role: user.role,
         bannedUntil: user.bannedUntil,
         banReason: user.banReason,

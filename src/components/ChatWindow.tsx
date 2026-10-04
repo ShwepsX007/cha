@@ -20,6 +20,9 @@ import {
 } from "@/lib/matrix/client";
 import AddGroupMembersModal from "./AddGroupMembersModal";
 import Avatar from "./Avatar";
+import MessageStatus from "./MessageStatus";
+
+type ReceiptMap = Record<number | string, { status: "sent" | "delivered" | "read" }>;
 
 function formatTime(dateStr: string) {
   return new Date(dateStr).toLocaleTimeString("ru-RU", {
@@ -78,10 +81,14 @@ function MessageBubble({
   msg,
   isOwn,
   onRetry,
+  registerRef,
+  status,
 }: {
   msg: ChatMessage;
   isOwn: boolean;
   onRetry?: (message: ChatMessage) => void;
+  registerRef?: (id: number | string, el: HTMLDivElement | null) => void;
+  status?: ChatMessage["deliveryStatus"];
 }) {
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState("");
@@ -219,10 +226,13 @@ function MessageBubble({
   };
 
   return (
-    <div className={`flex ${isOwn ? "justify-end" : "justify-start"} mb-3`}>
+    <div
+      className={`mb-3 flex ${isOwn ? "justify-end" : "justify-start"}`}
+      ref={(el) => registerRef?.(msg.id, el)}
+    >
       <div className={`max-w-[75%] ${isOwn ? "order-1" : ""}`}>
         {!isOwn && (
-          <div className="flex items-center gap-2 mb-1">
+          <div className="mb-1 flex items-center gap-2">
             <Avatar src={msg.senderAvatarUrl} name={msg.senderDisplayName} color={msg.senderAvatarColor} size={24} initialsClassName="text-[10px]" />
             <span className="text-xs font-medium" style={{ color: msg.senderAvatarColor }}>
               {msg.senderDisplayName}
@@ -237,7 +247,7 @@ function MessageBubble({
           }`}
         >
           {msg.isLegacy && (
-            <div className="text-[9px] uppercase tracking-wide text-amber-300/80 mb-1">
+            <div className="mb-1 text-[9px] uppercase tracking-wide text-amber-300/80">
               Legacy · не зашифровано
             </div>
           )}
@@ -248,25 +258,14 @@ function MessageBubble({
             <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
           )}
           <div
-            className={`text-[10px] mt-1 flex items-center gap-1 justify-end ${
+            className={`mt-1 flex items-center justify-end gap-1 text-[10px] ${
               isOwn ? "text-purple-200" : "text-gray-500"
             }`}
           >
             {formatTime(msg.createdAt)}
-            {isOwn && msg.deliveryStatus === "sending" && (
-              <span title="Отправка" aria-label="Отправка" className="inline-flex h-3.5 w-3.5 items-center justify-center text-xs">◷</span>
-            )}
-            {isOwn && (!msg.deliveryStatus || msg.deliveryStatus === "sent") && (
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <title>Отправлено</title>
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-              </svg>
-            )}
-            {isOwn && msg.deliveryStatus === "error" && (
-              <span title={msg.deliveryError || "Не отправлено"} aria-label="Ошибка отправки" className="inline-flex h-3.5 w-3.5 items-center justify-center rounded-full bg-red-500 text-[10px] font-bold text-white">!</span>
-            )}
+            {isOwn && <MessageStatus status={status} />}
           </div>
-          {isOwn && msg.deliveryStatus === "error" && (
+          {isOwn && status === "error" && (
             <div className="mt-1 flex flex-wrap items-center justify-end gap-2 text-[10px]">
               <span className="max-w-56 truncate text-red-200" title={msg.deliveryError}>{msg.deliveryError || "Не отправлено"}</span>
               {onRetry && msg.outboxId && (
@@ -307,6 +306,10 @@ export default function ChatWindow({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const prevMsgCountRef = useRef(0);
   const initialLoadRef = useRef(true);
+  const reportedReadRef = useRef<Set<number | string>>(new Set());
+  const reportedDeliveredRef = useRef<Set<number | string>>(new Set());
+  const [receipts, setReceipts] = useState<ReceiptMap>({});
+  const messageElsRef = useRef<Map<number | string, HTMLElement>>(new Map());
   const [banUntil, setBanUntil] = useState<string | null>(currentUser.bannedUntil ?? null);
   const [banReason, setBanReason] = useState<string | null>(currentUser.banReason ?? null);
   const [banNow, setBanNow] = useState(() => Date.now());
@@ -419,7 +422,122 @@ export default function ChatWindow({
 
   useEffect(() => {
     initialLoadRef.current = true;
+    reportedReadRef.current = new Set();
+    reportedDeliveredRef.current = new Set();
+    setReceipts({});
+    messageElsRef.current = new Map();
   }, [chat.id]);
+
+  const sendReceipts = useCallback(async (messageIds: Array<number | string>, status: "delivered" | "read") => {
+    if (chat.securityMode !== "public") return; // receipts for E2EE chats come from Matrix natively
+    const numericIds = messageIds.filter((id): id is number => typeof id === "number" && Number.isInteger(id));
+    if (!numericIds.length) return;
+    try {
+      await fetch(`/api/messages/${chat.id}/receipts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messageIds: numericIds, status }),
+      });
+    } catch {
+      /* ignore */
+    }
+  }, [chat.id, chat.securityMode]);
+
+  // On initial messages load, mark other users' messages as delivered.
+  useEffect(() => {
+    if (messages.length === 0) return;
+    const pending: number[] = [];
+    for (const msg of messages) {
+      if (msg.senderId === currentUser.id) continue;
+      if (typeof msg.id !== "number") continue;
+      if (reportedDeliveredRef.current.has(msg.id)) continue;
+      reportedDeliveredRef.current.add(msg.id);
+      pending.push(msg.id);
+    }
+    if (pending.length) void sendReceipts(pending, "delivered");
+  }, [messages, currentUser.id, sendReceipts]);
+
+  // Poll receipts every few seconds so we can upgrade sent→delivered→read.
+  useEffect(() => {
+    if (chat.securityMode !== "public") return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await fetch(`/api/messages/${chat.id}/receipts`, { cache: "no-store" });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled || !data.receipts) return;
+        setReceipts((prev) => ({ ...prev, ...data.receipts }));
+      } catch {
+        /* ignore */
+      }
+    };
+    void load();
+    const interval = window.setInterval(load, 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [chat.id, chat.securityMode]);
+
+  // IntersectionObserver: when a message becomes > 60% visible for 400ms, mark it read.
+  useEffect(() => {
+    if (chat.securityMode !== "public") return;
+    const observer = new IntersectionObserver((entries) => {
+      const visibleIds: number[] = [];
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const idAttr = (entry.target as HTMLElement).dataset.messageId;
+        if (!idAttr) continue;
+        const id = Number(idAttr);
+        if (!Number.isInteger(id)) continue;
+        if (reportedReadRef.current.has(id)) continue;
+        reportedReadRef.current.add(id);
+        visibleIds.push(id);
+      }
+      if (visibleIds.length) void sendReceipts(visibleIds, "read");
+    }, { root: messagesContainerRef.current, threshold: [0.6] });
+
+    const nodes = messageElsRef.current;
+    // Observe all currently registered messages.
+    nodes.forEach((el) => observer.observe(el));
+
+    // Use a MutationObserver to attach to freshly rendered message nodes.
+    const container = messagesContainerRef.current;
+    if (!container) return () => observer.disconnect();
+    const mo = new MutationObserver(() => {
+      nodes.forEach((el, id) => {
+        if (!el.isConnected) { nodes.delete(id); return; }
+        // IntersectionObserver ignores duplicates safely.
+        observer.observe(el);
+      });
+    });
+    mo.observe(container, { childList: true, subtree: true });
+    return () => {
+      mo.disconnect();
+      observer.disconnect();
+    };
+  }, [chat.id, chat.securityMode, messages.length, sendReceipts]);
+
+  const registerMessageEl = useCallback((id: number | string, el: HTMLElement | null) => {
+    if (!el) {
+      messageElsRef.current.delete(id);
+      return;
+    }
+    el.dataset.messageId = String(id);
+    messageElsRef.current.set(id, el);
+  }, []);
+
+  const getMessageStatus = useCallback((msg: ChatMessage): ChatMessage["deliveryStatus"] => {
+    if (msg.deliveryStatus === "sending" || msg.deliveryStatus === "error") return msg.deliveryStatus;
+    if (msg.senderId !== currentUser.id) return undefined;
+    // For own messages, look up aggregated receipt state.
+    if (typeof msg.id === "number") {
+      const r = receipts[msg.id];
+      if (r) return r.status;
+    }
+    return msg.deliveryStatus || "sent";
+  }, [currentUser.id, receipts]);
 
   const prepareEncryptedChat = useCallback(async () => {
     if (chat.securityMode !== "e2ee" || !chat.matrixRoomId || !currentUser.matrixSession) return;
@@ -785,6 +903,7 @@ export default function ChatWindow({
           name={chat.name || "?"}
           color={otherMember?.avatarColor || "#6C5CE7"}
           size={40}
+          cacheKey={chat.isGroup ? null : otherMember?.avatarUpdatedAt || null}
         />
 
         <div className="flex-1 min-w-0">
@@ -847,6 +966,8 @@ export default function ChatWindow({
               msg={msg}
               isOwn={msg.senderId === currentUser.id}
               onRetry={handleRetryMessage}
+              registerRef={registerMessageEl}
+              status={getMessageStatus(msg)}
             />
           ))
         )}

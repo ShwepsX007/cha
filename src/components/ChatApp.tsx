@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import dynamic from "next/dynamic";
 import ChatSidebar from "./ChatSidebar";
 import ChatWindow from "./ChatWindow";
+import { registerServiceWorker } from "@/lib/push-client";
 
 const DeviceSecurityModal = dynamic(() => import("./DeviceSecurityModal"), { ssr: false });
 const ProfileSettingsModal = dynamic(() => import("./ProfileSettingsModal"), { ssr: false });
@@ -28,11 +29,13 @@ export interface User {
   displayName: string;
   avatarColor?: string;
   avatarUrl?: string | null;
+  avatarUpdatedAt?: string | null;
   lastSeen?: string;
   role?: "user" | "admin";
   bannedUntil?: string | null;
   banReason?: string | null;
   matrixResetRequired?: boolean;
+  pushEnabled?: boolean;
   matrixAvailability?: MatrixAvailability;
   matrixSession?: MatrixSession | null;
   initialRecoveryKey?: string | null;
@@ -53,7 +56,7 @@ export interface ChatMessage {
   mimeType: string | null;
   encryptedAttachment?: IEncryptedFile & { url: string };
   createdAt: string;
-  deliveryStatus?: "sending" | "sent" | "error";
+  deliveryStatus?: "sending" | "sent" | "delivered" | "read" | "error";
   deliveryError?: string;
   outboxId?: string;
   matrixEventId?: string;
@@ -109,6 +112,22 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
   const [automaticRecoveryNotice, setAutomaticRecoveryNotice] = useState<MatrixRecoveryNotice | null>(
     () => user.matrixSession ? getAutomaticRecoveryNotice(user.matrixSession.userId) : null,
   );
+
+  useEffect(() => {
+    void registerServiceWorker();
+    // Listen for SW-triggered navigation from push notifications.
+    if (typeof window !== "undefined" && "serviceWorker" in navigator) {
+      const onMessage = (event: MessageEvent) => {
+        const data = event?.data;
+        if (data && data.type === "chata-open-chat") {
+          // Default view handles "/" (chat list); deeper routing can be added later.
+          window.location.href = data.url || "/";
+        }
+      };
+      navigator.serviceWorker.addEventListener("message", onMessage);
+      return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+    }
+  }, []);
 
   const handleLogout = useCallback(async () => {
     try {

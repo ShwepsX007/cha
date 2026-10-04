@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { messages, chatMembers, chats } from "@/db/schema";
+import { messages, chatMembers, chats, users } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { eq, and } from "drizzle-orm";
 import { MAX_TELEGRAM_DOWNLOAD_BYTES, uploadFileToTelegram } from "@/lib/telegram";
 import { getActivePublicChatBan } from "@/lib/moderation";
+import { messagePreview, notifyChatMessage } from "@/lib/notifications";
 
 const MAX_ENCRYPTED_FILE_SIZE = 45 * 1024 * 1024;
 
@@ -113,6 +114,19 @@ export async function POST(req: NextRequest) {
         mimeType,
       })
       .returning();
+
+    const [sender] = await db
+      .select({ displayName: users.displayName })
+      .from(users)
+      .where(eq(users.id, payload.userId));
+
+    void notifyChatMessage({
+      chatId,
+      senderId: payload.userId,
+      senderName: sender?.displayName || "Пользователь",
+      textPreview: messagePreview(messageType, fileName, fileName),
+      messageId: msg.id,
+    });
 
     return NextResponse.json({ message: msg, uploaded: !!telegramResult });
   } catch (error) {

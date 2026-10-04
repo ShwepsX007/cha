@@ -10,6 +10,7 @@ export interface Profile {
   displayName: string;
   avatarColor: string;
   avatarUrl: string | null;
+  avatarUpdatedAt: string | null;
   role: "user" | "admin";
   bannedUntil: string | null;
   banReason: string | null;
@@ -38,6 +39,7 @@ export async function getAuthenticatedUser(userId: number) {
       passwordHash: users.passwordHash,
       avatarColor: users.avatarColor,
       avatarUrl: users.avatarUrl,
+      avatarUpdatedAt: users.avatarUpdatedAt,
       role: users.role,
       bannedUntil: users.bannedUntil,
       banReason: users.banReason,
@@ -48,9 +50,10 @@ export async function getAuthenticatedUser(userId: number) {
   return user;
 }
 
-type ProfileRow = Omit<Profile, "role" | "bannedUntil"> & {
+type ProfileRow = Omit<Profile, "role" | "bannedUntil" | "avatarUpdatedAt"> & {
   role: string;
   bannedUntil: Date | string | null;
+  avatarUpdatedAt: Date | string | null;
   passwordHash?: string;
 };
 
@@ -61,6 +64,7 @@ export function serializeProfile(user: ProfileRow): Profile {
     ...rest,
     role: user.role === "admin" ? "admin" : "user",
     bannedUntil: user.bannedUntil instanceof Date ? user.bannedUntil.toISOString() : user.bannedUntil ?? null,
+    avatarUpdatedAt: user.avatarUpdatedAt instanceof Date ? user.avatarUpdatedAt.toISOString() : user.avatarUpdatedAt ?? null,
   };
 }
 

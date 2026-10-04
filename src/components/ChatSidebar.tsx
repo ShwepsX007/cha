@@ -68,7 +68,7 @@ export default function ChatSidebar({
       <div className="p-4 border-b border-dark-600">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-3">
-            <Avatar src={user.avatarUrl} name={user.displayName} color={user.avatarColor} size={44} />
+            <Avatar src={user.avatarUrl} name={user.displayName} color={user.avatarColor} size={44} cacheKey={user.avatarUpdatedAt} />
             <div>
               <div className="font-semibold text-sm">{user.displayName}</div>
               <div className="text-xs text-gray-500">@{user.username}</div>
@@ -205,6 +205,7 @@ export default function ChatSidebar({
                   name={chat.name || "?"}
                   color={otherMember?.avatarColor || "#6C5CE7"}
                   size={44}
+                  cacheKey={chat.isGroup ? null : otherMember?.avatarUpdatedAt || null}
                 />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center justify-between">

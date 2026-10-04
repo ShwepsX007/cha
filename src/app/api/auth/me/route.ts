@@ -28,6 +28,7 @@ export async function GET() {
         displayName: users.displayName,
         avatarColor: users.avatarColor,
         avatarUrl: users.avatarUrl,
+        avatarUpdatedAt: users.avatarUpdatedAt,
         role: users.role,
         bannedUntil: users.bannedUntil,
         banReason: users.banReason,
@@ -48,6 +49,7 @@ export async function GET() {
         ...user,
         displayName: user.displayName || user.username,
         avatarUrl: user.avatarUrl || null,
+        avatarUpdatedAt: user.avatarUpdatedAt instanceof Date ? user.avatarUpdatedAt.toISOString() : user.avatarUpdatedAt ?? null,
         bannedUntil: user.bannedUntil instanceof Date ? user.bannedUntil.toISOString() : user.bannedUntil ?? null,
       },
     });

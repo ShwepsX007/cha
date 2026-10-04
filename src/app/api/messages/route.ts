@@ -4,6 +4,7 @@ import { messages, users, chatMembers, chats } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { eq, and, asc } from "drizzle-orm";
 import { getActivePublicChatBan } from "@/lib/moderation";
+import { messagePreview, notifyChatMessage } from "@/lib/notifications";
 
 export async function GET(req: NextRequest) {
   try {
@@ -114,6 +115,20 @@ export async function POST(req: NextRequest) {
         messageType: "text",
       })
       .returning();
+
+    const [sender] = await db
+      .select({ displayName: users.displayName })
+      .from(users)
+      .where(eq(users.id, payload.userId));
+
+    // Fire-and-forget push to offline members.
+    void notifyChatMessage({
+      chatId,
+      senderId: payload.userId,
+      senderName: sender?.displayName || "Пользователь",
+      textPreview: messagePreview("text", content.trim(), null),
+      messageId: msg.id,
+    });
 
     return NextResponse.json({ message: msg });
   } catch (error) {

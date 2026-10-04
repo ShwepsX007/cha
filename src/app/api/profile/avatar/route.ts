@@ -36,10 +36,11 @@ export async function POST(req: NextRequest) {
     const previousAvatar = auth.user.avatarUrl;
     const avatarUrl = await saveLocalBuffer("avatars", `${auth.user.id}-${randomBytes(4).toString("hex")}.webp`, processed);
 
-    await db.update(users).set({ avatarUrl }).where(eq(users.id, auth.user.id));
+    const now = new Date();
+    await db.update(users).set({ avatarUrl, avatarUpdatedAt: now }).where(eq(users.id, auth.user.id));
     if (previousAvatar) await removeLocalFile(previousAvatar);
 
-    return NextResponse.json({ avatarUrl }, { headers: { "Cache-Control": "no-store" } });
+    return NextResponse.json({ avatarUrl, avatarUpdatedAt: now.toISOString() }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "Не удалось сохранить аватарку" }, { status: 400 });
   }
@@ -51,9 +52,10 @@ export async function DELETE() {
 
   try {
     const previousAvatar = auth.user.avatarUrl;
-    await db.update(users).set({ avatarUrl: null }).where(eq(users.id, auth.user.id));
+    const now = new Date();
+    await db.update(users).set({ avatarUrl: null, avatarUpdatedAt: now }).where(eq(users.id, auth.user.id));
     if (previousAvatar) await removeLocalFile(previousAvatar);
-    return NextResponse.json({ avatarUrl: null }, { headers: { "Cache-Control": "no-store" } });
+    return NextResponse.json({ avatarUrl: null, avatarUpdatedAt: now.toISOString() }, { headers: { "Cache-Control": "no-store" } });
   } catch {
     return NextResponse.json({ error: "Не удалось удалить аватарку" }, { status: 500 });
   }
