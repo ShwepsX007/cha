@@ -51,6 +51,7 @@ export default function ChatSidebar({
   onLogout,
   onChatsUpdated,
   matrixState,
+  matrixNotice,
   onOpenDeviceSecurity,
 }: {
   user: User;
@@ -60,6 +61,7 @@ export default function ChatSidebar({
   onLogout: () => void;
   onChatsUpdated: () => void;
   matrixState: "checking" | "connected" | "not_configured" | "unavailable";
+  matrixNotice?: string;
   onOpenDeviceSecurity: () => void;
 }) {
   const [showNewChat, setShowNewChat] = useState(false);
@@ -131,6 +133,11 @@ export default function ChatSidebar({
             </button>
           </div>
         </div>
+        {matrixNotice && (
+          <div role="status" className="mb-3 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-200">
+            {matrixNotice}
+          </div>
+        )}
 
         {/* Search */}
         <div className="relative">

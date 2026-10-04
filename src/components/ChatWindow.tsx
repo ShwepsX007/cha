@@ -8,9 +8,15 @@ import {
   ensureDirectRoomHistoryVisibility,
   ensureEncryptedRoomReady,
   getEncryptedRoomMessages,
+  createEncryptedOutboxMessage,
+  getPendingEncryptedMessages,
   hasMatrixInvitePermission,
+  MATRIX_OUTBOX_EVENT,
+  retryQueuedEncryptedMessage,
   sendEncryptedAttachment,
-  sendEncryptedText,
+  sendQueuedEncryptedMessage,
+  type EncryptedOutboxMessage,
+  type MatrixOutboxUpdate,
 } from "@/lib/matrix/client";
 import AddGroupMembersModal from "./AddGroupMembersModal";
 
@@ -28,12 +34,39 @@ function formatFileSize(bytes: number | null) {
   return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
+function outboxItemToChatMessage(
+  item: EncryptedOutboxMessage,
+  user: Pick<User, "id" | "username" | "displayName" | "avatarColor">,
+  chatId: number,
+): ChatMessage {
+  return {
+    id: `outbox:${item.id}`,
+    outboxId: item.id,
+    chatId,
+    senderId: user.id,
+    content: item.body,
+    messageType: "text",
+    telegramFileId: null,
+    fileName: null,
+    fileSize: null,
+    mimeType: null,
+    createdAt: item.createdAt,
+    deliveryStatus: item.status === "error" ? "error" : "sending",
+    deliveryError: item.status === "error" ? item.error || "Сообщение не отправлено. Нажмите «Повторить»." : undefined,
+    senderUsername: user.username,
+    senderDisplayName: user.displayName,
+    senderAvatarColor: user.avatarColor || "#6C5CE7",
+  };
+}
+
 function MessageBubble({
   msg,
   isOwn,
+  onRetry,
 }: {
   msg: ChatMessage;
   isOwn: boolean;
+  onRetry?: (message: ChatMessage) => void;
 }) {
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState("");
@@ -210,12 +243,29 @@ function MessageBubble({
             }`}
           >
             {formatTime(msg.createdAt)}
-            {isOwn && (
+            {isOwn && msg.deliveryStatus === "sending" && (
+              <span title="Отправка" aria-label="Отправка" className="inline-flex h-3.5 w-3.5 items-center justify-center text-xs">◷</span>
+            )}
+            {isOwn && (!msg.deliveryStatus || msg.deliveryStatus === "sent") && (
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <title>Отправлено</title>
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
               </svg>
             )}
+            {isOwn && msg.deliveryStatus === "error" && (
+              <span title={msg.deliveryError || "Не отправлено"} aria-label="Ошибка отправки" className="inline-flex h-3.5 w-3.5 items-center justify-center rounded-full bg-red-500 text-[10px] font-bold text-white">!</span>
+            )}
           </div>
+          {isOwn && msg.deliveryStatus === "error" && (
+            <div className="mt-1 flex flex-wrap items-center justify-end gap-2 text-[10px]">
+              <span className="max-w-56 truncate text-red-200" title={msg.deliveryError}>{msg.deliveryError || "Не отправлено"}</span>
+              {onRetry && msg.outboxId && (
+                <button type="button" onClick={() => onRetry(msg)} className="font-semibold text-red-100 underline underline-offset-2 hover:text-white">
+                  Повторить
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -234,6 +284,7 @@ export default function ChatWindow({
   onMessageSent: () => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const localMessagesRef = useRef<ChatMessage[]>([]);
   const [newMessage, setNewMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -244,6 +295,31 @@ export default function ChatWindow({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const prevMsgCountRef = useRef(0);
+  const updateLocalMessages = useCallback((update: (current: ChatMessage[]) => ChatMessage[]) => {
+    const next = update(localMessagesRef.current);
+    localMessagesRef.current = next;
+    const visibleLocalMessages = next.filter((message) => message.chatId === chat.id);
+    setMessages((current) => {
+      const byOutboxId = new Map(
+        visibleLocalMessages.filter((message) => message.outboxId)
+          .map((message) => [message.outboxId as string, message]),
+      );
+      const visibleOutboxIds = new Set<string>();
+      const merged = current.map((message) => {
+        if (!message.outboxId) return message;
+        const replacement = byOutboxId.get(message.outboxId);
+        if (!replacement) return message;
+        visibleOutboxIds.add(message.outboxId);
+        return replacement;
+      });
+      const additions = visibleLocalMessages.filter((message) =>
+        message.outboxId && !visibleOutboxIds.has(message.outboxId),
+      );
+      return [...merged, ...additions].sort(
+        (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+      );
+    });
+  }, [chat.id]);
 
   useEffect(() => {
     if (
@@ -357,6 +433,44 @@ export default function ChatWindow({
         setMessageReadError("");
       }
 
+      if (chat.securityMode === "e2ee" && currentUser.matrixSession) {
+        const queuedItems = getPendingEncryptedMessages(currentUser.id, chat.id);
+        const queuedIds = new Set(queuedItems.map((item) => item.id));
+        const allLocalMessages = localMessagesRef.current;
+        const currentLocalMessages = allLocalMessages.filter((message) => message.chatId === chat.id);
+        const localByOutboxId = new Map(
+          currentLocalMessages
+            .filter((message) => message.outboxId)
+            .map((message) => [message.outboxId as string, message]),
+        );
+        const optimisticMessages = queuedItems.map((item) =>
+          localByOutboxId.get(item.id) || outboxItemToChatMessage(item, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor }, chat.id),
+        );
+        const liveIds = new Set(visibleMessages.map((message) => String(message.id)));
+        const sentButNotSynced = currentLocalMessages.filter((message) =>
+          message.deliveryStatus === "sent" &&
+          (!message.outboxId || !queuedIds.has(message.outboxId)) &&
+          (!message.matrixEventId || !liveIds.has(message.matrixEventId)),
+        );
+        const nextLocalMessages = [...optimisticMessages, ...sentButNotSynced];
+        const hasLocalChanges = nextLocalMessages.length !== currentLocalMessages.length ||
+          nextLocalMessages.some((message, index) => {
+            const current = currentLocalMessages[index];
+            return !current || current.id !== message.id ||
+              current.deliveryStatus !== message.deliveryStatus ||
+              current.deliveryError !== message.deliveryError;
+          });
+        if (hasLocalChanges) {
+          localMessagesRef.current = [
+            ...allLocalMessages.filter((message) => message.chatId !== chat.id),
+            ...nextLocalMessages,
+          ];
+        }
+        visibleMessages = [...visibleMessages, ...nextLocalMessages].sort(
+          (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+        );
+      }
+
       setMessages(visibleMessages);
       if (visibleMessages.length !== prevMsgCountRef.current) {
         prevMsgCountRef.current = visibleMessages.length;
@@ -370,6 +484,10 @@ export default function ChatWindow({
     chat.matrixRoomId,
     chat.members,
     chat.securityMode,
+    currentUser.id,
+    currentUser.username,
+    currentUser.displayName,
+    currentUser.avatarColor,
     currentUser.matrixSession,
     prepareEncryptedChat,
     scrollToBottom,
@@ -382,15 +500,86 @@ export default function ChatWindow({
     return () => clearInterval(interval);
   }, [loadMessages]);
 
+  useEffect(() => {
+    const onOutboxUpdate = (event: Event) => {
+      const update = (event as CustomEvent<MatrixOutboxUpdate>).detail;
+      if (!update) return;
+      const isActiveChat = update.chatId === chat.id;
+
+      updateLocalMessages((current) => {
+        let message = current.find((item) => item.outboxId === update.id);
+        if (!message && update.status !== "sent") {
+          const queued = getPendingEncryptedMessages(currentUser.id, update.chatId)
+            .find((item) => item.id === update.id);
+          if (queued) message = outboxItemToChatMessage(queued, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor }, update.chatId);
+        }
+        if (!message) return current;
+
+        const updated: ChatMessage = {
+          ...message,
+          id: update.status === "sent" && update.eventId ? update.eventId : message.id,
+          matrixEventId: update.status === "sent" ? update.eventId : message.matrixEventId,
+          deliveryStatus: update.status,
+          deliveryError: update.error,
+        };
+        const found = current.some((item) => item.outboxId === update.id);
+        return found
+          ? current.map((item) => item.outboxId === update.id ? updated : item)
+          : [...current, updated];
+      });
+
+      if (update.status === "sent") {
+        if (isActiveChat) void loadMessages();
+        onMessageSent();
+      }
+    };
+
+    window.addEventListener(MATRIX_OUTBOX_EVENT, onOutboxUpdate);
+    return () => window.removeEventListener(MATRIX_OUTBOX_EVENT, onOutboxUpdate);
+  }, [chat, currentUser, loadMessages, onMessageSent, updateLocalMessages]);
+
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newMessage.trim() || sending) return;
 
     const msgText = newMessage.trim();
-    setNewMessage("");
     setSendError("");
-    setSending(true);
 
+    if (chat.securityMode === "e2ee") {
+      if (!chat.matrixRoomId || !currentUser.matrixSession) {
+        setSendError("Matrix E2EE не подключён. Сообщение не отправлено открытым текстом.");
+        return;
+      }
+
+      try {
+        const item = createEncryptedOutboxMessage({
+          appUserId: currentUser.id,
+          chatId: chat.id,
+          roomId: chat.matrixRoomId,
+          isDirect: !chat.isGroup,
+          body: msgText,
+        });
+        const optimisticMessage: ChatMessage = {
+          ...outboxItemToChatMessage(item, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor }, chat.id),
+          id: `outbox:${item.id}`,
+          deliveryStatus: "sending",
+          deliveryError: undefined,
+        };
+        updateLocalMessages((current) => [...current, optimisticMessage]);
+        setNewMessage("");
+        setSending(false);
+        scrollToBottom(true);
+        void sendQueuedEncryptedMessage(currentUser.matrixSession, item.id).catch(() => undefined);
+      } catch (queueError) {
+        setSendError(queueError instanceof Error
+          ? queueError.message
+          : "Не удалось сохранить сообщение в очереди. Повторите попытку.");
+      }
+      return;
+    }
+
+    setNewMessage("");
+    setSending(true);
     try {
       if (chat.securityMode === "public") {
         const response = await fetch("/api/messages", {
@@ -399,11 +588,8 @@ export default function ChatWindow({
           body: JSON.stringify({ chatId: chat.id, content: msgText }),
         });
         if (!response.ok) throw new Error("Не удалось отправить сообщение");
-      } else if (chat.securityMode === "e2ee" && chat.matrixRoomId && currentUser.matrixSession) {
-        await prepareEncryptedChat();
-        await sendEncryptedText(currentUser.matrixSession, chat.matrixRoomId, msgText);
       } else {
-        throw new Error("Matrix E2EE не подключён. Сообщение не отправлено открытым текстом.");
+        throw new Error("Новые сообщения в legacy-чатах заблокированы до настройки E2EE.");
       }
 
       await loadMessages();
@@ -416,6 +602,14 @@ export default function ChatWindow({
     } finally {
       setSending(false);
     }
+  };
+
+  const handleRetryMessage = (message: ChatMessage) => {
+    if (!message.outboxId || !currentUser.matrixSession) return;
+    updateLocalMessages((current) => current.map((item) => item.outboxId === message.outboxId
+      ? { ...item, deliveryStatus: "sending", deliveryError: undefined }
+      : item));
+    void retryQueuedEncryptedMessage(currentUser.matrixSession, message.outboxId).catch(() => undefined);
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -565,6 +759,7 @@ export default function ChatWindow({
               key={msg.id}
               msg={msg}
               isOwn={msg.senderId === currentUser.id}
+              onRetry={handleRetryMessage}
             />
           ))
         )}

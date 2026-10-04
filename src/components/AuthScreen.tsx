@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { initializeMatrixCryptoAfterLogin } from "@/lib/matrix/client";
 import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
 
 interface User {
@@ -9,6 +10,9 @@ interface User {
   displayName: string;
   matrixAvailability?: MatrixAvailability;
   matrixSession?: MatrixSession | null;
+  initialRecoveryKey?: string | null;
+  initialRecoveryKeySaved?: boolean;
+  matrixNotice?: string;
 }
 
 function getMatrixDeviceId(username: string): string {
@@ -58,10 +62,34 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
         return;
       }
 
+      const matrixSession: MatrixSession | null = data.matrixSession || null;
+      let initialRecoveryKey: string | null = null;
+      let initialRecoveryKeySaved = false;
+      let matrixNotice = "";
+
+      if (matrixSession && data.matrixAvailability === "ready") {
+        try {
+          const initialization = await initializeMatrixCryptoAfterLogin(matrixSession, password);
+          initialRecoveryKey = initialization.recoveryKey || null;
+          initialRecoveryKeySaved = initialization.recoveryKeySaved || false;
+          matrixNotice = initialization.notice || "";
+        } catch (matrixError) {
+          matrixNotice = matrixError instanceof Error
+            ? matrixError.message
+            : "Matrix не синхронизирован. Приватные сообщения пока не отправляются.";
+          console.error("Matrix crypto initialization failed");
+        }
+      } else if (data.matrixAvailability === "unavailable") {
+        matrixNotice = "Matrix недоступен. Общий чат остаётся доступен, приватные сообщения не отправляются.";
+      }
+
       const authenticatedUser: User = {
         ...data.user,
         matrixAvailability: data.matrixAvailability || "unavailable",
-        matrixSession: data.matrixSession || null,
+        matrixSession,
+        initialRecoveryKey,
+        initialRecoveryKeySaved,
+        matrixNotice,
       };
 
       if (authenticatedUser.matrixSession) {
@@ -70,6 +98,7 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
         sessionStorage.removeItem("chata_matrix_session");
       }
       sessionStorage.setItem("chata_matrix_availability", authenticatedUser.matrixAvailability || "unavailable");
+      setPassword("");
       onAuth(authenticatedUser);
     } catch {
       setError("Ошибка соединения");
@@ -167,7 +196,7 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
               disabled={loading}
               className="w-full py-3 bg-purple-500 hover:bg-purple-600 disabled:opacity-50 text-white font-medium rounded-xl transition-colors"
             >
-              {loading ? "Загрузка..." : isLogin ? "Войти" : "Зарегистрироваться"}
+              {loading ? "Подключаем Matrix и шифрование…" : isLogin ? "Войти" : "Зарегистрироваться"}
             </button>
           </form>
 

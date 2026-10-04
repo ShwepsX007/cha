@@ -12,6 +12,9 @@ interface User {
   avatarColor?: string;
   matrixAvailability?: MatrixAvailability;
   matrixSession?: MatrixSession | null;
+  initialRecoveryKey?: string | null;
+  initialRecoveryKeySaved?: boolean;
+  matrixNotice?: string;
 }
 
 export default function Home() {

@@ -6,7 +6,17 @@ import ChatSidebar from "./ChatSidebar";
 import ChatWindow from "./ChatWindow";
 
 const DeviceSecurityModal = dynamic(() => import("./DeviceSecurityModal"), { ssr: false });
-import { getMatrixClient, joinRoomIfInvited, stopMatrixClient, waitForMatrixSync } from "@/lib/matrix/client";
+import { ClientEvent, SyncState } from "matrix-js-sdk";
+import {
+  drainEncryptedOutbox,
+  getAutomaticRecoveryNotice,
+  getMatrixClient,
+  joinRoomIfInvited,
+  MATRIX_RECOVERY_EVENT,
+  stopMatrixClient,
+  waitForMatrixSync,
+  type MatrixRecoveryNotice,
+} from "@/lib/matrix/client";
 import type { IEncryptedFile } from "matrix-encrypt-attachment";
 import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
 
@@ -18,6 +28,9 @@ export interface User {
   lastSeen?: string;
   matrixAvailability?: MatrixAvailability;
   matrixSession?: MatrixSession | null;
+  initialRecoveryKey?: string | null;
+  initialRecoveryKeySaved?: boolean;
+  matrixNotice?: string;
 }
 
 export interface ChatMessage {
@@ -33,6 +46,10 @@ export interface ChatMessage {
   mimeType: string | null;
   encryptedAttachment?: IEncryptedFile & { url: string };
   createdAt: string;
+  deliveryStatus?: "sending" | "sent" | "error";
+  deliveryError?: string;
+  outboxId?: string;
+  matrixEventId?: string;
   senderUsername: string;
   senderDisplayName: string;
   senderAvatarColor: string;
@@ -69,7 +86,12 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
   );
   const [selectedChatId, setSelectedChatId] = useState<number | null>(null);
   const [showSidebar, setShowSidebar] = useState(true);
-  const [showDeviceSecurity, setShowDeviceSecurity] = useState(false);
+  const [showDeviceSecurity, setShowDeviceSecurity] = useState(Boolean(user.initialRecoveryKey));
+  const [initialRecoveryKey, setInitialRecoveryKey] = useState(user.initialRecoveryKey || null);
+  const [initialRecoveryKeySaved, setInitialRecoveryKeySaved] = useState(Boolean(user.initialRecoveryKeySaved));
+  const [automaticRecoveryNotice, setAutomaticRecoveryNotice] = useState<MatrixRecoveryNotice | null>(
+    () => user.matrixSession ? getAutomaticRecoveryNotice(user.matrixSession.userId) : null,
+  );
 
   const loadChats = useCallback(async () => {
     try {
@@ -83,23 +105,61 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
 
   useEffect(() => {
     if (!user.matrixSession) return;
+    const session = user.matrixSession;
+    const onRecoveryUpdate = (event: Event) => {
+      const detail = (event as CustomEvent<MatrixRecoveryNotice & { userId: string }>).detail;
+      if (detail?.userId === session.userId) {
+        setAutomaticRecoveryNotice({ status: detail.status, message: detail.message });
+      }
+    };
+    window.addEventListener(MATRIX_RECOVERY_EVENT, onRecoveryUpdate);
+    return () => window.removeEventListener(MATRIX_RECOVERY_EVENT, onRecoveryUpdate);
+  }, [user.matrixSession]);
 
+  useEffect(() => {
+    if (!user.matrixSession) return;
+    const session = user.matrixSession;
     let cancelled = false;
-    getMatrixClient(user.matrixSession)
-      .then(waitForMatrixSync)
-      .then(() => {
-        if (!cancelled) setMatrixState("connected");
+    let matrixClient: Awaited<ReturnType<typeof getMatrixClient>> | null = null;
+    const onSync = (state: SyncState, previousState: SyncState | null) => {
+      if (cancelled) return;
+      if (state === SyncState.Error || state === SyncState.Stopped) {
+        setMatrixState("unavailable");
+        return;
+      }
+      if (state === SyncState.Prepared || state === SyncState.Syncing || state === SyncState.Catchup) {
+        setMatrixState("connected");
+      }
+      if (
+        state === SyncState.Prepared ||
+        state === SyncState.Catchup ||
+        (state === SyncState.Syncing && (previousState === SyncState.Reconnecting || previousState === SyncState.Error))
+      ) {
+        void drainEncryptedOutbox(session).catch(() => undefined);
+      }
+    };
+
+    void getMatrixClient(session)
+      .then(async (client) => {
+        if (cancelled) return;
+        matrixClient = client;
+        client.on(ClientEvent.Sync, onSync);
+        await waitForMatrixSync(client);
+        if (cancelled) return;
+        setMatrixState("connected");
+        void drainEncryptedOutbox(session).catch(() => undefined);
       })
       .catch((error) => {
-        const detail = error instanceof Error ? `${error.name}: ${error.message}` : "Unknown Matrix sync error";
-        console.error("Matrix client unavailable:", detail);
+        const errorType = error instanceof Error ? error.name : "Unknown Matrix sync error";
+        console.error("Matrix client unavailable:", errorType);
         if (!cancelled) setMatrixState("unavailable");
       });
 
     return () => {
       cancelled = true;
+      if (matrixClient) matrixClient.removeListener(ClientEvent.Sync, onSync);
     };
-  }, [user.matrixAvailability, user.matrixSession]);
+  }, [user.matrixSession]);
 
   useEffect(() => {
     if (!user.matrixSession) return;
@@ -172,6 +232,7 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
           onLogout={handleLogout}
           onChatsUpdated={loadChats}
           matrixState={matrixState}
+          matrixNotice={automaticRecoveryNotice?.message || user.matrixNotice}
           onOpenDeviceSecurity={() => setShowDeviceSecurity(true)}
         />
       </div>
@@ -203,7 +264,13 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
     {showDeviceSecurity && user.matrixSession && (
       <DeviceSecurityModal
         session={user.matrixSession}
-        onClose={() => setShowDeviceSecurity(false)}
+        initialRecoveryKey={initialRecoveryKey}
+        initialRecoveryKeySaved={initialRecoveryKeySaved}
+        onClose={() => {
+          setShowDeviceSecurity(false);
+          setInitialRecoveryKey(null);
+          setInitialRecoveryKeySaved(false);
+        }}
       />
     )}
     </>

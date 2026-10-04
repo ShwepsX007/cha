@@ -12,15 +12,25 @@ import {
   type VerificationRequest,
 } from "matrix-js-sdk/lib/crypto-api/verification";
 import {
+  getAutomaticRecoveryNotice,
   getMatrixClient,
   getMatrixSecurityStatus,
   restoreMatrixHistoryFromVerifiedDevice,
   restoreMatrixRecoveryKey,
+  rotateMatrixRecoveryKey,
   setupMatrixRecovery,
   waitForMatrixSync,
+  MATRIX_RECOVERY_EVENT,
+  type MatrixRecoveryNotice,
   type MatrixRecoveryResult,
   type MatrixSecurityStatus,
 } from "@/lib/matrix/client";
+import {
+  decryptRecoveryKeyFromProfile,
+  fetchStoredRecoveryKey,
+  saveRecoveryKeyToProfile,
+  type EncryptedRecoveryKeyRecord,
+} from "@/lib/matrix/recovery-key-storage";
 import type { ImportRoomKeyProgressData } from "matrix-js-sdk/lib/crypto-api/index";
 import type { MatrixSession } from "@/lib/matrix/types";
 
@@ -82,9 +92,13 @@ function describeRestoreProgress(progress: ImportRoomKeyProgressData): string {
 export default function DeviceSecurityModal({
   session,
   onClose,
+  initialRecoveryKey,
+  initialRecoveryKeySaved = false,
 }: {
   session: MatrixSession;
   onClose: () => void;
+  initialRecoveryKey?: string | null;
+  initialRecoveryKeySaved?: boolean;
 }) {
   const [securityStatus, setSecurityStatus] = useState<MatrixSecurityStatus | null>(null);
   const [incomingRequests, setIncomingRequests] = useState<VerificationRequest[]>([]);
@@ -98,8 +112,14 @@ export default function DeviceSecurityModal({
   const [scannerError, setScannerError] = useState("");
   const [password, setPassword] = useState("");
   const [recoveryKeyInput, setRecoveryKeyInput] = useState("");
-  const [generatedRecoveryKey, setGeneratedRecoveryKey] = useState<string | null>(null);
-  const [recoverySaved, setRecoverySaved] = useState(false);
+  const [generatedRecoveryKey, setGeneratedRecoveryKey] = useState<string | null>(initialRecoveryKey || null);
+  const [recoveryKeySaved, setRecoveryKeySaved] = useState(initialRecoveryKeySaved);
+  const [storedRecoveryRecord, setStoredRecoveryRecord] = useState<EncryptedRecoveryKeyRecord | null>(null);
+  const [recoveryRevealPassword, setRecoveryRevealPassword] = useState("");
+  const [revealedRecoveryKey, setRevealedRecoveryKey] = useState<string | null>(null);
+  const [autoRecoveryNotice, setAutoRecoveryNotice] = useState<MatrixRecoveryNotice | null>(
+    () => getAutomaticRecoveryNotice(session.userId),
+  );
   const [restoring, setRestoring] = useState(false);
   const [restoreProgress, setRestoreProgress] = useState("");
   const [restoreResult, setRestoreResult] = useState<MatrixRecoveryResult | null>(null);
@@ -111,10 +131,16 @@ export default function DeviceSecurityModal({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scannerControlsRef = useRef<{ stop: () => void } | null>(null);
   const scanHandledRef = useRef(false);
+  const qrAutoRestoreRequestRef = useRef<string | null>(null);
 
   const refreshSecurityStatus = useCallback(async () => {
     const next = await getMatrixSecurityStatus(session);
     setSecurityStatus(next);
+    try {
+      setStoredRecoveryRecord(await fetchStoredRecoveryKey());
+    } catch {
+      // Keep device status visible if the profile endpoint is temporarily unavailable.
+    }
   }, [session]);
 
   const addIncomingRequest = useCallback((request: VerificationRequest) => {
@@ -181,6 +207,13 @@ export default function DeviceSecurityModal({
     let live = true;
     let matrixClient: Awaited<ReturnType<typeof getMatrixClient>> | null = null;
     const onVerificationRequest = (request: VerificationRequest) => addIncomingRequest(request);
+    const onAutomaticRecoveryUpdate = (event: Event) => {
+      const detail = (event as CustomEvent<MatrixRecoveryNotice & { userId: string }>).detail;
+      if (detail?.userId === session.userId) {
+        setAutoRecoveryNotice({ status: detail.status, message: detail.message });
+      }
+    };
+    window.addEventListener(MATRIX_RECOVERY_EVENT, onAutomaticRecoveryUpdate);
 
     void getMatrixClient(session)
       .then(async (client) => {
@@ -200,6 +233,7 @@ export default function DeviceSecurityModal({
 
     return () => {
       live = false;
+      window.removeEventListener(MATRIX_RECOVERY_EVENT, onAutomaticRecoveryUpdate);
       if (matrixClient) {
         matrixClient.removeListener(CryptoEvent.VerificationRequestReceived, onVerificationRequest);
       }
@@ -211,7 +245,7 @@ export default function DeviceSecurityModal({
   }, [addIncomingRequest, refreshSecurityStatus, session]);
 
   const handleClose = async () => {
-    if ((generatedRecoveryKey && !recoverySaved) || busy || restoring) return;
+    if (busy || restoring) return;
     const current = activeRequestRef.current;
     if (current?.pending) await current.cancel({ reason: "Пользователь закрыл окно проверки" }).catch(() => undefined);
     onClose();
@@ -225,7 +259,13 @@ export default function DeviceSecurityModal({
     try {
       const key = await setupMatrixRecovery(session, password);
       setGeneratedRecoveryKey(key);
-      setRecoverySaved(false);
+      setRecoveryKeySaved(false);
+      try {
+        await saveRecoveryKeyToProfile(key, password);
+        setRecoveryKeySaved(true);
+      } catch (saveError) {
+        setError(`${errorMessage(saveError)} Скопируйте или скачайте ключ до закрытия этого окна.`);
+      }
       setPassword("");
       await refreshSecurityStatus();
     } catch (setupError) {
@@ -235,33 +275,88 @@ export default function DeviceSecurityModal({
     }
   };
 
-  const handleCopyRecoveryKey = async () => {
-    if (!generatedRecoveryKey) return;
+  const handleRotateRecoveryKey = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (busy || !password) return;
+    setBusy(true);
+    setError("");
     try {
-      await navigator.clipboard.writeText(generatedRecoveryKey);
+      const key = await rotateMatrixRecoveryKey(session, password);
+      setGeneratedRecoveryKey(key);
+      setRecoveryKeySaved(false);
+      setRevealedRecoveryKey(null);
+      setPassword("");
+      try {
+        await saveRecoveryKeyToProfile(key, password);
+        setRecoveryKeySaved(true);
+      } catch (saveError) {
+        setError(`${errorMessage(saveError)} Скопируйте или скачайте новый ключ до закрытия этого окна.`);
+      }
+      await refreshSecurityStatus();
+    } catch (rotateError) {
+      setError(errorMessage(rotateError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRevealStoredRecoveryKey = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!storedRecoveryRecord || !recoveryRevealPassword) return;
+    setError("");
+    try {
+      const key = await decryptRecoveryKeyFromProfile(storedRecoveryRecord, recoveryRevealPassword);
+      setRevealedRecoveryKey(key);
+      setRecoveryRevealPassword("");
+    } catch (revealError) {
+      setError(errorMessage(revealError));
+    }
+  };
+
+  const handleSaveDisplayedRecoveryKey = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!generatedRecoveryKey || !password || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await saveRecoveryKeyToProfile(generatedRecoveryKey, password);
+      setRecoveryKeySaved(true);
+      setPassword("");
+    } catch (saveError) {
+      setError(errorMessage(saveError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleCopyRecoveryKey = async (key: string) => {
+    try {
+      await navigator.clipboard.writeText(key);
       setError("");
     } catch {
       setError("Не удалось скопировать recovery key. Скачайте его в файл или выделите вручную.");
     }
   };
 
-  const handleDownloadRecoveryKey = () => {
-    if (!generatedRecoveryKey) return;
+  const handleDownloadRecoveryKey = (key: string) => {
     const file = new Blob([
       "Matrix recovery key. Храните отдельно и никому не отправляйте.\n\n",
-      generatedRecoveryKey,
+      key,
       "\n",
     ], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(file);
     const link = document.createElement("a");
     link.href = url;
     link.download = "matrix-recovery-key.txt";
+    document.body.appendChild(link);
     link.click();
-    URL.revokeObjectURL(url);
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
   };
 
-  const handleStartVerification = async () => {
+  const handleStartVerification = async (targetDeviceId?: string) => {
     if (busy) return;
+    qrAutoRestoreRequestRef.current = null;
     setBusy(true);
     setError("");
     setVerificationMessage("");
@@ -270,9 +365,13 @@ export default function DeviceSecurityModal({
       await waitForMatrixSync(client);
       const crypto = client.getCrypto();
       if (!crypto) throw new Error("Matrix Rust crypto is unavailable");
-      const request = await crypto.requestOwnUserVerification();
+      const request = targetDeviceId
+        ? await crypto.requestDeviceVerification(session.userId, targetDeviceId)
+        : await crypto.requestOwnUserVerification();
       attachActiveRequest(request, "new-device");
-      setVerificationMessage("Запрос отправлен. Откройте этот раздел на старом доверенном устройстве и примите запрос.");
+      setVerificationMessage(targetDeviceId
+        ? `Запрос отправлен устройству ${targetDeviceId}. Откройте QR на этом устройстве и отсканируйте его здесь.`
+        : "Запрос отправлен. Откройте этот раздел на старом доверенном устройстве и примите запрос.");
     } catch (verificationError) {
       setError(errorMessage(verificationError));
     } finally {
@@ -324,7 +423,7 @@ export default function DeviceSecurityModal({
       await verifier.verify();
       setVerificationMessage("Новое устройство подтверждено. Теперь можно восстановить историю Matrix E2EE.");
       setRequestPhase(VerificationPhase.Done);
-      await refreshSecurityStatus();
+      await refreshSecurityStatus().catch(() => undefined);
     } catch (verificationError) {
       setScannerError(errorMessage(verificationError));
       setVerificationMessage("");
@@ -368,9 +467,9 @@ export default function DeviceSecurityModal({
     setVerificationMessage("Подтверждение отправлено. Ожидаем завершения проверки на новом устройстве…");
   };
 
-  const reportRestoreProgress = (progress: ImportRoomKeyProgressData) => {
+  const reportRestoreProgress = useCallback((progress: ImportRoomKeyProgressData) => {
     setRestoreProgress(describeRestoreProgress(progress));
-  };
+  }, []);
 
   const handleRestoreWithRecoveryKey = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -397,16 +496,37 @@ export default function DeviceSecurityModal({
     }
   };
 
-  const handleRestoreAfterQr = async () => {
+  const handleRestoreAfterQr = useCallback(async () => {
     if (restoring) return;
     setRestoring(true);
     setError("");
     setRestoreResult(null);
     setRestoreProgress("Подготавливаем доверенную копию Matrix…");
     try {
-      const backup = await restoreMatrixHistoryFromVerifiedDevice(session, reportRestoreProgress);
+      const retryDelays = [0, 1_000, 3_000, 9_000];
+      let backup: Awaited<ReturnType<typeof restoreMatrixHistoryFromVerifiedDevice>> | null = null;
+      let lastError: unknown;
+      for (const delay of retryDelays) {
+        if (delay > 0) {
+          setRestoreProgress("Ожидаем передачи ключа backup от доверенного устройства…");
+          await new Promise((resolve) => window.setTimeout(resolve, delay));
+        }
+        try {
+          backup = await restoreMatrixHistoryFromVerifiedDevice(session, reportRestoreProgress);
+          break;
+        } catch (restoreError) {
+          lastError = restoreError;
+          const message = errorMessage(restoreError);
+          if (!/not shared|not available|not yet|backup key/i.test(message)) throw restoreError;
+        }
+      }
+      if (!backup) throw lastError || new Error("Не удалось получить ключ Matrix backup.");
       setRestoreResult({ crossSigningRestored: false, backup });
       setRestoreProgress(`Восстановлено ключей: ${backup.imported} из ${backup.total}.`);
+      setAutoRecoveryNotice({
+        status: "restored",
+        message: "Устройство подтверждено; зашифрованная история Matrix восстановлена.",
+      });
     } catch (restoreError) {
       setError(errorMessage(restoreError));
       setRestoreProgress("");
@@ -414,7 +534,21 @@ export default function DeviceSecurityModal({
       setRestoring(false);
       await refreshSecurityStatus().catch(() => undefined);
     }
-  };
+  }, [refreshSecurityStatus, reportRestoreProgress, restoring, session]);
+
+  useEffect(() => {
+    if (
+      requestRole !== "new-device" ||
+      requestPhase !== VerificationPhase.Done ||
+      !securityStatus?.keyBackupAvailable ||
+      !activeRequest
+    ) return;
+
+    const requestId = activeRequest.transactionId || activeRequest.otherDeviceId;
+    if (!requestId || qrAutoRestoreRequestRef.current === requestId) return;
+    qrAutoRestoreRequestRef.current = requestId;
+    void handleRestoreAfterQr();
+  }, [activeRequest, handleRestoreAfterQr, requestPhase, requestRole, securityStatus?.keyBackupAvailable]);
 
   const recoverySetupAvailable = Boolean(securityStatus && !securityStatus.secretStorageKeyId);
   const recoveryInputAvailable = Boolean(
@@ -422,7 +556,9 @@ export default function DeviceSecurityModal({
     (!securityStatus.crossSigningPrivateKeysCached ||
       (securityStatus.keyBackupAvailable && !securityStatus.backupVersion)),
   );
-  const recoveryCloseBlocked = Boolean(generatedRecoveryKey && !recoverySaved);
+  const recoveryRotationAvailable = Boolean(
+    securityStatus?.secretStorageKeyId && securityStatus.crossSigningPrivateKeysCached,
+  );
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-3 sm:p-6">
@@ -440,9 +576,9 @@ export default function DeviceSecurityModal({
           <button
             type="button"
             onClick={() => void handleClose()}
-            disabled={recoveryCloseBlocked || busy || restoring}
+            disabled={busy || restoring}
             aria-label="Закрыть"
-            title={recoveryCloseBlocked ? "Сначала подтвердите, что сохранили recovery key" : "Закрыть"}
+            title="Закрыть"
             className="rounded-lg p-2 text-gray-400 hover:bg-dark-600 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
           >
             <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -455,6 +591,18 @@ export default function DeviceSecurityModal({
           {error && (
             <div role="alert" className="rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-300">
               {error}
+            </div>
+          )}
+          {autoRecoveryNotice && (
+            <div
+              role={autoRecoveryNotice.status === "needs-recovery" || autoRecoveryNotice.status === "error" ? "alert" : "status"}
+              className={`rounded-xl border px-4 py-3 text-sm ${
+                autoRecoveryNotice.status === "needs-recovery" || autoRecoveryNotice.status === "error"
+                  ? "border-amber-500/40 bg-amber-500/10 text-amber-200"
+                  : "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+              }`}
+            >
+              {autoRecoveryNotice.message}
             </div>
           )}
 
@@ -494,7 +642,7 @@ export default function DeviceSecurityModal({
             )}
             {securityStatus && !securityStatus.crossSigningReady && (
               <p className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-200">
-                Если это первое устройство аккаунта, сначала настройте recovery здесь. Если вы переносите аккаунт, настройте recovery на старом доверенном устройстве и не создавайте новую пару ключей на новом.
+                Первая настройка Matrix выполняется автоматически после входа. Если у аккаунта уже есть ключи, запросите QR с доверенного устройства или восстановите их по recovery key — не создавайте новую пару ключей.
               </p>
             )}
             {securityStatus?.crossSigningReady && !securityStatus.crossSigningPrivateKeysCached && (
@@ -507,48 +655,142 @@ export default function DeviceSecurityModal({
             </p>
           </section>
 
+          <section className="rounded-xl border border-dark-500 p-4">
+            <h3 className="font-medium text-white">Устройства Matrix</h3>
+            <p className="mt-1 text-xs text-gray-400">Подтверждённые устройства могут безопасно передавать ключи этому устройству.</p>
+            {securityStatus?.devices.length ? (
+              <ul className="mt-3 space-y-2">
+                {securityStatus.devices.map((device) => (
+                  <li key={device.deviceId} className="flex flex-wrap items-center justify-between gap-3 rounded-lg bg-dark-700 p-3">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-sm text-white">
+                        <span aria-hidden="true">{device.verified ? "✅" : "⚠️"}</span>
+                        <span className="truncate">{device.displayName}</span>
+                        {device.current && <span className="shrink-0 rounded bg-purple-500/20 px-1.5 py-0.5 text-[10px] text-purple-200">это устройство</span>}
+                      </div>
+                      <div className="mt-1 font-mono text-[10px] text-gray-500">{device.deviceId}</div>
+                      {device.lastSeenTs && (
+                        <div className="mt-1 text-[10px] text-gray-500">
+                          Последняя активность: {new Date(device.lastSeenTs).toLocaleString("ru-RU")}
+                        </div>
+                      )}
+                    </div>
+                    {!device.verified && !device.current && (
+                      <button
+                        type="button"
+                        onClick={() => void handleStartVerification(device.deviceId)}
+                        disabled={busy || restoring || Boolean(activeRequest)}
+                        className="rounded-lg bg-purple-500 px-3 py-2 text-xs font-medium text-white hover:bg-purple-600 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        Подтвердить устройство
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-3 text-xs text-gray-500">Список устройств Matrix ещё загружается или устройств нет.</p>
+            )}
+          </section>
+
           {generatedRecoveryKey ? (
             <section className="rounded-xl border border-amber-400/50 bg-amber-400/10 p-4">
-              <h3 className="font-semibold text-amber-100">Сохраните recovery key сейчас</h3>
+              <h3 className="font-semibold text-amber-100">
+                {initialRecoveryKey ? "Ваш чат зашифрован" : "Ключ восстановления"}
+              </h3>
               <p className="mt-2 text-xs leading-relaxed text-amber-100/80">
-                Это единственный показ ключа. Он открывает зашифрованные Matrix-ключи аккаунта. Не отправляйте его в Telegram, чат или поддержку и не храните рядом с паролем.
+                {recoveryKeySaved
+                  ? "Ключ показан только на этом устройстве. Его зашифрованная копия сохранена в профиле и может быть открыта здесь после ввода пароля аккаунта."
+                  : "Зашифрованную копию не удалось сохранить в профиле. Скопируйте или скачайте ключ сейчас, если хотите восстановить историю на новом устройстве."}
+                {" "}Не отправляйте ключ в чат, Telegram или поддержку.
               </p>
               <code className="mt-3 block select-all break-all rounded-lg bg-black/40 p-3 text-center font-mono text-sm tracking-wide text-white">
                 {generatedRecoveryKey}
               </code>
               <div className="mt-3 flex flex-wrap gap-2">
-                <button type="button" onClick={() => void handleCopyRecoveryKey()} className="rounded-lg bg-dark-500 px-3 py-2 text-xs text-white hover:bg-dark-400">
+                <button type="button" onClick={() => void handleCopyRecoveryKey(generatedRecoveryKey)} className="rounded-lg bg-dark-500 px-3 py-2 text-xs text-white hover:bg-dark-400">
                   Скопировать ключ
                 </button>
-                <button type="button" onClick={handleDownloadRecoveryKey} className="rounded-lg bg-dark-500 px-3 py-2 text-xs text-white hover:bg-dark-400">
-                  Скачать файл
+                <button type="button" onClick={() => handleDownloadRecoveryKey(generatedRecoveryKey)} className="rounded-lg bg-dark-500 px-3 py-2 text-xs text-white hover:bg-dark-400">
+                  Скачать .txt
                 </button>
               </div>
-              <label className="mt-4 flex items-start gap-2 text-xs text-amber-100/90">
-                <input
-                  type="checkbox"
-                  checked={recoverySaved}
-                  onChange={(event) => setRecoverySaved(event.target.checked)}
-                  className="mt-0.5 accent-amber-400"
-                />
-                Я сохранил recovery key отдельно и смогу найти его при потере этого устройства.
-              </label>
+              {!recoveryKeySaved && (
+                <form onSubmit={handleSaveDisplayedRecoveryKey} className="mt-4 flex flex-wrap gap-2">
+                  <input
+                    type="password"
+                    autoComplete="current-password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    className="min-w-0 flex-1 rounded-lg border border-dark-500 bg-dark-700 px-3 py-2 text-sm text-white outline-none focus:border-purple-400"
+                    placeholder="Пароль аккаунта для сохранения в профиле"
+                    required
+                  />
+                  <button type="submit" disabled={busy || !password} className="rounded-lg bg-purple-500 px-3 py-2 text-xs font-medium text-white hover:bg-purple-600 disabled:opacity-50">
+                    {busy ? "Сохраняем…" : "Сохранить в профиле"}
+                  </button>
+                </form>
+              )}
               <button
                 type="button"
-                disabled={!recoverySaved}
-                onClick={() => setGeneratedRecoveryKey(null)}
-                className="mt-3 rounded-lg bg-amber-400 px-4 py-2 text-sm font-semibold text-dark-900 hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+                onClick={() => {
+                  setGeneratedRecoveryKey(null);
+                  if (initialRecoveryKey) void handleClose();
+                }}
+                className="mt-4 rounded-lg bg-amber-400 px-4 py-2 text-sm font-semibold text-dark-900 hover:bg-amber-300"
               >
-                Ключ сохранён — продолжить
+                {recoveryKeySaved ? "Продолжить" : "Продолжить без сохранения"}
               </button>
             </section>
           ) : null}
+
+          {storedRecoveryRecord && !generatedRecoveryKey && (
+            <section className="rounded-xl border border-dark-500 p-4">
+              <h3 className="font-medium text-white">Ключ восстановления</h3>
+              <p className="mt-1 text-xs leading-relaxed text-gray-400">
+                Ключ хранится в профиле только в зашифрованном виде. Для просмотра введите пароль аккаунта; расшифровка выполняется в браузере.
+              </p>
+              {revealedRecoveryKey ? (
+                <>
+                  <code className="mt-3 block select-all break-all rounded-lg bg-black/40 p-3 text-center font-mono text-sm text-white">
+                    {revealedRecoveryKey}
+                  </code>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button type="button" onClick={() => void handleCopyRecoveryKey(revealedRecoveryKey)} className="rounded-lg bg-dark-500 px-3 py-2 text-xs text-white hover:bg-dark-400">
+                      Скопировать
+                    </button>
+                    <button type="button" onClick={() => handleDownloadRecoveryKey(revealedRecoveryKey)} className="rounded-lg bg-dark-500 px-3 py-2 text-xs text-white hover:bg-dark-400">
+                      Скачать .txt
+                    </button>
+                    <button type="button" onClick={() => setRevealedRecoveryKey(null)} className="rounded-lg bg-dark-500 px-3 py-2 text-xs text-white hover:bg-dark-400">
+                      Скрыть
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <form onSubmit={handleRevealStoredRecoveryKey} className="mt-3 flex flex-wrap gap-2">
+                  <input
+                    type="password"
+                    autoComplete="current-password"
+                    value={recoveryRevealPassword}
+                    onChange={(event) => setRecoveryRevealPassword(event.target.value)}
+                    className="min-w-0 flex-1 rounded-lg border border-dark-500 bg-dark-700 px-3 py-2 text-sm text-white outline-none focus:border-purple-400"
+                    placeholder="Пароль аккаунта"
+                    required
+                  />
+                  <button type="submit" disabled={!recoveryRevealPassword} className="rounded-lg bg-purple-500 px-3 py-2 text-xs font-medium text-white hover:bg-purple-600 disabled:opacity-50">
+                    Показать ключ
+                  </button>
+                </form>
+              )}
+            </section>
+          )}
 
           {recoverySetupAvailable && !generatedRecoveryKey && (
             <section className="rounded-xl border border-dark-500 p-4">
               <h3 className="font-medium text-white">Настроить восстановление</h3>
               <p className="mt-1 text-xs leading-relaxed text-gray-400">
-                Matrix создаст cross-signing и резервную копию ключей. Для подтверждения Matrix попросит ваш пароль аккаунта. Recovery key будет показан один раз.
+                Обычно Matrix recovery настраивается автоматически при первом входе. Если автоматическая настройка не удалась, создайте cross-signing и резервную копию здесь.
               </p>
               <form onSubmit={handleSetupRecovery} className="mt-3 space-y-3">
                 <label className="block text-xs text-gray-400">
@@ -574,11 +816,34 @@ export default function DeviceSecurityModal({
             </section>
           )}
 
+          {recoveryRotationAvailable && !generatedRecoveryKey && (
+            <section className="rounded-xl border border-dark-500 p-4">
+              <h3 className="font-medium text-white">Сгенерировать новый ключ</h3>
+              <p className="mt-1 text-xs leading-relaxed text-gray-400">
+                Будет создан новый recovery key и новая серверная копия ключей сообщений. Ключ подтвердится паролем и сохранится в профиле в зашифрованном виде.
+              </p>
+              <form onSubmit={handleRotateRecoveryKey} className="mt-3 flex flex-wrap gap-2">
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  className="min-w-0 flex-1 rounded-lg border border-dark-500 bg-dark-700 px-3 py-2 text-sm text-white outline-none focus:border-purple-400"
+                  placeholder="Пароль аккаунта"
+                  required
+                />
+                <button type="submit" disabled={busy || !password} className="rounded-lg bg-dark-500 px-3 py-2 text-xs font-medium text-white hover:bg-dark-400 disabled:opacity-50">
+                  {busy ? "Создаём…" : "Сгенерировать новый ключ"}
+                </button>
+              </form>
+            </section>
+          )}
+
           {recoveryInputAvailable && (
             <section className="rounded-xl border border-dark-500 p-4">
               <h3 className="font-medium text-white">Восстановить ключи по recovery key</h3>
               <p className="mt-1 text-xs leading-relaxed text-gray-400">
-                Введите сохранённый Matrix recovery key. Он проверяется на клиенте; приложение не сохраняет его в базе данных или браузерном хранилище.
+                Введите Matrix recovery key. Он используется только в памяти браузера для восстановления и не отправляется приложению.
               </p>
               <form onSubmit={handleRestoreWithRecoveryKey} className="mt-3 space-y-3">
                 <label className="block text-xs text-gray-400">
@@ -779,7 +1044,7 @@ export default function DeviceSecurityModal({
           <button
             type="button"
             onClick={() => void handleClose()}
-            disabled={recoveryCloseBlocked || busy || restoring}
+            disabled={busy || restoring}
             className="rounded-lg bg-dark-500 px-4 py-2 text-sm text-white hover:bg-dark-400 disabled:cursor-not-allowed disabled:opacity-40"
           >
             Закрыть

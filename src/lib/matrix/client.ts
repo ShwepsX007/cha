@@ -8,11 +8,13 @@ import {
   Preset,
   Visibility,
   MatrixError,
+  SyncState,
   createClient,
   type MatrixClient,
   type UIAuthCallback,
 } from "matrix-js-sdk";
 import type {
+  CryptoApi,
   CryptoCallbacks,
   ImportRoomKeyProgressData,
   KeyBackupRestoreResult,
@@ -20,6 +22,12 @@ import type {
 import { decodeRecoveryKey, encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import type { IEncryptedFile } from "matrix-encrypt-attachment";
 import type { MatrixSession } from "./types";
+import type { MatrixEvent } from "matrix-js-sdk/lib/models/event";
+import {
+  decryptRecoveryKeyFromProfile,
+  fetchStoredRecoveryKey,
+  saveRecoveryKeyToProfile,
+} from "./recovery-key-storage";
 
 let clientPromise: Promise<MatrixClient> | null = null;
 let currentSessionKey: string | null = null;
@@ -30,6 +38,53 @@ const secretStorageKeyCache = new Map<
   string,
   { keyId?: string; key: Uint8Array<ArrayBuffer> }
 >();
+const matrixSyncReadyPromises = new WeakMap<MatrixClient, Promise<void>>();
+const toDeviceEventListeners = new WeakMap<MatrixClient, (event: MatrixEvent) => void>();
+const outboxSendPromises = new Map<string, Promise<string>>();
+const automaticRecoveryNotices = new Map<string, MatrixRecoveryNotice>();
+
+export const MATRIX_OUTBOX_EVENT = "chata:matrix-outbox-update";
+export const MATRIX_RECOVERY_EVENT = "chata:matrix-recovery-update";
+
+export interface EncryptedOutboxMessage {
+  id: string;
+  transactionId: string;
+  chatId: number;
+  roomId: string;
+  isDirect: boolean;
+  body: string;
+  createdAt: string;
+  status: "queued" | "sending" | "error";
+  error?: string;
+}
+
+export interface MatrixOutboxUpdate {
+  id: string;
+  chatId: number;
+  roomId: string;
+  status: "sending" | "sent" | "error";
+  error?: string;
+  eventId?: string;
+}
+
+export interface MatrixRecoveryNotice {
+  status: "restoring" | "restored" | "needs-recovery" | "error";
+  message: string;
+}
+
+export interface MatrixLoginCryptoResult {
+  recoveryKey?: string;
+  recoveryKeySaved?: boolean;
+  notice?: string;
+}
+
+export interface MatrixDeviceInfo {
+  deviceId: string;
+  displayName: string;
+  lastSeenTs: number | null;
+  current: boolean;
+  verified: boolean;
+}
 
 export interface MatrixTimelineMessage {
   eventId: string;
@@ -50,6 +105,113 @@ export interface MatrixTimelineResult {
 
 function sessionKey(session: MatrixSession): string {
   return `${session.baseUrl}|${session.userId}|${session.deviceId}|${session.accessToken}`;
+}
+
+function matrixOutboxStorageKey(appUserId: number): string {
+  return `chata_matrix_outbox_v1_${appUserId}`;
+}
+
+function readEncryptedOutbox(appUserId: number): EncryptedOutboxMessage[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const serialized = window.sessionStorage.getItem(matrixOutboxStorageKey(appUserId));
+    if (!serialized) return [];
+    const parsed: unknown = JSON.parse(serialized);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is EncryptedOutboxMessage => Boolean(
+      item &&
+      typeof item === "object" &&
+      typeof (item as EncryptedOutboxMessage).id === "string" &&
+      typeof (item as EncryptedOutboxMessage).transactionId === "string" &&
+      Number.isInteger((item as EncryptedOutboxMessage).chatId) &&
+      typeof (item as EncryptedOutboxMessage).roomId === "string" &&
+      typeof (item as EncryptedOutboxMessage).isDirect === "boolean" &&
+      typeof (item as EncryptedOutboxMessage).body === "string" &&
+      typeof (item as EncryptedOutboxMessage).createdAt === "string" &&
+      ["queued", "sending", "error"].includes((item as EncryptedOutboxMessage).status)
+    ));
+  } catch {
+    return [];
+  }
+}
+
+function writeEncryptedOutbox(appUserId: number, messages: EncryptedOutboxMessage[]): void {
+  if (typeof window === "undefined") throw new Error("Очередь E2EE доступна только в браузере");
+  try {
+    window.sessionStorage.setItem(matrixOutboxStorageKey(appUserId), JSON.stringify(messages));
+  } catch {
+    throw new Error("Не удалось сохранить сообщение в локальной очереди. Освободите место в хранилище браузера и повторите попытку.");
+  }
+}
+
+export function getPendingEncryptedMessages(
+  appUserId: number,
+  chatId?: number,
+): EncryptedOutboxMessage[] {
+  const messages = readEncryptedOutbox(appUserId);
+  return chatId === undefined ? messages : messages.filter((message) => message.chatId === chatId);
+}
+
+function emitOutboxUpdate(update: MatrixOutboxUpdate): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent<MatrixOutboxUpdate>(MATRIX_OUTBOX_EVENT, { detail: update }));
+  }
+}
+
+function setAutomaticRecoveryNotice(userId: string, notice: MatrixRecoveryNotice): void {
+  automaticRecoveryNotices.set(userId, notice);
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent<MatrixRecoveryNotice & { userId: string }>(
+      MATRIX_RECOVERY_EVENT,
+      { detail: { ...notice, userId } },
+    ));
+  }
+}
+
+export function getAutomaticRecoveryNotice(userId: string): MatrixRecoveryNotice | null {
+  return automaticRecoveryNotices.get(userId) || null;
+}
+
+export function createEncryptedOutboxMessage(input: {
+  appUserId: number;
+  chatId: number;
+  roomId: string;
+  isDirect: boolean;
+  body: string;
+  createdAt?: string;
+}): EncryptedOutboxMessage {
+  const message: EncryptedOutboxMessage = {
+    id: crypto.randomUUID(),
+    transactionId: `chata_${crypto.randomUUID().replaceAll("-", "")}`,
+    chatId: input.chatId,
+    roomId: input.roomId,
+    isDirect: input.isDirect,
+    body: input.body,
+    createdAt: input.createdAt || new Date().toISOString(),
+    status: "queued",
+  };
+  const messages = readEncryptedOutbox(input.appUserId);
+  writeEncryptedOutbox(input.appUserId, [...messages, message]);
+  return message;
+}
+
+function updateEncryptedOutboxMessage(
+  appUserId: number,
+  messageId: string,
+  patch: Partial<EncryptedOutboxMessage>,
+): EncryptedOutboxMessage | null {
+  const messages = readEncryptedOutbox(appUserId);
+  const index = messages.findIndex((message) => message.id === messageId);
+  if (index < 0) return null;
+  const updated = { ...messages[index], ...patch };
+  messages[index] = updated;
+  writeEncryptedOutbox(appUserId, messages);
+  return updated;
+}
+
+function removeEncryptedOutboxMessage(appUserId: number, messageId: string): void {
+  const messages = readEncryptedOutbox(appUserId).filter((message) => message.id !== messageId);
+  writeEncryptedOutbox(appUserId, messages);
 }
 
 function clearSecretStorageKey(key: string): void {
@@ -112,7 +274,11 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
   if (clientPromise) {
     const oldKey = currentSessionKey;
     const oldClient = await clientPromise.catch(() => null);
-    oldClient?.stopClient();
+    if (oldClient) {
+      const oldListener = toDeviceEventListeners.get(oldClient);
+      if (oldListener) oldClient.removeListener(ClientEvent.ToDeviceEvent, oldListener);
+      oldClient.stopClient();
+    }
     if (oldKey) clearSecretStorageKey(oldKey);
     backfilledRoomIds.clear();
     roomPreparationPromises.clear();
@@ -132,6 +298,7 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
         return [keyId, new Uint8Array(cached.key)];
       },
       cacheSecretStorageKey: (keyId, _keyInfo, secretKey) => {
+        secretStorageKeyCache.get(key)?.key.fill(0);
         secretStorageKeyCache.set(key, {
           keyId,
           key: new Uint8Array(secretKey),
@@ -153,7 +320,28 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
       useIndexedDB: true,
       cryptoDatabasePrefix,
     });
-    client.startClient({ initialSyncLimit: 20 });
+
+    // Register the initial-sync gate and diagnostics before starting sync so a
+    // fast PREPARED event cannot be missed by callers.
+    const initialSyncReady = createInitialSyncPromise(client);
+    matrixSyncReadyPromises.set(client, initialSyncReady);
+    void initialSyncReady.catch(() => {
+      if (matrixSyncReadyPromises.get(client) === initialSyncReady) {
+        matrixSyncReadyPromises.delete(client);
+      }
+    });
+    const onToDeviceEvent = (event: MatrixEvent) => {
+      // Keep production diagnostics useful without logging event payloads,
+      // which may contain secret keys or other sensitive crypto material.
+      console.debug("[Matrix E2EE] received to-device event", {
+        type: event.getType(),
+        sender: event.getSender(),
+      });
+    };
+    toDeviceEventListeners.set(client, onToDeviceEvent);
+    client.on(ClientEvent.ToDeviceEvent, onToDeviceEvent);
+
+    await client.startClient({ initialSyncLimit: 50 });
     return client;
   })();
 
@@ -166,32 +354,110 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
   }
 }
 
-export async function waitForMatrixSync(client: MatrixClient): Promise<void> {
-  if (client.getSyncState() === "SYNCING") return;
+const MATRIX_INITIAL_SYNC_TIMEOUT_MS = 45_000;
 
-  await new Promise<void>((resolve, reject) => {
+function createInitialSyncPromise(client: MatrixClient): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let hasPrepared = false;
+    let settled = false;
     const timeout = window.setTimeout(() => {
-      client.removeListener(ClientEvent.Sync, onSync);
-      reject(new Error("Matrix sync timed out"));
-    }, 30_000);
+      finish(new Error("Matrix не синхронизировался вовремя. Сообщение не отправлено."));
+    }, MATRIX_INITIAL_SYNC_TIMEOUT_MS);
 
-    const onSync = (state: string) => {
-      if (state === "SYNCING") {
-        window.clearTimeout(timeout);
-        client.removeListener(ClientEvent.Sync, onSync);
-        resolve();
-      } else if (state === "ERROR" || state === "STOPPED") {
-        window.clearTimeout(timeout);
-        client.removeListener(ClientEvent.Sync, onSync);
-        reject(new Error(`Matrix sync stopped: ${state}`));
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      client.removeListener(ClientEvent.Sync, onSync);
+      if (error) reject(error);
+      else resolve();
+    };
+
+    const onSync = (state: SyncState) => {
+      if (state === SyncState.Prepared) {
+        hasPrepared = true;
+        finish();
+      } else if (
+        (state === SyncState.Syncing && hasPrepared) ||
+        state === SyncState.Catchup
+      ) {
+        finish();
+      } else if (state === SyncState.Error || state === SyncState.Stopped) {
+        finish(new Error(`Matrix не синхронизирован (${state}). Сообщение не отправлено.`));
       }
     };
 
     client.on(ClientEvent.Sync, onSync);
+    const state = client.getSyncState();
+    if (state === SyncState.Prepared || state === SyncState.Catchup || client.isInitialSyncComplete()) {
+      finish();
+    }
   });
 }
 
-const MATRIX_ROOM_READY_TIMEOUT_MS = 20_000;
+function waitForMatrixReconnect(client: MatrixClient): Promise<void> {
+  if (client.getSyncState() !== SyncState.Reconnecting) return Promise.resolve();
+
+  return new Promise<void>((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      finish(new Error("Matrix не восстановил синхронизацию вовремя. Сообщение не отправлено."));
+    }, MATRIX_INITIAL_SYNC_TIMEOUT_MS);
+
+    const finish = (error?: Error) => {
+      window.clearTimeout(timeout);
+      client.removeListener(ClientEvent.Sync, onSync);
+      if (error) reject(error);
+      else resolve();
+    };
+
+    const onSync = (nextState: SyncState) => {
+      if (
+        nextState === SyncState.Prepared ||
+        nextState === SyncState.Syncing ||
+        nextState === SyncState.Catchup
+      ) {
+        finish();
+      } else if (nextState === SyncState.Error || nextState === SyncState.Stopped) {
+        finish(new Error(`Matrix не синхронизирован (${nextState}). Сообщение не отправлено.`));
+      }
+    };
+
+    client.on(ClientEvent.Sync, onSync);
+    const currentState = client.getSyncState();
+    if (currentState && currentState !== SyncState.Reconnecting) onSync(currentState);
+  });
+}
+
+export async function waitForMatrixSync(client: MatrixClient): Promise<void> {
+  const state = client.getSyncState();
+  if (state === SyncState.Error || state === SyncState.Stopped) {
+    throw new Error(`Matrix не синхронизирован (${state}). Сообщение не отправлено.`);
+  }
+
+  let prepared = matrixSyncReadyPromises.get(client);
+  if (!prepared) {
+    prepared = createInitialSyncPromise(client);
+    matrixSyncReadyPromises.set(client, prepared);
+    void prepared.catch(() => {
+      if (matrixSyncReadyPromises.get(client) === prepared) matrixSyncReadyPromises.delete(client);
+    });
+  }
+
+  await prepared;
+  let currentState = client.getSyncState();
+  if (currentState === SyncState.Error || currentState === SyncState.Stopped) {
+    throw new Error(`Matrix не синхронизирован (${currentState}). Сообщение не отправлено.`);
+  }
+  if (currentState === SyncState.Reconnecting) {
+    await waitForMatrixReconnect(client);
+    currentState = client.getSyncState();
+    if (currentState === SyncState.Error || currentState === SyncState.Stopped) {
+      throw new Error(`Matrix не синхронизирован (${currentState}). Сообщение не отправлено.`);
+    }
+  }
+}
+
+const MATRIX_ROOM_READY_TIMEOUT_MS = 10_000;
 
 function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -271,11 +537,45 @@ async function waitForRoomEncryption(client: MatrixClient, roomId: string): Prom
         throw new Error("В Matrix-комнате отсутствует поддерживаемое E2EE-шифрование.");
       }
     }
-    if (await crypto.isEncryptionEnabledInRoom(roomId)) return;
+    const clientEncryptionState = client.isRoomEncrypted(roomId);
+    const cryptoEncryptionState = await crypto.isEncryptionEnabledInRoom(roomId);
+    if (clientEncryptionState && cryptoEncryptionState) return;
     await wait(200);
   }
 
   throw new Error("Matrix ещё не подтвердил E2EE в этой комнате. Сообщение и файл не отправлены; обновите чат и попробуйте снова.");
+}
+
+async function ensureRoomDeviceListsAreDownloaded(client: MatrixClient, roomId: string): Promise<void> {
+  const crypto = client.getCrypto();
+  const room = client.getRoom(roomId);
+  if (!crypto || !room) throw new Error("Matrix-комната ещё не загружена на этом устройстве");
+
+  const recipientIds = [...new Set(
+    room.currentState.getStateEvents(EventType.RoomMember)
+      .filter((event) => {
+        const membership = event.getContent<Record<string, unknown>>().membership;
+        return membership === "join" || membership === "invite";
+      })
+      .map((event) => event.getStateKey())
+      .filter((userId): userId is string => Boolean(userId)),
+  )];
+  if (recipientIds.length === 0) {
+    throw new Error("В Matrix-комнате пока нет участников для доставки E2EE-ключа");
+  }
+
+  // In Rust crypto v43 this is the supported equivalent of manually calling
+  // /keys/query: it downloads uncached device lists before Megolm shares its
+  // outbound room key via Olm. The SDK manages Olm sessions and key sharing.
+  const devices = await crypto.getUserDeviceInfo(recipientIds, true);
+  if (process.env.NODE_ENV !== "production") {
+    const usersWithoutDevices = recipientIds.filter((userId) => !devices.get(userId)?.size);
+    if (usersWithoutDevices.length > 0) {
+      console.debug("[Matrix E2EE] no currently known devices for invited/offline users", {
+        count: usersWithoutDevices.length,
+      });
+    }
+  }
 }
 
 async function prepareEncryptedRoom(client: MatrixClient, roomId: string): Promise<void> {
@@ -332,11 +632,12 @@ export async function ensureDirectRoomHistoryVisibility(
     const additionalCreators = createContent?.additional_creators;
     const isCreator = createEvent?.getSender() === session.userId ||
       (Array.isArray(additionalCreators) && additionalCreators.includes(session.userId));
-    if (!isCreator) return;
-
     const visibilityEvent = room.currentState.getStateEvents(EventType.RoomHistoryVisibility, "");
     const visibility = visibilityEvent?.getContent<Record<string, unknown>>().history_visibility;
     if (visibility === "invited") return;
+    if (!isCreator) {
+      throw new Error("Личный Matrix-чат ещё не разрешает приглашённым участникам читать историю.");
+    }
     if (visibility !== "joined") {
       throw new Error("Личный Matrix-чат имеет неподдерживаемые настройки видимости истории.");
     }
@@ -389,6 +690,7 @@ export interface MatrixSecurityStatus {
   secretStorageReady: boolean;
   backupVersion: string | null;
   keyBackupAvailable: boolean;
+  devices: MatrixDeviceInfo[];
 }
 
 export async function getMatrixSecurityStatus(
@@ -399,24 +701,39 @@ export async function getMatrixSecurityStatus(
   const crypto = client.getCrypto();
   if (!crypto) throw new Error("Matrix Rust crypto is unavailable");
 
-  const [crossSigning, secretStorage, backupInfo, backupVersion] = await Promise.all([
+  const [crossSigning, secretStorage, backupInfo, backupVersion, hasCrossSigning, deviceResponse] = await Promise.all([
     crypto.getCrossSigningStatus(),
     crypto.getSecretStorageStatus(),
     crypto.getKeyBackupInfo(),
     crypto.getActiveSessionBackupVersion(),
+    crypto.userHasCrossSigningKeys(session.userId, true),
+    client.getDevices(),
   ]);
+  await crypto.getUserDeviceInfo([session.userId], true);
   const cachedKeys = crossSigning.privateKeysCachedLocally;
-  const privateKeysCached =
-    cachedKeys.masterKey && cachedKeys.selfSigningKey && cachedKeys.userSigningKey;
+  const privateKeysCached = Boolean(
+    cachedKeys.masterKey && cachedKeys.selfSigningKey && cachedKeys.userSigningKey,
+  );
+  const devices = await Promise.all(deviceResponse.devices.map(async (device) => {
+    const verification = await crypto.getDeviceVerificationStatus(session.userId, device.device_id);
+    return {
+      deviceId: device.device_id,
+      displayName: device.display_name || `Устройство ${device.device_id}`,
+      lastSeenTs: typeof device.last_seen_ts === "number" ? device.last_seen_ts : null,
+      current: device.device_id === session.deviceId,
+      verified: verification?.isVerified() || false,
+    } satisfies MatrixDeviceInfo;
+  }));
 
   return {
-    crossSigningReady: crossSigning.publicKeysOnDevice,
+    crossSigningReady: crossSigning.publicKeysOnDevice || hasCrossSigning,
     crossSigningPrivateKeysCached: privateKeysCached,
     crossSigningPrivateKeysStored: crossSigning.privateKeysInSecretStorage,
     secretStorageKeyId: secretStorage.defaultKeyId,
     secretStorageReady: secretStorage.ready,
     backupVersion,
     keyBackupAvailable: Boolean(backupInfo),
+    devices,
   };
 }
 
@@ -445,10 +762,164 @@ function passwordUiaCallback(userId: string, password: string): UIAuthCallback<v
   };
 }
 
+async function createSecretStorageAndBackup(
+  crypto: CryptoApi,
+  options: { setupNewSecretStorage?: boolean; setupNewKeyBackup: boolean },
+): Promise<string> {
+  const generatedKey: {
+    value: Awaited<ReturnType<typeof crypto.createRecoveryKeyFromPassphrase>> | null;
+  } = { value: null };
+  await crypto.bootstrapSecretStorage({
+    setupNewSecretStorage: options.setupNewSecretStorage,
+    setupNewKeyBackup: options.setupNewKeyBackup,
+    createSecretStorageKey: async () => {
+      generatedKey.value = await crypto.createRecoveryKeyFromPassphrase();
+      return generatedKey.value;
+    },
+  });
+
+  const createdKey = generatedKey.value;
+  if (!createdKey) throw new Error("Matrix did not create a recovery key");
+  const encodedKey = createdKey.encodedPrivateKey || encodeRecoveryKey(createdKey.privateKey);
+  if (!encodedKey) throw new Error("Matrix could not encode the recovery key");
+  return encodedKey;
+}
+
+const cryptoLoginInitializations = new Map<string, Promise<MatrixLoginCryptoResult>>();
+
+/**
+ * Run after a successful Matrix login. A first-time account gets cross-signing,
+ * secret storage, and a key backup automatically. Existing accounts try the
+ * profile-encrypted recovery key in the background; failure never blocks new
+ * E2EE messages.
+ */
+export async function initializeMatrixCryptoAfterLogin(
+  session: MatrixSession,
+  password: string,
+): Promise<MatrixLoginCryptoResult> {
+  const lockKey = `${session.userId}|${session.deviceId}`;
+  const existing = cryptoLoginInitializations.get(lockKey);
+  if (existing) return existing;
+
+  const initialization = (async (): Promise<MatrixLoginCryptoResult> => {
+    const client = await getMatrixClient(session);
+    await waitForMatrixSync(client);
+    const crypto = client.getCrypto();
+    if (!crypto) throw new Error("Matrix Rust crypto is unavailable");
+
+    const [crossSigning, secretStorage, backupInfo, backupVersion, remoteCrossSigning] = await Promise.all([
+      crypto.getCrossSigningStatus(),
+      crypto.getSecretStorageStatus(),
+      crypto.getKeyBackupInfo(),
+      crypto.getActiveSessionBackupVersion(),
+      crypto.userHasCrossSigningKeys(session.userId, true),
+    ]);
+    const cachedKeys = crossSigning.privateKeysCachedLocally;
+    const allPrivateKeysCached = Boolean(
+      cachedKeys.masterKey && cachedKeys.selfSigningKey && cachedKeys.userSigningKey,
+    );
+    const isNewMatrixAccount =
+      !remoteCrossSigning &&
+      !crossSigning.publicKeysOnDevice &&
+      !secretStorage.defaultKeyId &&
+      !backupInfo;
+
+    if (isNewMatrixAccount) {
+      await crypto.bootstrapCrossSigning({
+        setupNewCrossSigning: true,
+        authUploadDeviceSigningKeys: passwordUiaCallback(session.userId, password),
+      });
+      const recoveryKey = await createSecretStorageAndBackup(crypto, { setupNewKeyBackup: true });
+      let recoveryKeySaved = false;
+      let notice: string | undefined;
+      try {
+        await saveRecoveryKeyToProfile(recoveryKey, password);
+        recoveryKeySaved = true;
+      } catch {
+        notice = "Matrix E2EE настроено, но recovery key не удалось сохранить в профиле. Сохраните его на следующем экране.";
+      }
+      return { recoveryKey, recoveryKeySaved, notice };
+    }
+
+    // If signing keys already exist locally but this account has no secret
+    // storage yet, it is safe to create storage/backup without replacing them.
+    if (!secretStorage.defaultKeyId && allPrivateKeysCached) {
+      const recoveryKey = await createSecretStorageAndBackup(crypto, {
+        setupNewKeyBackup: !backupInfo,
+      });
+      let recoveryKeySaved = false;
+      let notice: string | undefined;
+      try {
+        await saveRecoveryKeyToProfile(recoveryKey, password);
+        recoveryKeySaved = true;
+      } catch {
+        notice = "Matrix ключи настроены, но recovery key не удалось сохранить в профиле. Сохраните его на следующем экране.";
+      }
+      return { recoveryKey, recoveryKeySaved, notice };
+    }
+
+    const localBackupIsReady = !backupInfo || backupVersion === backupInfo.version;
+    if (allPrivateKeysCached && localBackupIsReady) {
+      automaticRecoveryNotices.delete(session.userId);
+      return {};
+    }
+
+    let storedRecoveryKey;
+    try {
+      storedRecoveryKey = await fetchStoredRecoveryKey();
+    } catch {
+      storedRecoveryKey = null;
+    }
+
+    if (storedRecoveryKey) {
+      try {
+        const recoveryKey = await decryptRecoveryKeyFromProfile(storedRecoveryKey, password);
+        setAutomaticRecoveryNotice(session.userId, {
+          status: "restoring",
+          message: "Восстанавливаем старые ключи Matrix в фоне. Новые E2EE-сообщения уже доступны.",
+        });
+        void restoreMatrixRecoveryKey(session, recoveryKey)
+          .then(() => setAutomaticRecoveryNotice(session.userId, {
+            status: "restored",
+            message: "Старые ключи Matrix восстановлены из резервной копии.",
+          }))
+          .catch(() => setAutomaticRecoveryNotice(session.userId, {
+            status: "needs-recovery",
+            message: "Не удалось автоматически расшифровать старые сообщения. Подтвердите вход с другого устройства или введите recovery key в настройках. Новые сообщения можно отправлять.",
+          }));
+        return { notice: "Идёт автоматическое восстановление ключей Matrix." };
+      } catch {
+        // A password change or a damaged profile envelope requires an explicit
+        // recovery key/QR flow. Never replace existing cross-signing keys.
+      }
+    }
+
+    const needsRecovery = Boolean(
+      backupInfo || remoteCrossSigning || crossSigning.publicKeysOnDevice || secretStorage.defaultKeyId,
+    );
+    if (needsRecovery) {
+      const notice = "Для расшифровки старых сообщений подтвердите вход с другого устройства или введите ключ восстановления в настройках. Новые сообщения можно отправлять.";
+      setAutomaticRecoveryNotice(session.userId, { status: "needs-recovery", message: notice });
+      return { notice };
+    }
+
+    return {};
+  })();
+
+  cryptoLoginInitializations.set(lockKey, initialization);
+  try {
+    return await initialization;
+  } finally {
+    if (cryptoLoginInitializations.get(lockKey) === initialization) {
+      cryptoLoginInitializations.delete(lockKey);
+    }
+  }
+}
+
 /**
  * Set up Matrix cross-signing, secret storage, and an encrypted room-key backup.
- * The recovery key is returned once for the user to save; it is never persisted
- * in app storage or sent to the application server.
+ * The recovery key is returned for an optional one-time save screen and is
+ * encrypted in the profile by the caller before it is sent to the server.
  */
 export async function setupMatrixRecovery(
   session: MatrixSession,
@@ -461,10 +932,11 @@ export async function setupMatrixRecovery(
   const crypto = client.getCrypto();
   if (!crypto) throw new Error("Matrix Rust crypto is unavailable");
 
-  const [secretStorage, crossSigning, backupInfo] = await Promise.all([
+  const [secretStorage, crossSigning, backupInfo, remoteCrossSigning] = await Promise.all([
     crypto.getSecretStorageStatus(),
     crypto.getCrossSigningStatus(),
     crypto.getKeyBackupInfo(),
+    crypto.userHasCrossSigningKeys(session.userId, true),
   ]);
   if (secretStorage.defaultKeyId) {
     throw new Error("Matrix secret storage already exists. Use your recovery key or pair a trusted device instead.");
@@ -472,7 +944,7 @@ export async function setupMatrixRecovery(
 
   const cachedKeyCount = Object.values(crossSigning.privateKeysCachedLocally).filter(Boolean).length;
   if (
-    (crossSigning.publicKeysOnDevice && cachedKeyCount !== 3) ||
+    ((remoteCrossSigning || crossSigning.publicKeysOnDevice) && cachedKeyCount !== 3) ||
     (cachedKeyCount > 0 && cachedKeyCount < 3)
   ) {
     throw new Error("This account already has cross-signing keys. Pair a trusted device or restore with its recovery key; refusing to replace them.");
@@ -482,22 +954,45 @@ export async function setupMatrixRecovery(
     authUploadDeviceSigningKeys: passwordUiaCallback(session.userId, password),
   });
 
-  const generatedKey: {
-    value: Awaited<ReturnType<typeof crypto.createRecoveryKeyFromPassphrase>> | null;
-  } = { value: null };
-  await crypto.bootstrapSecretStorage({
-    setupNewKeyBackup: !backupInfo,
-    createSecretStorageKey: async () => {
-      generatedKey.value = await crypto.createRecoveryKeyFromPassphrase();
-      return generatedKey.value;
-    },
+  const recoveryKey = await createSecretStorageAndBackup(crypto, { setupNewKeyBackup: !backupInfo });
+  setAutomaticRecoveryNotice(session.userId, {
+    status: "restored",
+    message: "Matrix cross-signing и резервная копия настроены на этом устройстве.",
   });
+  return recoveryKey;
+}
 
-  const createdKey = generatedKey.value;
-  if (!createdKey) throw new Error("Matrix did not create a recovery key");
-  const encodedKey = createdKey.encodedPrivateKey || encodeRecoveryKey(createdKey.privateKey);
-  if (!encodedKey) throw new Error("Matrix could not encode the recovery key");
-  return encodedKey;
+/** Replace the current secret-storage/recovery key and rotate the room-key backup. */
+export async function rotateMatrixRecoveryKey(
+  session: MatrixSession,
+  password: string,
+): Promise<string> {
+  if (!password) throw new Error("Введите пароль аккаунта для создания нового recovery key");
+  const client = await getMatrixClient(session);
+  await waitForMatrixSync(client);
+  const crypto = client.getCrypto();
+  if (!crypto) throw new Error("Matrix Rust crypto is unavailable");
+
+  const [secretStorage, crossSigning] = await Promise.all([
+    crypto.getSecretStorageStatus(),
+    crypto.getCrossSigningStatus(),
+  ]);
+  const cachedKeys = crossSigning.privateKeysCachedLocally;
+  if (!secretStorage.defaultKeyId || !(
+    cachedKeys.masterKey && cachedKeys.selfSigningKey && cachedKeys.userSigningKey
+  )) {
+    throw new Error("Сначала восстановите существующие cross-signing ключи на этом устройстве; новый ключ вместо них не создавался.");
+  }
+
+  const recoveryKey = await createSecretStorageAndBackup(crypto, {
+    setupNewSecretStorage: true,
+    setupNewKeyBackup: true,
+  });
+  setAutomaticRecoveryNotice(session.userId, {
+    status: "restored",
+    message: "Recovery key и Matrix backup обновлены.",
+  });
+  return recoveryKey;
 }
 
 export interface MatrixRecoveryResult {
@@ -518,13 +1013,13 @@ export async function restoreMatrixRecoveryKey(
 
   const decodedKey = decodeRecoveryKey(recoveryKey.trim());
   const cacheKey = sessionKey(session);
-  const secretStorage = await crypto.getSecretStorageStatus();
-  secretStorageKeyCache.set(cacheKey, {
-    keyId: secretStorage.defaultKeyId || undefined,
-    key: decodedKey,
-  });
-
   try {
+    const secretStorage = await crypto.getSecretStorageStatus();
+    clearSecretStorageKey(cacheKey);
+    secretStorageKeyCache.set(cacheKey, {
+      keyId: secretStorage.defaultKeyId || undefined,
+      key: decodedKey,
+    });
     const backupInfo = await crypto.getKeyBackupInfo();
     const hasCrossSigningSecrets =
       secretStorage.secretStorageKeyValidityMap["m.cross_signing.master"] &&
@@ -550,6 +1045,12 @@ export async function restoreMatrixRecoveryKey(
     if (!crossSigningRestored && !backup) {
       throw new Error("No recoverable Matrix keys were found for this account");
     }
+    setAutomaticRecoveryNotice(session.userId, {
+      status: "restored",
+      message: backup
+        ? "Старые ключи Matrix восстановлены из резервной копии."
+        : "Ключи проверки Matrix восстановлены.",
+    });
     return { crossSigningRestored, backup };
   } finally {
     clearSecretStorageKey(cacheKey);
@@ -577,7 +1078,12 @@ export async function restoreMatrixHistoryFromVerifiedDevice(
     throw new Error("Matrix backup key is not available on this device yet");
   }
 
-  return await crypto.restoreKeyBackup({ progressCallback: onProgress });
+  const result = await crypto.restoreKeyBackup({ progressCallback: onProgress });
+  setAutomaticRecoveryNotice(session.userId, {
+    status: "restored",
+    message: "Устройство подтверждено; зашифрованная история Matrix восстановлена.",
+  });
+  return result;
 }
 
 export async function createEncryptedRoom(
@@ -597,7 +1103,11 @@ export async function createEncryptedRoom(
       {
         type: EventType.RoomEncryption,
         state_key: "",
-        content: { algorithm: "m.megolm.v1.aes-sha2" },
+        content: {
+          algorithm: "m.megolm.v1.aes-sha2",
+          rotation_period_ms: 7 * 24 * 60 * 60 * 1000,
+          rotation_period_msgs: 100,
+        },
       },
       {
         type: EventType.RoomJoinRules,
@@ -639,14 +1149,177 @@ export async function sendEncryptedText(
   session: MatrixSession,
   roomId: string,
   body: string,
-): Promise<void> {
+  transactionId?: string,
+): Promise<string> {
   const client = await ensureEncryptedRoomReady(session, roomId);
   const crypto = client.getCrypto();
-  if (!crypto || !(await crypto.isEncryptionEnabledInRoom(roomId))) {
+  if (!crypto || !client.isRoomEncrypted(roomId) || !(await crypto.isEncryptionEnabledInRoom(roomId))) {
     throw new Error("Refusing to send: this Matrix room is not encrypted");
   }
 
-  await client.sendTextMessage(roomId, body);
+  await ensureRoomDeviceListsAreDownloaded(client, roomId);
+  const response = await client.sendTextMessage(roomId, body, transactionId);
+  return response.event_id;
+}
+
+const OUTBOX_RETRY_DELAYS_MS = [1_000, 3_000, 9_000] as const;
+
+function isRetryableMatrixSendError(error: unknown): boolean {
+  const transientMessage = error instanceof Error &&
+    /network|fetch|timeout|timed out|connection|reconnect|unknown device|olm session|sync/i.test(error.message);
+  if (error instanceof MatrixError) {
+    const status = error.httpStatus;
+    return status === 0 || status === 408 || status === 429 ||
+      (typeof status === "number" && status >= 500) ||
+      transientMessage;
+  }
+  if (!(error instanceof Error)) return true;
+  if (error.name === "TypeError") return true;
+  return Boolean(transientMessage);
+}
+
+function matrixSendErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return "Не удалось отправить E2EE-сообщение. Проверьте соединение и повторите попытку.";
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function runEncryptedOutboxMessage(
+  session: MatrixSession,
+  item: EncryptedOutboxMessage,
+): Promise<string> {
+  const operationKey = `${sessionKey(session)}|${item.id}`;
+  const active = outboxSendPromises.get(operationKey);
+  if (active) return active;
+
+  const operation = (async () => {
+    const appUserId = getAppUserIdFromMatrixSession(session);
+    let lastError: unknown;
+    try {
+      updateEncryptedOutboxMessage(appUserId, item.id, {
+        status: "sending",
+        error: undefined,
+      });
+    } catch {
+      // The item was persisted before its first send. UI status events are still
+      // delivered if browser storage becomes unavailable mid-flight.
+    }
+    emitOutboxUpdate({ id: item.id, chatId: item.chatId, roomId: item.roomId, status: "sending" });
+
+    for (let attempt = 0; attempt <= OUTBOX_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        if (item.isDirect) {
+          await ensureDirectRoomHistoryVisibility(session, item.roomId);
+        }
+        const eventId = await sendEncryptedText(
+          session,
+          item.roomId,
+          item.body,
+          item.transactionId,
+        );
+        try {
+          removeEncryptedOutboxMessage(appUserId, item.id);
+        } catch {
+            // A fixed Matrix transaction ID makes a later drain idempotent even
+            // if browser storage could not remove an already-sent item.
+        }
+        emitOutboxUpdate({
+          id: item.id,
+          chatId: item.chatId,
+          roomId: item.roomId,
+          status: "sent",
+          eventId,
+        });
+        return eventId;
+      } catch (error) {
+        lastError = error;
+        const message = matrixSendErrorMessage(error);
+        try {
+          updateEncryptedOutboxMessage(appUserId, item.id, {
+            status: attempt < OUTBOX_RETRY_DELAYS_MS.length && isRetryableMatrixSendError(error) ? "queued" : "error",
+            error: message,
+          });
+        } catch {
+          // Keep the in-memory error visible if sessionStorage is unavailable.
+        }
+        emitOutboxUpdate({
+          id: item.id,
+          chatId: item.chatId,
+          roomId: item.roomId,
+          status: "sending",
+          error: message,
+        });
+        if (attempt >= OUTBOX_RETRY_DELAYS_MS.length || !isRetryableMatrixSendError(error)) break;
+        await delay(OUTBOX_RETRY_DELAYS_MS[attempt]);
+      }
+    }
+
+    const errorMessage = matrixSendErrorMessage(lastError);
+    try {
+      updateEncryptedOutboxMessage(appUserId, item.id, {
+        status: "error",
+        error: errorMessage,
+      });
+    } catch {
+      // The chat UI still displays the final error and preserves its retry action.
+    }
+    emitOutboxUpdate({
+      id: item.id,
+      chatId: item.chatId,
+      roomId: item.roomId,
+      status: "error",
+      error: errorMessage,
+    });
+    throw lastError instanceof Error ? lastError : new Error(errorMessage);
+  })();
+
+  outboxSendPromises.set(operationKey, operation);
+  try {
+    return await operation;
+  } finally {
+    if (outboxSendPromises.get(operationKey) === operation) {
+      outboxSendPromises.delete(operationKey);
+    }
+  }
+}
+
+function getAppUserIdFromMatrixSession(session: MatrixSession): number {
+  const match = session.userId.match(/^@chata_u(\d+):/);
+  if (!match) throw new Error("Matrix user does not match this application");
+  return Number(match[1]);
+}
+
+export async function sendQueuedEncryptedMessage(
+  session: MatrixSession,
+  messageId: string,
+): Promise<string> {
+  const appUserId = getAppUserIdFromMatrixSession(session);
+  const item = readEncryptedOutbox(appUserId).find((message) => message.id === messageId);
+  if (!item) throw new Error("Сообщение уже отправлено или отсутствует в очереди");
+  return runEncryptedOutboxMessage(session, item);
+}
+
+export async function retryQueuedEncryptedMessage(
+  session: MatrixSession,
+  messageId: string,
+): Promise<string> {
+  return sendQueuedEncryptedMessage(session, messageId);
+}
+
+export async function drainEncryptedOutbox(session: MatrixSession): Promise<void> {
+  const appUserId = getAppUserIdFromMatrixSession(session);
+  await waitForMatrixSync(await getMatrixClient(session));
+  const items = readEncryptedOutbox(appUserId);
+  for (const item of items) {
+    try {
+      await runEncryptedOutboxMessage(session, item);
+    } catch {
+      // The item remains in sessionStorage with an explicit error state.
+    }
+  }
 }
 
 export async function sendEncryptedAttachment(
@@ -661,10 +1334,11 @@ export async function sendEncryptedAttachment(
 ): Promise<void> {
   const client = await ensureEncryptedRoomReady(session, roomId);
   const crypto = client.getCrypto();
-  if (!crypto || !(await crypto.isEncryptionEnabledInRoom(roomId))) {
+  if (!crypto || !client.isRoomEncrypted(roomId) || !(await crypto.isEncryptionEnabledInRoom(roomId))) {
     throw new Error("Refusing to send: this Matrix room is not encrypted");
   }
 
+  await ensureRoomDeviceListsAreDownloaded(client, roomId);
   const sha256 = input.encryptedFile.hashes?.sha256;
   if (!sha256 || !input.encryptedFile.v) {
     throw new Error("Matrix encrypted attachment metadata is incomplete");
@@ -812,7 +1486,11 @@ export async function stopMatrixClient(logout = false): Promise<void> {
     return;
   }
   const client = await clientPromise.catch(() => null);
-  client?.stopClient();
+  if (client) {
+    const listener = toDeviceEventListeners.get(client);
+    if (listener) client.removeListener(ClientEvent.ToDeviceEvent, listener);
+    client.stopClient();
+  }
   if (logout && client) {
     await client.logout().catch(() => undefined);
   }

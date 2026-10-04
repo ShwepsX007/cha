@@ -14,6 +14,10 @@ export const users = pgTable("users", {
   username: varchar("username", { length: 50 }).notNull().unique(),
   displayName: varchar("display_name", { length: 100 }).notNull(),
   passwordHash: text("password_hash").notNull(),
+  // Ciphertext only: the recovery key is encrypted in the browser with a
+  // PBKDF2-derived key before either value reaches the application server.
+  matrixRecoveryKeyEncrypted: text("matrix_recovery_key_encrypted"),
+  matrixRecoveryKeySalt: text("matrix_recovery_key_salt"),
   avatarColor: varchar("avatar_color", { length: 7 }).notNull().default("#6C5CE7"),
   lastSeen: timestamp("last_seen").defaultNow(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
