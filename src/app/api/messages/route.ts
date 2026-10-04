@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { messages, users, chatMembers } from "@/db/schema";
+import { messages, users, chatMembers, chats } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { eq, and, asc } from "drizzle-orm";
 
@@ -68,7 +68,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "chatId and content required" }, { status: 400 });
     }
 
-    // Check membership
     const [membership] = await db
       .select()
       .from(chatMembers)
@@ -78,6 +77,18 @@ export async function POST(req: NextRequest) {
 
     if (!membership) {
       return NextResponse.json({ error: "Not a member" }, { status: 403 });
+    }
+
+    const [chat] = await db
+      .select({ securityMode: chats.securityMode })
+      .from(chats)
+      .where(eq(chats.id, chatId));
+
+    if (!chat || chat.securityMode !== "public") {
+      return NextResponse.json(
+        { error: "Private messages must use the encrypted Matrix room", code: "E2EE_REQUIRED" },
+        { status: 409 },
+      );
     }
 
     const [msg] = await db

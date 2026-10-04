@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { users, chats, chatMembers } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import { createToken } from "@/lib/auth";
+import { createMatrixSession, type MatrixLoginResult } from "@/lib/matrix/server";
 
 const AVATAR_COLORS = [
   "#6C5CE7", "#A29BFE", "#00B894", "#00CEC9", "#0984E3",
@@ -12,7 +13,7 @@ const AVATAR_COLORS = [
 
 export async function POST(req: NextRequest) {
   try {
-    const { username, password, displayName } = await req.json();
+    const { username, password, displayName, matrixDeviceId } = await req.json();
 
     if (!username || !password) {
       return NextResponse.json({ error: "Логин и пароль обязательны" }, { status: 400 });
@@ -47,12 +48,12 @@ export async function POST(req: NextRequest) {
     let [generalChat] = await db
       .select()
       .from(chats)
-      .where(eq(chats.name, "Общий чат"));
+      .where(and(eq(chats.name, "Общий чат"), eq(chats.securityMode, "public")));
 
     if (!generalChat) {
       [generalChat] = await db
         .insert(chats)
-        .values({ name: "Общий чат", isGroup: true, createdBy: user.id })
+        .values({ name: "Общий чат", isGroup: true, createdBy: user.id, securityMode: "public" })
         .returning();
     }
 
@@ -71,11 +72,30 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    let matrix: MatrixLoginResult = { availability: "unavailable", session: null };
+    try {
+      matrix = await createMatrixSession({
+        appUserId: user.id,
+        username: user.username,
+        displayName: user.displayName,
+        password,
+        deviceId: matrixDeviceId,
+      });
+    } catch (error) {
+      // Registration remains available for the public chat if Matrix is offline.
+      console.error("Matrix session unavailable:", error);
+    }
+
     const token = await createToken(user.id, user.username);
 
-    const response = NextResponse.json({ user: { id: user.id, username: user.username, displayName: user.displayName } });
+    const response = NextResponse.json({
+      user: { id: user.id, username: user.username, displayName: user.displayName },
+      matrixAvailability: matrix.availability,
+      matrixSession: matrix.session,
+    });
     response.cookies.set("auth_token", token, {
       httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
       path: "/",
       maxAge: 60 * 60 * 24 * 7,

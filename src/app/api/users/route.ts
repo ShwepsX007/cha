@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { users } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { ne } from "drizzle-orm";
+import { ensureMatrixIdentity, getMatrixUserId } from "@/lib/matrix/server";
 
 export async function GET() {
   try {
@@ -22,7 +23,20 @@ export async function GET() {
       .from(users)
       .where(ne(users.id, payload.userId));
 
-    return NextResponse.json({ users: allUsers });
+    const usersWithMatrixIds = await Promise.all(
+      allUsers.map(async (user) => {
+        try {
+          await ensureMatrixIdentity(user.id, user.displayName);
+        } catch (error) {
+          // Keep public-chat user discovery available if Matrix is not ready.
+          console.error("Matrix identity provisioning failed:", error);
+        }
+
+        return { ...user, matrixUserId: getMatrixUserId(user.id) };
+      }),
+    );
+
+    return NextResponse.json({ users: usersWithMatrixIds });
   } catch (error) {
     console.error("Users error:", error);
     return NextResponse.json({ error: "Server error" }, { status: 500 });

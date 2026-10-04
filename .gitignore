@@ -1,0 +1,12 @@
+node_modules/
+.next/
+out/
+build/
+coverage/
+*.tsbuildinfo
+
+# Local environment files may contain database credentials and secrets.
+.env*
+!.env.example
+
+npm-debug.log*

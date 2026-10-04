@@ -1,11 +1,28 @@
 "use client";
 
 import { useState } from "react";
+import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
 
 interface User {
   id: number;
   username: string;
   displayName: string;
+  matrixAvailability?: MatrixAvailability;
+  matrixSession?: MatrixSession | null;
+}
+
+function getMatrixDeviceId(username: string): string {
+  const storageKey = `chata_matrix_device_${username.toLowerCase()}`;
+  try {
+    const existing = localStorage.getItem(storageKey);
+    if (existing && /^[A-Za-z0-9._=-]{1,255}$/.test(existing)) return existing;
+
+    const deviceId = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+    localStorage.setItem(storageKey, deviceId);
+    return deviceId;
+  } catch {
+    return crypto.randomUUID().replaceAll("-", "").toUpperCase();
+  }
 }
 
 export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void }) {
@@ -24,9 +41,10 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
 
     try {
       const endpoint = isLogin ? "/api/auth/login" : "/api/auth/register";
+      const matrixDeviceId = getMatrixDeviceId(username);
       const body = isLogin
-        ? { username, password }
-        : { username, password, displayName: displayName || username };
+        ? { username, password, matrixDeviceId }
+        : { username, password, displayName: displayName || username, matrixDeviceId };
 
       const res = await fetch(endpoint, {
         method: "POST",
@@ -40,7 +58,19 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
         return;
       }
 
-      onAuth(data.user);
+      const authenticatedUser: User = {
+        ...data.user,
+        matrixAvailability: data.matrixAvailability || "unavailable",
+        matrixSession: data.matrixSession || null,
+      };
+
+      if (authenticatedUser.matrixSession) {
+        sessionStorage.setItem("chata_matrix_session", JSON.stringify(authenticatedUser.matrixSession));
+      } else {
+        sessionStorage.removeItem("chata_matrix_session");
+      }
+      sessionStorage.setItem("chata_matrix_availability", authenticatedUser.matrixAvailability || "unavailable");
+      onAuth(authenticatedUser);
     } catch {
       setError("Ошибка соединения");
     } finally {

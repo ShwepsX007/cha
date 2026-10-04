@@ -1,7 +1,11 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import type { MouseEvent } from "react";
 import type { User, Chat, ChatMessage } from "./ChatApp";
+import { decryptAttachment, encryptAttachment } from "matrix-encrypt-attachment";
+import { getEncryptedRoomMessages, hasMatrixInvitePermission, sendEncryptedAttachment, sendEncryptedText } from "@/lib/matrix/client";
+import AddGroupMembersModal from "./AddGroupMembersModal";
 
 function formatTime(dateStr: string) {
   return new Date(dateStr).toLocaleTimeString("ru-RU", {
@@ -24,15 +28,50 @@ function MessageBubble({
   msg: ChatMessage;
   isOwn: boolean;
 }) {
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState("");
+
+  const downloadEncryptedFile = async () => {
+    if (!msg.encryptedAttachment || downloading) return;
+    setDownloading(true);
+    setDownloadError("");
+    try {
+      const response = await fetch(msg.encryptedAttachment.url);
+      if (!response.ok) throw new Error("Ciphertext download failed");
+      const ciphertext = await response.arrayBuffer();
+      const plaintext = await decryptAttachment(ciphertext, msg.encryptedAttachment);
+      const blob = new Blob([plaintext], { type: msg.mimeType || "application/octet-stream" });
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = msg.fileName || "attachment";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    } catch (error) {
+      console.error("Encrypted attachment download failed");
+      setDownloadError("Не удалось скачать или расшифровать файл на этом устройстве.");
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const handleAttachmentClick = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (!msg.encryptedAttachment) return;
+    event.preventDefault();
+    void downloadEncryptedFile();
+  };
+
   const renderFileContent = () => {
-    const hasFile = msg.telegramFileId;
-    const fileUrl = `/api/file/${msg.id}`;
+    const hasFile = Boolean(msg.telegramFileId || msg.encryptedAttachment);
+    const fileUrl = msg.encryptedAttachment?.url || `/api/file/${msg.id}`;
 
     if (msg.messageType === "image") {
       return (
         <div className="mb-1">
           {hasFile ? (
-            <a href={fileUrl} target="_blank" rel="noopener noreferrer">
+            <a href={fileUrl} onClick={handleAttachmentClick} target="_blank" rel="noopener noreferrer">
               <div className="bg-dark-600 rounded-lg p-3 flex items-center gap-3 hover:bg-dark-500 transition-colors">
                 <div className="w-10 h-10 bg-purple-500/20 rounded-lg flex items-center justify-center">
                   <span className="text-xl">📷</span>
@@ -63,7 +102,7 @@ function MessageBubble({
       return (
         <div className="mb-1">
           {hasFile ? (
-            <a href={fileUrl} target="_blank" rel="noopener noreferrer">
+            <a href={fileUrl} onClick={handleAttachmentClick} target="_blank" rel="noopener noreferrer">
               <div className="bg-dark-600 rounded-lg p-3 flex items-center gap-3 hover:bg-dark-500 transition-colors">
                 <div className="w-10 h-10 bg-blue-500/20 rounded-lg flex items-center justify-center">
                   <span className="text-xl">🎬</span>
@@ -94,7 +133,7 @@ function MessageBubble({
       return (
         <div className="mb-1">
           {hasFile ? (
-            <a href={fileUrl} target="_blank" rel="noopener noreferrer">
+            <a href={fileUrl} onClick={handleAttachmentClick} target="_blank" rel="noopener noreferrer">
               <div className="bg-dark-600 rounded-lg p-3 flex items-center gap-3 hover:bg-dark-500 transition-colors">
                 <div className="w-10 h-10 bg-green-500/20 rounded-lg flex items-center justify-center">
                   <span className="text-xl">📎</span>
@@ -147,7 +186,14 @@ function MessageBubble({
               : "bg-dark-600 text-gray-100 rounded-bl-md"
           }`}
         >
+          {msg.isLegacy && (
+            <div className="text-[9px] uppercase tracking-wide text-amber-300/80 mb-1">
+              Legacy · не зашифровано
+            </div>
+          )}
           {msg.messageType !== "text" && renderFileContent()}
+          {downloading && <div className="text-xs text-gray-400">Скачиваем и расшифровываем…</div>}
+          {downloadError && <div className="text-xs text-red-300">{downloadError}</div>}
           {msg.messageType === "text" && msg.content && (
             <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
           )}
@@ -184,9 +230,37 @@ export default function ChatWindow({
   const [newMessage, setNewMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [sendError, setSendError] = useState("");
+  const [messageReadError, setMessageReadError] = useState("");
+  const [showAddMembers, setShowAddMembers] = useState(false);
+  const [invitePermissionRoomId, setInvitePermissionRoomId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const prevMsgCountRef = useRef(0);
+
+  useEffect(() => {
+    if (
+      !chat.isGroup ||
+      chat.securityMode !== "e2ee" ||
+      !chat.matrixRoomId ||
+      !currentUser.matrixSession
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    hasMatrixInvitePermission(currentUser.matrixSession, chat.matrixRoomId)
+      .then((allowed) => {
+        if (!cancelled) setInvitePermissionRoomId(allowed ? chat.matrixRoomId : null);
+      })
+      .catch(() => {
+        if (!cancelled) setInvitePermissionRoomId(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [chat.isGroup, chat.matrixRoomId, chat.securityMode, currentUser.matrixSession]);
 
   const scrollToBottom = useCallback((force = false) => {
     if (force || true) {
@@ -198,17 +272,80 @@ export default function ChatWindow({
     try {
       const res = await fetch(`/api/messages?chatId=${chat.id}`);
       const data = await res.json();
-      if (data.messages) {
-        setMessages(data.messages);
-        if (data.messages.length !== prevMsgCountRef.current) {
-          prevMsgCountRef.current = data.messages.length;
-          setTimeout(() => scrollToBottom(true), 50);
+      if (!res.ok || !Array.isArray(data.messages)) return;
+
+      const legacyMessages: ChatMessage[] = data.messages.map((message: ChatMessage) => ({
+        ...message,
+        isLegacy: chat.securityMode !== "public",
+      }));
+      let visibleMessages = legacyMessages;
+
+      if (chat.securityMode === "e2ee" && chat.matrixRoomId && currentUser.matrixSession) {
+        try {
+          const matrixMessages = await getEncryptedRoomMessages(
+            currentUser.matrixSession,
+            chat.matrixRoomId,
+            chat.id,
+          );
+          setMessageReadError("");
+          const liveMessages: ChatMessage[] = matrixMessages.map((message) => {
+            const senderId = Number(message.senderUserId);
+            const sender = chat.members.find((member) => member.id === senderId);
+            const isFile = message.msgtype === "m.file";
+            const mimeType = message.mimeType || null;
+            return {
+              id: message.eventId,
+              chatId: chat.id,
+              senderId,
+              content: isFile ? null : message.body,
+              messageType: isFile
+                ? mimeType?.startsWith("image/")
+                  ? "image"
+                  : mimeType?.startsWith("video/")
+                    ? "video"
+                    : "file"
+                : "text",
+              telegramFileId: null,
+              fileName: isFile ? message.body : null,
+              fileSize: isFile ? message.fileSize || null : null,
+              mimeType,
+              encryptedAttachment: message.encryptedFile,
+              createdAt: new Date(message.timestamp).toISOString(),
+              senderUsername: sender?.username || message.senderMxid,
+              senderDisplayName: sender?.displayName || "Пользователь",
+              senderAvatarColor: sender?.avatarColor || "#6C5CE7",
+              isLegacy: false,
+            };
+          });
+          visibleMessages = [...legacyMessages, ...liveMessages].sort(
+            (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+          );
+        } catch (err) {
+          console.error("Failed to read encrypted Matrix messages");
+          setMessageReadError("Не удалось загрузить зашифрованные сообщения на этом устройстве.");
         }
+      } else if (chat.securityMode === "e2ee" && chat.matrixRoomId) {
+        setMessageReadError("На этой вкладке нет активной Matrix-сессии. Войдите снова, чтобы читать новые сообщения.");
+      } else {
+        setMessageReadError("");
+      }
+
+      setMessages(visibleMessages);
+      if (visibleMessages.length !== prevMsgCountRef.current) {
+        prevMsgCountRef.current = visibleMessages.length;
+        setTimeout(() => scrollToBottom(true), 50);
       }
     } catch (err) {
       console.error("Failed to load messages:", err);
     }
-  }, [chat.id, scrollToBottom]);
+  }, [
+    chat.id,
+    chat.matrixRoomId,
+    chat.members,
+    chat.securityMode,
+    currentUser.matrixSession,
+    scrollToBottom,
+  ]);
 
   useEffect(() => {
     prevMsgCountRef.current = 0;
@@ -221,22 +358,32 @@ export default function ChatWindow({
     e.preventDefault();
     if (!newMessage.trim() || sending) return;
 
-    const msgText = newMessage;
+    const msgText = newMessage.trim();
     setNewMessage("");
+    setSendError("");
     setSending(true);
 
     try {
-      await fetch("/api/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId: chat.id, content: msgText }),
-      });
+      if (chat.securityMode === "public") {
+        const response = await fetch("/api/messages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chatId: chat.id, content: msgText }),
+        });
+        if (!response.ok) throw new Error("Не удалось отправить сообщение");
+      } else if (chat.securityMode === "e2ee" && chat.matrixRoomId && currentUser.matrixSession) {
+        await sendEncryptedText(currentUser.matrixSession, chat.matrixRoomId, msgText);
+      } else {
+        throw new Error("Matrix E2EE не подключён. Сообщение не отправлено открытым текстом.");
+      }
+
       await loadMessages();
       onMessageSent();
       scrollToBottom(true);
     } catch (err) {
-      console.error("Failed to send:", err);
+      console.error("Failed to send message");
       setNewMessage(msgText);
+      setSendError(err instanceof Error ? err.message : "Не удалось отправить сообщение");
     } finally {
       setSending(false);
     }
@@ -246,28 +393,67 @@ export default function ChatWindow({
     const file = e.target.files?.[0];
     if (!file) return;
 
+    setSendError("");
     setUploading(true);
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("chatId", String(chat.id));
+      if (chat.securityMode === "public") {
+        const formData = new FormData();
+        formData.append("file", file);
+        formData.append("chatId", String(chat.id));
 
-      await fetch("/api/upload", {
-        method: "POST",
-        body: formData,
-      });
+        const response = await fetch("/api/upload", { method: "POST", body: formData });
+        if (!response.ok) throw new Error("Не удалось загрузить файл");
+      } else if (chat.securityMode === "e2ee" && chat.matrixRoomId && currentUser.matrixSession) {
+        if (file.size > 45 * 1024 * 1024) {
+          throw new Error("Размер файла для E2EE не должен превышать 45 МБ");
+        }
+
+        // Matrix.org's attachment library encrypts the bytes in the browser
+        // using the Matrix encrypted-attachment format. Only ciphertext and a
+        // random filename are sent to the Telegram upload endpoint.
+        const encrypted = await encryptAttachment(await file.arrayBuffer());
+        const ciphertext = new Blob([encrypted.data], { type: "application/octet-stream" });
+        const formData = new FormData();
+        formData.append("file", ciphertext, `ciphertext-${crypto.randomUUID()}.bin`);
+        formData.append("chatId", String(chat.id));
+        formData.append("encrypted", "true");
+
+        const response = await fetch("/api/upload", { method: "POST", body: formData });
+        const uploadResult = await response.json();
+        if (!response.ok || typeof uploadResult.telegramFileId !== "string") {
+          throw new Error(uploadResult.error || "Не удалось сохранить зашифрованный файл в Telegram");
+        }
+
+        const fileUrl = new URL("/api/file/telegram", window.location.origin);
+        fileUrl.searchParams.set("chatId", String(chat.id));
+        fileUrl.searchParams.set("fileId", uploadResult.telegramFileId);
+        await sendEncryptedAttachment(currentUser.matrixSession, chat.matrixRoomId, {
+          fileName: file.name,
+          mimeType: file.type || "application/octet-stream",
+          fileSize: file.size,
+          encryptedFile: { ...encrypted.info, url: fileUrl.toString() },
+        });
+      } else {
+        throw new Error("Этот чат не готов к безопасной загрузке файлов");
+      }
+
       await loadMessages();
       onMessageSent();
       scrollToBottom(true);
     } catch (err) {
-      console.error("Failed to upload:", err);
+      console.error("Failed to upload attachment");
+      setSendError(err instanceof Error ? err.message : "Не удалось загрузить файл");
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
-  const otherMember = chat.members.find((m) => m.id !== currentUser.id);
+  const otherMember = chat.isGroup ? undefined : chat.members.find((m) => m.id !== currentUser.id);
+  const canSendMessage =
+    chat.securityMode === "public" ||
+    (chat.securityMode === "e2ee" && Boolean(chat.matrixRoomId && currentUser.matrixSession));
+  const canAttachFile = canSendMessage;
 
   return (
     <div className="flex flex-col h-full bg-dark-900">
@@ -298,17 +484,49 @@ export default function ChatWindow({
                 : "был(а) недавно"
               : `${chat.members.length} участников`}
           </div>
+          <div className={`text-[10px] mt-0.5 ${chat.securityMode === "e2ee" ? "text-emerald-400" : "text-amber-400"}`}>
+            {chat.securityMode === "public"
+              ? "Открытый чат · без E2EE"
+              : chat.securityMode === "e2ee"
+                ? currentUser.matrixSession
+                  ? "Matrix E2EE · старая история помечена как legacy"
+                  : "E2EE-комната · Matrix-сессия на этой вкладке недоступна"
+                : "Legacy-чат · новые сообщения заблокированы до E2EE"}
+          </div>
         </div>
+        {chat.isGroup && chat.securityMode === "e2ee" && chat.matrixRoomId === invitePermissionRoomId && (
+          <button
+            onClick={() => setShowAddMembers(true)}
+            className="rounded-lg p-2 text-gray-400 hover:bg-dark-600 hover:text-white"
+            title="Добавить участников (создатель/админ)"
+            aria-label="Добавить участников"
+          >
+            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18 9a3 3 0 11-6 0 3 3 0 016 0zM3 20a6 6 0 0112 0M19 8v6m3-3h-6" />
+            </svg>
+          </button>
+        )}
       </div>
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-4 py-4">
+        {messageReadError && (
+          <div className="mb-3 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
+            {messageReadError} Legacy-история при этом остаётся доступна ниже.
+          </div>
+        )}
         {messages.length === 0 ? (
           <div className="h-full flex items-center justify-center">
             <div className="text-center">
               <div className="text-4xl mb-3">🔐</div>
-              <p className="text-gray-500 text-sm">Начните разговор!</p>
-              <p className="text-gray-600 text-xs mt-1">Сообщения видны только участникам чата</p>
+              <p className="text-gray-500 text-sm">{chat.securityMode === "legacy" ? "История чата сохранена как legacy" : "Начните разговор!"}</p>
+              <p className="text-gray-600 text-xs mt-1">
+                {chat.securityMode === "public"
+                  ? "Этот общий чат не шифруется"
+                  : chat.securityMode === "e2ee"
+                    ? "Новые сообщения шифруются Matrix на устройствах участников"
+                    : "Новые сообщения не отправляются открытым текстом"}
+              </p>
             </div>
           </div>
         ) : (
@@ -325,6 +543,11 @@ export default function ChatWindow({
 
       {/* Input */}
       <div className="px-4 py-3 bg-dark-800 border-t border-dark-600">
+        {sendError && (
+          <div className="mb-2 text-xs text-amber-300" role="status">
+            {sendError}
+          </div>
+        )}
         <form onSubmit={handleSend} className="flex items-center gap-2">
           <input
             type="file"
@@ -337,9 +560,9 @@ export default function ChatWindow({
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={uploading}
+            disabled={uploading || !canAttachFile}
             className="p-2.5 text-gray-400 hover:text-purple-400 rounded-xl hover:bg-dark-700 transition-colors disabled:opacity-50"
-            title="Прикрепить файл"
+            title={canAttachFile ? "Прикрепить файл" : "Новые файлы доступны после настройки Matrix E2EE"}
           >
             {uploading ? (
               <div className="w-5 h-5 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
@@ -354,14 +577,15 @@ export default function ChatWindow({
             type="text"
             value={newMessage}
             onChange={(e) => setNewMessage(e.target.value)}
-            className="flex-1 px-4 py-2.5 bg-dark-700 border border-dark-500 rounded-xl text-sm text-white placeholder-gray-500 focus:outline-none focus:border-purple-500 transition-colors"
-            placeholder="Введите сообщение..."
+            disabled={!canSendMessage || sending}
+            className="flex-1 px-4 py-2.5 bg-dark-700 border border-dark-500 rounded-xl text-sm text-white placeholder-gray-500 focus:outline-none focus:border-purple-500 transition-colors disabled:opacity-50"
+            placeholder={canSendMessage ? "Введите сообщение..." : "Новые сообщения заблокированы до подключения E2EE"}
             autoComplete="off"
           />
 
           <button
             type="submit"
-            disabled={!newMessage.trim() || sending}
+            disabled={!newMessage.trim() || sending || !canSendMessage}
             className="p-2.5 bg-purple-500 hover:bg-purple-600 disabled:opacity-30 disabled:hover:bg-purple-500 text-white rounded-xl transition-colors"
           >
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -370,6 +594,15 @@ export default function ChatWindow({
           </button>
         </form>
       </div>
+      {showAddMembers && (
+        <AddGroupMembersModal
+          chatId={chat.id}
+          memberIds={chat.members.map((member) => member.id)}
+          matrixSession={currentUser.matrixSession}
+          onClose={() => setShowAddMembers(false)}
+          onAdded={onMessageSent}
+        />
+      )}
     </div>
   );
 }

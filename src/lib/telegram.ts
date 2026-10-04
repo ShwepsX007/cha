@@ -56,7 +56,9 @@ export async function getFileFromTelegram(fileId: string): Promise<{
 } | null> {
   if (!isTelegramConfigured()) return null;
 
-  const res = await fetch(`${BASE_URL}/getFile?file_id=${fileId}`);
+  const getFileUrl = new URL(`${BASE_URL}/getFile`);
+  getFileUrl.searchParams.set("file_id", fileId);
+  const res = await fetch(getFileUrl);
   const data = await res.json();
 
   if (!data.ok || !data.result.file_path) return null;

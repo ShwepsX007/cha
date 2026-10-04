@@ -17,12 +17,17 @@ function formatTime(dateStr: string) {
   return d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" });
 }
 
-function getLastMessagePreview(msg: Chat["lastMessage"]) {
+function getLastMessagePreview(msg: Chat["lastMessage"], securityMode: Chat["securityMode"]) {
   if (!msg) return "";
-  if (msg.messageType === "text") return msg.content || "";
-  if (msg.messageType === "image") return "📷 Фото";
-  if (msg.messageType === "video") return "🎬 Видео";
-  return `📎 ${msg.fileName || "Файл"}`;
+  const preview = msg.messageType === "text"
+    ? msg.content || ""
+    : msg.messageType === "image"
+      ? "📷 Фото"
+      : msg.messageType === "video"
+        ? "🎬 Видео"
+        : `📎 ${msg.fileName || "Файл"}`;
+  if (securityMode === "e2ee") return "🔒 Новые сообщения Matrix E2EE";
+  return securityMode === "public" ? preview : `Legacy · ${preview}`;
 }
 
 function Avatar({ name, color, size = "md" }: { name: string; color?: string; size?: "sm" | "md" | "lg" }) {
@@ -45,6 +50,8 @@ export default function ChatSidebar({
   onSelectChat,
   onLogout,
   onChatsUpdated,
+  matrixState,
+  onOpenDeviceSecurity,
 }: {
   user: User;
   chats: Chat[];
@@ -52,6 +59,8 @@ export default function ChatSidebar({
   onSelectChat: (chatId: number) => void;
   onLogout: () => void;
   onChatsUpdated: () => void;
+  matrixState: "checking" | "connected" | "not_configured" | "unavailable";
+  onOpenDeviceSecurity: () => void;
 }) {
   const [showNewChat, setShowNewChat] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -70,17 +79,47 @@ export default function ChatSidebar({
             <div>
               <div className="font-semibold text-sm">{user.displayName}</div>
               <div className="text-xs text-gray-500">@{user.username}</div>
+              <div
+                className={`mt-1 text-[10px] leading-tight ${
+                  matrixState === "connected" ? "text-amber-400" : "text-gray-500"
+                }`}
+                title="E2EE пока не включено для отправки новых личных сообщений"
+              >
+                {matrixState === "connected"
+                  ? "Matrix подключён · E2EE активно в личных чатах"
+                  : matrixState === "checking"
+                    ? "Проверка Matrix…"
+                    : matrixState === "not_configured"
+                      ? "E2EE не настроено на сервере"
+                      : "Matrix недоступен · E2EE выключено"}
+              </div>
             </div>
           </div>
-          <button
-            onClick={onLogout}
-            className="p-2 text-gray-500 hover:text-red-400 rounded-lg hover:bg-dark-600 transition-colors"
-            title="Выйти"
-          >
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-            </svg>
-          </button>
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              onClick={onOpenDeviceSecurity}
+              disabled={!user.matrixSession}
+              className="rounded-lg p-2 text-gray-500 transition-colors hover:bg-dark-600 hover:text-purple-300 disabled:cursor-not-allowed disabled:opacity-40"
+              title="Ключи и устройства Matrix"
+              aria-label="Ключи и устройства Matrix"
+            >
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={onLogout}
+              className="rounded-lg p-2 text-gray-500 transition-colors hover:bg-dark-600 hover:text-red-400"
+              title="Выйти"
+              aria-label="Выйти"
+            >
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+              </svg>
+            </button>
+          </div>
         </div>
 
         {/* Search */}
@@ -142,7 +181,7 @@ export default function ChatSidebar({
                     )}
                   </div>
                   <div className="text-xs text-gray-500 truncate mt-0.5">
-                    {getLastMessagePreview(chat.lastMessage)}
+                    {getLastMessagePreview(chat.lastMessage, chat.securityMode)}
                   </div>
                 </div>
               </button>
@@ -154,6 +193,7 @@ export default function ChatSidebar({
       {/* New Chat Modal */}
       {showNewChat && (
         <NewChatModal
+          currentUser={user}
           onClose={() => setShowNewChat(false)}
           onChatCreated={(chatId) => {
             setShowNewChat(false);

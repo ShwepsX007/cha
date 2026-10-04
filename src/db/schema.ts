@@ -24,6 +24,11 @@ export const chats = pgTable("chats", {
   name: varchar("name", { length: 100 }),
   isGroup: boolean("is_group").notNull().default(false),
   createdBy: integer("created_by").references(() => users.id),
+  // Legacy is deliberately the default: historical rooms must not be
+  // mistaken for encrypted until a verified Matrix room is linked.
+  securityMode: varchar("security_mode", { length: 20 }).notNull().default("legacy"),
+  matrixRoomId: text("matrix_room_id"),
+  e2eeEnabledAt: timestamp("e2ee_enabled_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 

@@ -4,10 +4,11 @@ import { users } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import { createToken } from "@/lib/auth";
+import { createMatrixSession, type MatrixLoginResult } from "@/lib/matrix/server";
 
 export async function POST(req: NextRequest) {
   try {
-    const { username, password } = await req.json();
+    const { username, password, matrixDeviceId } = await req.json();
 
     if (!username || !password) {
       return NextResponse.json({ error: "Логин и пароль обязательны" }, { status: 400 });
@@ -23,16 +24,31 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Неверный логин или пароль" }, { status: 401 });
     }
 
-    // Update last seen
     await db.update(users).set({ lastSeen: new Date() }).where(eq(users.id, user.id));
 
-    const token = await createToken(user.id, user.username);
+    let matrix: MatrixLoginResult = { availability: "unavailable", session: null };
+    try {
+      matrix = await createMatrixSession({
+        appUserId: user.id,
+        username: user.username,
+        displayName: user.displayName,
+        password,
+        deviceId: matrixDeviceId,
+      });
+    } catch (error) {
+      // Matrix downtime must not prevent access to the existing public chat.
+      console.error("Matrix session unavailable:", error);
+    }
 
+    const token = await createToken(user.id, user.username);
     const response = NextResponse.json({
       user: { id: user.id, username: user.username, displayName: user.displayName },
+      matrixAvailability: matrix.availability,
+      matrixSession: matrix.session,
     });
     response.cookies.set("auth_token", token, {
       httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
       path: "/",
       maxAge: 60 * 60 * 24 * 7,

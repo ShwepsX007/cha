@@ -3,12 +3,15 @@
 import { useState, useEffect } from "react";
 import AuthScreen from "@/components/AuthScreen";
 import ChatApp from "@/components/ChatApp";
+import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
 
 interface User {
   id: number;
   username: string;
   displayName: string;
   avatarColor?: string;
+  matrixAvailability?: MatrixAvailability;
+  matrixSession?: MatrixSession | null;
 }
 
 export default function Home() {
@@ -19,7 +22,33 @@ export default function Home() {
     fetch("/api/auth/me")
       .then((r) => r.json())
       .then((data) => {
-        if (data.user) setUser(data.user);
+        if (data.user) {
+          let matrixSession: MatrixSession | null = null;
+          try {
+            const stored = sessionStorage.getItem("chata_matrix_session");
+            const candidate = stored ? JSON.parse(stored) as MatrixSession : null;
+            if (
+              candidate &&
+              typeof candidate.baseUrl === "string" &&
+              typeof candidate.accessToken === "string" &&
+              typeof candidate.deviceId === "string" &&
+              typeof candidate.userId === "string" &&
+              candidate.userId.startsWith(`@chata_u${data.user.id}:`)
+            ) {
+              matrixSession = candidate;
+            } else {
+              sessionStorage.removeItem("chata_matrix_session");
+            }
+          } catch {
+            sessionStorage.removeItem("chata_matrix_session");
+          }
+
+          const storedAvailability = sessionStorage.getItem("chata_matrix_availability");
+          const matrixAvailability = storedAvailability === "ready" || storedAvailability === "not_configured"
+            ? storedAvailability
+            : "unavailable";
+          setUser({ ...data.user, matrixSession, matrixAvailability });
+        }
       })
       .catch(() => {})
       .finally(() => setLoading(false));
