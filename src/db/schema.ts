@@ -13,7 +13,7 @@ import {
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
   username: varchar("username", { length: 50 }).notNull().unique(),
-  displayName: varchar("display_name", { length: 100 }).notNull(),
+  displayName: varchar("display_name", { length: 50 }).notNull(),
   passwordHash: text("password_hash").notNull(),
   // Ciphertext only: the recovery key is encrypted in the browser with a
   // PBKDF2-derived key before either value reaches the application server.
@@ -24,6 +24,7 @@ export const users = pgTable("users", {
   banReason: text("ban_reason"),
   matrixResetRequired: boolean("matrix_reset_required").notNull().default(false),
   avatarColor: varchar("avatar_color", { length: 7 }).notNull().default("#6C5CE7"),
+  avatarUrl: text("avatar_url"),
   lastSeen: timestamp("last_seen").defaultNow(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });

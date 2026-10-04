@@ -32,6 +32,8 @@ export async function POST(req: NextRequest) {
         bannedUntil: users.bannedUntil,
         banReason: users.banReason,
         matrixResetRequired: users.matrixResetRequired,
+        avatarColor: users.avatarColor,
+        avatarUrl: users.avatarUrl,
       })
       .from(users)
       .where(eq(users.id, user.id));
@@ -59,6 +61,8 @@ export async function POST(req: NextRequest) {
         id: user.id,
         username: user.username,
         displayName: user.displayName,
+        avatarColor: accountState?.avatarColor || user.avatarColor,
+        avatarUrl: accountState?.avatarUrl || null,
         role: accountState?.role || "user",
         bannedUntil: accountState?.bannedUntil || null,
         banReason: accountState?.banReason || null,

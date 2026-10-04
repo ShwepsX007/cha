@@ -28,6 +28,7 @@ export async function GET(request: NextRequest) {
         username: users.username,
         displayName: users.displayName,
         avatarColor: users.avatarColor,
+        avatarUrl: users.avatarUrl,
         role: users.role,
         bannedUntil: users.bannedUntil,
         banReason: users.banReason,

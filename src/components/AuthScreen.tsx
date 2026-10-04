@@ -8,6 +8,8 @@ interface User {
   id: number;
   username: string;
   displayName: string;
+  avatarColor?: string;
+  avatarUrl?: string | null;
   role?: "user" | "admin";
   bannedUntil?: string | null;
   banReason?: string | null;

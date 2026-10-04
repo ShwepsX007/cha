@@ -179,6 +179,18 @@ export async function deactivateMatrixIdentityForAppUser(
   return { configured: true };
 }
 
+/** Synchronize the dedicated Matrix identity's password with the app password. */
+export async function synchronizeMatrixAppUserPassword(
+  appUserId: number,
+  displayName: string,
+  password: string,
+): Promise<{ configured: boolean }> {
+  const config = getMatrixConfig();
+  if (!config) return { configured: false };
+  await putMatrixUser(config, appUserId, displayName, password);
+  return { configured: true };
+}
+
 /** Confirm that a freshly authenticated Matrix device has been provisioned. */
 export async function matrixDeviceExistsForAppUser(
   appUserId: number,

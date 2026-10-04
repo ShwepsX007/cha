@@ -35,6 +35,7 @@ export async function GET() {
             username: users.username,
             displayName: users.displayName,
             avatarColor: users.avatarColor,
+            avatarUrl: users.avatarUrl,
             lastSeen: users.lastSeen,
           })
           .from(chatMembers)
@@ -48,9 +49,13 @@ export async function GET() {
             messageType: messages.messageType,
             fileName: messages.fileName,
             senderId: messages.senderId,
+            senderDisplayName: users.displayName,
+            senderAvatarColor: users.avatarColor,
+            senderAvatarUrl: users.avatarUrl,
             createdAt: messages.createdAt,
           })
           .from(messages)
+          .innerJoin(users, eq(messages.senderId, users.id))
           .where(eq(messages.chatId, chat.id))
           .orderBy(desc(messages.createdAt))
           .limit(1);

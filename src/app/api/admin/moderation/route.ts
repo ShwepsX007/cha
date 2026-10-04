@@ -41,6 +41,8 @@ export async function GET(request: NextRequest) {
         senderId: messages.senderId,
         senderUsername: users.username,
         senderDisplayName: users.displayName,
+        senderAvatarUrl: users.avatarUrl,
+        senderAvatarColor: users.avatarColor,
         content: messages.content,
         messageType: messages.messageType,
         fileName: messages.fileName,

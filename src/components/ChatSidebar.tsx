@@ -3,6 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import type { User, Chat } from "./ChatApp";
+import Avatar from "./Avatar";
 import NewChatModal from "./NewChatModal";
 
 function formatTime(dateStr: string) {
@@ -31,19 +32,6 @@ function getLastMessagePreview(msg: Chat["lastMessage"], securityMode: Chat["sec
   return securityMode === "public" ? preview : `Legacy · ${preview}`;
 }
 
-function Avatar({ name, color, size = "md" }: { name: string; color?: string; size?: "sm" | "md" | "lg" }) {
-  const sizes = { sm: "w-8 h-8 text-xs", md: "w-11 h-11 text-sm", lg: "w-14 h-14 text-lg" };
-  const initial = name.charAt(0).toUpperCase();
-  return (
-    <div
-      className={`${sizes[size]} rounded-full flex items-center justify-center font-bold text-white shrink-0`}
-      style={{ backgroundColor: color || "#6C5CE7" }}
-    >
-      {initial}
-    </div>
-  );
-}
-
 export default function ChatSidebar({
   user,
   chats,
@@ -54,6 +42,7 @@ export default function ChatSidebar({
   matrixState,
   matrixNotice,
   onOpenDeviceSecurity,
+  onOpenProfileSettings,
 }: {
   user: User;
   chats: Chat[];
@@ -64,6 +53,7 @@ export default function ChatSidebar({
   matrixState: "checking" | "connected" | "not_configured" | "unavailable";
   matrixNotice?: string;
   onOpenDeviceSecurity: () => void;
+  onOpenProfileSettings: () => void;
 }) {
   const [showNewChat, setShowNewChat] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -78,7 +68,7 @@ export default function ChatSidebar({
       <div className="p-4 border-b border-dark-600">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-3">
-            <Avatar name={user.displayName} color={user.avatarColor} />
+            <Avatar src={user.avatarUrl} name={user.displayName} color={user.avatarColor} size={44} />
             <div>
               <div className="font-semibold text-sm">{user.displayName}</div>
               <div className="text-xs text-gray-500">@{user.username}</div>
@@ -109,6 +99,18 @@ export default function ChatSidebar({
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              onClick={onOpenProfileSettings}
+              className="rounded-lg p-2 text-gray-500 transition-colors hover:bg-dark-600 hover:text-purple-300"
+              title="Настройки профиля"
+              aria-label="Настройки профиля"
+            >
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+            </button>
             <button
               type="button"
               onClick={onOpenDeviceSecurity}
@@ -199,8 +201,10 @@ export default function ChatSidebar({
                 }`}
               >
                 <Avatar
+                  src={chat.isGroup ? null : otherMember?.avatarUrl || null}
                   name={chat.name || "?"}
                   color={otherMember?.avatarColor || "#6C5CE7"}
+                  size={44}
                 />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center justify-between">

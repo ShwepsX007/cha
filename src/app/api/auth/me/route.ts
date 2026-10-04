@@ -27,6 +27,7 @@ export async function GET() {
         username: users.username,
         displayName: users.displayName,
         avatarColor: users.avatarColor,
+        avatarUrl: users.avatarUrl,
         role: users.role,
         bannedUntil: users.bannedUntil,
         banReason: users.banReason,
@@ -42,7 +43,14 @@ export async function GET() {
     // Update last seen
     await db.update(users).set({ lastSeen: new Date() }).where(eq(users.id, user.id));
 
-    return NextResponse.json({ user });
+    return NextResponse.json({
+      user: {
+        ...user,
+        displayName: user.displayName || user.username,
+        avatarUrl: user.avatarUrl || null,
+        bannedUntil: user.bannedUntil instanceof Date ? user.bannedUntil.toISOString() : user.bannedUntil ?? null,
+      },
+    });
   } catch {
     return NextResponse.json({ user: null }, { status: 401 });
   }

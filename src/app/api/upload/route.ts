@@ -4,7 +4,7 @@ import { db } from "@/db";
 import { messages, chatMembers, chats } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { eq, and } from "drizzle-orm";
-import { uploadFileToTelegram } from "@/lib/telegram";
+import { MAX_TELEGRAM_DOWNLOAD_BYTES, uploadFileToTelegram } from "@/lib/telegram";
 import { getActivePublicChatBan } from "@/lib/moderation";
 
 const MAX_ENCRYPTED_FILE_SIZE = 45 * 1024 * 1024;
@@ -89,11 +89,15 @@ export async function POST(req: NextRequest) {
     }
 
     const buffer = Buffer.from(await file.arrayBuffer());
+    if (buffer.length === 0 || buffer.length > MAX_TELEGRAM_DOWNLOAD_BYTES) {
+      return NextResponse.json({ error: `Файл слишком большой: лимит ${Math.round(MAX_TELEGRAM_DOWNLOAD_BYTES / 1024 / 1024)} МБ` }, { status: 413 });
+    }
     const mimeType = file.type || "application/octet-stream";
     const fileName = file.name;
     let messageType = "file";
     if (mimeType.startsWith("image/")) messageType = "image";
     else if (mimeType.startsWith("video/")) messageType = "video";
+    else if (mimeType.startsWith("audio/") || mimeType === "application/ogg" || mimeType.startsWith("voice/")) messageType = "file";
 
     const telegramResult = await uploadFileToTelegram(buffer, fileName, mimeType);
     const [msg] = await db

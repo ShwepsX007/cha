@@ -3,12 +3,14 @@
 import { useState, useEffect } from "react";
 import { createEncryptedRoom } from "@/lib/matrix/client";
 import type { MatrixSession } from "@/lib/matrix/types";
+import Avatar from "./Avatar";
 
 interface AvailableUser {
   id: number;
   username: string;
   displayName: string;
   avatarColor: string;
+  avatarUrl: string | null;
   lastSeen: string | null;
   matrixUserId: string | null;
 }
@@ -223,12 +225,7 @@ export default function NewChatModal({
                 disabled={creating || !currentUser.matrixSession || !user.matrixUserId}
                 className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-dark-700 transition-colors text-left disabled:opacity-50 ${groupMode && selectedUserIds.includes(user.id) ? "bg-purple-500/20" : ""}`}
               >
-                <div
-                  className="w-10 h-10 rounded-full flex items-center justify-center font-bold text-white text-sm shrink-0"
-                  style={{ backgroundColor: user.avatarColor }}
-                >
-                  {user.displayName.charAt(0).toUpperCase()}
-                </div>
+                <Avatar src={user.avatarUrl} name={user.displayName} color={user.avatarColor} size={40} />
                 <div className="flex-1 min-w-0">
                   <div className="font-medium text-sm">{user.displayName}</div>
                   <div className="text-xs text-gray-500">@{user.username}</div>

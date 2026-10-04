@@ -2,12 +2,14 @@
 
 import { useEffect, useState } from "react";
 import type { MatrixSession } from "@/lib/matrix/types";
+import Avatar from "./Avatar";
 
 interface CandidateUser {
   id: number;
   username: string;
   displayName: string;
   avatarColor: string;
+  avatarUrl: string | null;
   matrixUserId: string | null;
 }
 
@@ -105,9 +107,7 @@ export default function AddGroupMembersModal({
                     : [...current, user.id])}
                   className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left hover:bg-dark-700 disabled:opacity-50 ${selected ? "bg-purple-500/20" : ""}`}
                 >
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full text-sm font-bold text-white" style={{ backgroundColor: user.avatarColor }}>
-                    {user.displayName.charAt(0).toUpperCase()}
-                  </div>
+                  <Avatar src={user.avatarUrl} name={user.displayName} color={user.avatarColor} size={40} />
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-sm font-medium">{user.displayName}</div>
                     <div className="text-xs text-gray-500">@{user.username}</div>

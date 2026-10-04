@@ -44,6 +44,7 @@ export async function GET(req: NextRequest) {
         senderUsername: users.username,
         senderDisplayName: users.displayName,
         senderAvatarColor: users.avatarColor,
+        senderAvatarUrl: users.avatarUrl,
       })
       .from(messages)
       .innerJoin(users, eq(messages.senderId, users.id))

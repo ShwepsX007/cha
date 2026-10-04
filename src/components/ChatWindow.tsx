@@ -19,6 +19,7 @@ import {
   type MatrixOutboxUpdate,
 } from "@/lib/matrix/client";
 import AddGroupMembersModal from "./AddGroupMembersModal";
+import Avatar from "./Avatar";
 
 function formatTime(dateStr: string) {
   return new Date(dateStr).toLocaleTimeString("ru-RU", {
@@ -49,7 +50,7 @@ function formatBanRemaining(milliseconds: number): string {
 
 function outboxItemToChatMessage(
   item: EncryptedOutboxMessage,
-  user: Pick<User, "id" | "username" | "displayName" | "avatarColor">,
+  user: Pick<User, "id" | "username" | "displayName" | "avatarColor" | "avatarUrl">,
   chatId: number,
 ): ChatMessage {
   return {
@@ -69,6 +70,7 @@ function outboxItemToChatMessage(
     senderUsername: user.username,
     senderDisplayName: user.displayName,
     senderAvatarColor: user.avatarColor || "#6C5CE7",
+    senderAvatarUrl: user.avatarUrl || null,
   };
 }
 
@@ -124,18 +126,18 @@ function MessageBubble({
       return (
         <div className="mb-1">
           {hasFile ? (
-            <a href={fileUrl} onClick={handleAttachmentClick} target="_blank" rel="noopener noreferrer">
-              <div className="bg-dark-600 rounded-lg p-3 flex items-center gap-3 hover:bg-dark-500 transition-colors">
-                <div className="w-10 h-10 bg-purple-500/20 rounded-lg flex items-center justify-center">
-                  <span className="text-xl">📷</span>
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium truncate">{msg.fileName}</div>
-                  <div className="text-xs text-gray-400">{formatFileSize(msg.fileSize)}</div>
-                </div>
-                <svg className="w-5 h-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                </svg>
+            <a href={fileUrl} onClick={handleAttachmentClick} target="_blank" rel="noopener noreferrer" className="block">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={fileUrl}
+                alt={msg.fileName || "Изображение"}
+                className="max-h-72 w-auto max-w-full rounded-xl border border-dark-500/60 object-cover"
+                loading="lazy"
+              />
+              <div className="mt-1 flex items-center gap-2 text-[11px] text-gray-400">
+                <span className="truncate">{msg.fileName}</span>
+                <span>·</span>
+                <span>{formatFileSize(msg.fileSize)}</span>
               </div>
             </a>
           ) : (
@@ -221,12 +223,7 @@ function MessageBubble({
       <div className={`max-w-[75%] ${isOwn ? "order-1" : ""}`}>
         {!isOwn && (
           <div className="flex items-center gap-2 mb-1">
-            <div
-              className="w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold text-white"
-              style={{ backgroundColor: msg.senderAvatarColor }}
-            >
-              {msg.senderDisplayName.charAt(0).toUpperCase()}
-            </div>
+            <Avatar src={msg.senderAvatarUrl} name={msg.senderDisplayName} color={msg.senderAvatarColor} size={24} initialsClassName="text-[10px]" />
             <span className="text-xs font-medium" style={{ color: msg.senderAvatarColor }}>
               {msg.senderDisplayName}
             </span>
@@ -306,8 +303,10 @@ export default function ChatWindow({
   const [showAddMembers, setShowAddMembers] = useState(false);
   const [invitePermissionRoomId, setInvitePermissionRoomId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const prevMsgCountRef = useRef(0);
+  const initialLoadRef = useRef(true);
   const [banUntil, setBanUntil] = useState<string | null>(currentUser.bannedUntil ?? null);
   const [banReason, setBanReason] = useState<string | null>(currentUser.banReason ?? null);
   const [banNow, setBanNow] = useState(() => Date.now());
@@ -394,11 +393,33 @@ export default function ChatWindow({
     };
   }, [chat.isGroup, chat.matrixRoomId, chat.securityMode, currentUser.matrixSession]);
 
-  const scrollToBottom = useCallback((force = false) => {
-    if (force || true) {
-      messagesEndRef.current?.scrollIntoView({ behavior: force ? "smooth" : "auto" });
-    }
+  const isNearBottom = useCallback(() => {
+    const el = messagesContainerRef.current;
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 150;
   }, []);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+    const el = messagesContainerRef.current;
+    if (!el) {
+      messagesEndRef.current?.scrollIntoView({ behavior });
+      return;
+    }
+    el.scrollTop = el.scrollHeight;
+  }, []);
+
+  useEffect(() => {
+    if (initialLoadRef.current && messages.length > 0) {
+      window.requestAnimationFrame(() => {
+        scrollToBottom("auto");
+        initialLoadRef.current = false;
+      });
+    }
+  }, [messages, scrollToBottom]);
+
+  useEffect(() => {
+    initialLoadRef.current = true;
+  }, [chat.id]);
 
   const prepareEncryptedChat = useCallback(async () => {
     if (chat.securityMode !== "e2ee" || !chat.matrixRoomId || !currentUser.matrixSession) return;
@@ -466,6 +487,7 @@ export default function ChatWindow({
               senderUsername: sender?.username || message.senderMxid,
               senderDisplayName: sender?.displayName || "Пользователь",
               senderAvatarColor: sender?.avatarColor || "#6C5CE7",
+              senderAvatarUrl: sender?.avatarUrl || null,
               isLegacy: false,
             };
           });
@@ -493,7 +515,7 @@ export default function ChatWindow({
             .map((message) => [message.outboxId as string, message]),
         );
         const optimisticMessages = queuedItems.map((item) =>
-          localByOutboxId.get(item.id) || outboxItemToChatMessage(item, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor }, chat.id),
+          localByOutboxId.get(item.id) || outboxItemToChatMessage(item, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor, avatarUrl: currentUser.avatarUrl }, chat.id),
         );
         const liveIds = new Set(visibleMessages.map((message) => String(message.id)));
         const sentButNotSynced = currentLocalMessages.filter((message) =>
@@ -523,7 +545,10 @@ export default function ChatWindow({
       setMessages(visibleMessages);
       if (visibleMessages.length !== prevMsgCountRef.current) {
         prevMsgCountRef.current = visibleMessages.length;
-        setTimeout(() => scrollToBottom(true), 50);
+        const wasNearBottom = isNearBottom();
+        window.requestAnimationFrame(() => {
+          if (initialLoadRef.current || wasNearBottom) scrollToBottom(initialLoadRef.current ? "auto" : "smooth");
+        });
       }
     } catch (err) {
       console.error("Failed to load messages:", err);
@@ -537,7 +562,9 @@ export default function ChatWindow({
     currentUser.username,
     currentUser.displayName,
     currentUser.avatarColor,
+    currentUser.avatarUrl,
     currentUser.matrixSession,
+    isNearBottom,
     prepareEncryptedChat,
     scrollToBottom,
   ]);
@@ -560,7 +587,7 @@ export default function ChatWindow({
         if (!message && update.status !== "sent") {
           const queued = getPendingEncryptedMessages(currentUser.id, update.chatId)
             .find((item) => item.id === update.id);
-          if (queued) message = outboxItemToChatMessage(queued, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor }, update.chatId);
+          if (queued) message = outboxItemToChatMessage(queued, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor, avatarUrl: currentUser.avatarUrl }, update.chatId);
         }
         if (!message) return current;
 
@@ -613,7 +640,7 @@ export default function ChatWindow({
           body: msgText,
         });
         const optimisticMessage: ChatMessage = {
-          ...outboxItemToChatMessage(item, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor }, chat.id),
+          ...outboxItemToChatMessage(item, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor, avatarUrl: currentUser.avatarUrl }, chat.id),
           id: `outbox:${item.id}`,
           deliveryStatus: "sending",
           deliveryError: undefined,
@@ -621,7 +648,7 @@ export default function ChatWindow({
         updateLocalMessages((current) => [...current, optimisticMessage]);
         setNewMessage("");
         setSending(false);
-        scrollToBottom(true);
+        scrollToBottom("smooth");
         void sendQueuedEncryptedMessage(currentUser.matrixSession, item.id).catch(() => undefined);
       } catch (queueError) {
         setSendError(queueError instanceof Error
@@ -648,7 +675,7 @@ export default function ChatWindow({
 
       await loadMessages();
       onMessageSent();
-      scrollToBottom(true);
+      scrollToBottom("smooth");
     } catch (err) {
       console.error("Failed to send message");
       setNewMessage(msgText);
@@ -723,7 +750,7 @@ export default function ChatWindow({
 
       await loadMessages();
       onMessageSent();
-      scrollToBottom(true);
+      scrollToBottom("smooth");
     } catch (err) {
       console.error("Failed to upload attachment");
       setSendError(err instanceof Error ? err.message : "Не удалось загрузить файл");
@@ -740,9 +767,10 @@ export default function ChatWindow({
   const canAttachFile = canSendMessage;
 
   return (
-    <div className="flex flex-col h-full bg-dark-900">
+    <div className="flex h-[100dvh] min-h-0 flex-col overflow-hidden bg-dark-900 md:h-full">
       {/* Chat Header */}
-      <div className="px-4 py-3 bg-dark-800 border-b border-dark-600 flex items-center gap-3">
+      <div className="sticky top-0 z-20 shrink-0 border-b border-dark-600 bg-dark-800/95 px-4 py-3 pt-[max(0.75rem,env(safe-area-inset-top))] backdrop-blur">
+        <div className="flex items-center gap-3">
         <button
           onClick={onBack}
           className="md:hidden p-1.5 text-gray-400 hover:text-white rounded-lg hover:bg-dark-600"
@@ -752,12 +780,12 @@ export default function ChatWindow({
           </svg>
         </button>
 
-        <div
-          className="w-10 h-10 rounded-full flex items-center justify-center font-bold text-white text-sm shrink-0"
-          style={{ backgroundColor: otherMember?.avatarColor || "#6C5CE7" }}
-        >
-          {(chat.name || "?").charAt(0).toUpperCase()}
-        </div>
+        <Avatar
+          src={chat.isGroup ? null : otherMember?.avatarUrl || null}
+          name={chat.name || "?"}
+          color={otherMember?.avatarColor || "#6C5CE7"}
+          size={40}
+        />
 
         <div className="flex-1 min-w-0">
           <div className="font-semibold text-sm truncate">{chat.name}</div>
@@ -781,7 +809,7 @@ export default function ChatWindow({
         {chat.isGroup && chat.securityMode === "e2ee" && chat.matrixRoomId === invitePermissionRoomId && (
           <button
             onClick={() => setShowAddMembers(true)}
-            className="rounded-lg p-2 text-gray-400 hover:bg-dark-600 hover:text-white"
+            className="rounded-lg p-2 text-gray-400 hover:bg-dark-600 hover:text-white touch-manipulation"
             title="Добавить участников (создатель/админ)"
             aria-label="Добавить участников"
           >
@@ -790,28 +818,27 @@ export default function ChatWindow({
             </svg>
           </button>
         )}
+        </div>
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-4">
+      <div ref={messagesContainerRef} className="flex min-h-0 flex-1 flex-col justify-end overflow-y-auto overscroll-contain px-4 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] [-webkit-overflow-scrolling:touch]">
         {messageReadError && (
           <div className="mb-3 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
             {messageReadError} Legacy-история при этом остаётся доступна ниже.
           </div>
         )}
         {messages.length === 0 ? (
-          <div className="h-full flex items-center justify-center">
-            <div className="text-center">
-              <div className="text-4xl mb-3">🔐</div>
-              <p className="text-gray-500 text-sm">{chat.securityMode === "legacy" ? "История чата сохранена как legacy" : "Начните разговор!"}</p>
-              <p className="text-gray-600 text-xs mt-1">
-                {chat.securityMode === "public"
-                  ? "Этот общий чат не шифруется"
-                  : chat.securityMode === "e2ee"
-                    ? "Новые сообщения шифруются Matrix на устройствах участников"
-                    : "Новые сообщения не отправляются открытым текстом"}
-              </p>
-            </div>
+          <div className="flex min-h-[60dvh] flex-col items-center justify-center text-center">
+            <div className="text-4xl mb-3">🔐</div>
+            <p className="text-gray-500 text-sm">{chat.securityMode === "legacy" ? "История чата сохранена как legacy" : "Начните разговор!"}</p>
+            <p className="text-gray-600 text-xs mt-1">
+              {chat.securityMode === "public"
+                ? "Этот общий чат не шифруется"
+                : chat.securityMode === "e2ee"
+                  ? "Новые сообщения шифруются Matrix на устройствах участников"
+                  : "Новые сообщения не отправляются открытым текстом"}
+            </p>
           </div>
         ) : (
           messages.map((msg) => (
@@ -827,7 +854,7 @@ export default function ChatWindow({
       </div>
 
       {/* Input */}
-      <div className="px-4 py-3 bg-dark-800 border-t border-dark-600">
+      <div className="sticky bottom-0 z-20 shrink-0 border-t border-dark-600 bg-dark-800/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur">
         {isPublicBanActive && (
           <div role="alert" className="mb-3 rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs leading-relaxed text-red-200">
             <div className="font-semibold">Отправка сообщений и файлов в общий чат временно заблокирована.</div>
