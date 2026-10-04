@@ -5,7 +5,7 @@
 - The existing `Общий чат` remains a normal, unencrypted public room.
 - New direct chats and private multi-person rooms use end-to-end encryption (E2EE).
 - Only a room creator/admin may invite members.
-- New devices are linked/verified from an already trusted device using a QR flow; key recovery must never give the server plaintext keys.
+- New devices are linked/verified from an already trusted device using a QR flow. A separate recovery key/passphrase is also provided for restoring encrypted key backup when no trusted device is available. The server stores only the encrypted backup and cannot read the key. A short numeric code is not the only recovery method; if used during device linking, it must be one-time, short-lived, and rate-limited.
 - Existing history is retained as legacy plaintext. New private-room messages are encrypted; old messages must be clearly marked as not E2EE.
 - Telegram remains the attachment store. The browser encrypts an attachment before upload; Telegram and the app server receive only ciphertext. Filenames, MIME type, and file decryption metadata must be sent inside the encrypted room message, not as plaintext database fields.
 
