@@ -30,6 +30,9 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: "Not a member" }, { status: 403 });
     }
 
+    // Mark the user as "seen now" while they are actively polling messages.
+    await db.update(users).set({ lastSeen: new Date() }).where(eq(users.id, payload.userId));
+
     const msgs = await db
       .select({
         id: messages.id,

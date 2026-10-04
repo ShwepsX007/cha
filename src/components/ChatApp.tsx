@@ -75,6 +75,7 @@ export interface Chat {
   e2eeEnabledAt: string | null;
   createdBy: number | null;
   members: User[];
+  notificationsMuted?: boolean;
   lastMessage: {
     id: number;
     content: string | null;
@@ -299,6 +300,10 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
             currentUser={currentUserState}
             onBack={handleBack}
             onMessageSent={loadChats}
+            onChatUpdated={(patch) => {
+              if (!selectedChat) return;
+              setChats((prev) => prev.map((c) => c.id === selectedChat.id ? { ...c, ...patch } : c));
+            }}
           />
         ) : (
           <div className="flex-1 flex items-center justify-center bg-dark-900">

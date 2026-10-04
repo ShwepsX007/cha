@@ -1,9 +1,9 @@
 import { db } from "@/db";
 import { chatMembers, users } from "@/db/schema";
-import { eq, and, ne, sql } from "drizzle-orm";
+import { eq, and, ne } from "drizzle-orm";
 import { sendPushToUser } from "@/lib/push";
 
-const ONLINE_WINDOW_MS = 60_000; // user is considered "online" if seen in the last 60s
+const ONLINE_WINDOW_MS = 120_000; // user is considered "online" if seen in the last 2 minutes
 
 interface NotifyChatMessageParams {
   chatId: number;
@@ -15,8 +15,8 @@ interface NotifyChatMessageParams {
 
 /**
  * Best-effort fan-out of a push notification to every chat member except the
- * sender and users who have been active in the last minute (they are probably
- * already looking at the chat). Failures are swallowed; push is optional.
+ * sender, muted members, and users who have been active in the last minute
+ * (they are probably already looking at the chat). Failures are swallowed.
  */
 export async function notifyChatMessage({
   chatId,
@@ -27,7 +27,11 @@ export async function notifyChatMessage({
 }: NotifyChatMessageParams) {
   try {
     const recipients = await db
-      .select({ id: users.id, lastSeen: users.lastSeen })
+      .select({
+        id: users.id,
+        lastSeen: users.lastSeen,
+        muted: chatMembers.notificationsMuted,
+      })
       .from(chatMembers)
       .innerJoin(users, eq(users.id, chatMembers.userId))
       .where(
@@ -40,6 +44,7 @@ export async function notifyChatMessage({
     const now = Date.now();
     await Promise.all(
       recipients.map(async (recipient) => {
+        if (recipient.muted) return;
         // Skip online users — they will see the message via polling.
         if (recipient.lastSeen) {
           const last = new Date(recipient.lastSeen).getTime();

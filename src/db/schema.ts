@@ -61,6 +61,7 @@ export const chatMembers = pgTable("chat_members", {
   userId: integer("user_id")
     .references(() => users.id, { onDelete: "cascade" })
     .notNull(),
+  notificationsMuted: boolean("notifications_muted").notNull().default(false),
   joinedAt: timestamp("joined_at").defaultNow().notNull(),
 });
 

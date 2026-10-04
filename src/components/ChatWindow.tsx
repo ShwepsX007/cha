@@ -286,11 +286,13 @@ export default function ChatWindow({
   currentUser,
   onBack,
   onMessageSent,
+  onChatUpdated,
 }: {
   chat: Chat;
   currentUser: User;
   onBack: () => void;
   onMessageSent: () => void;
+  onChatUpdated?: (patch: Partial<Chat>) => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const localMessagesRef = useRef<ChatMessage[]>([]);
@@ -301,6 +303,35 @@ export default function ChatWindow({
   const [messageReadError, setMessageReadError] = useState("");
   const [showAddMembers, setShowAddMembers] = useState(false);
   const [invitePermissionRoomId, setInvitePermissionRoomId] = useState<string | null>(null);
+  const [notificationsMuted, setNotificationsMuted] = useState(Boolean(chat.notificationsMuted));
+  const [muteBusy, setMuteBusy] = useState(false);
+
+  useEffect(() => {
+    setNotificationsMuted(Boolean(chat.notificationsMuted));
+  }, [chat.id, chat.notificationsMuted]);
+
+  const toggleChatMute = async () => {
+    if (muteBusy) return;
+    const next = !notificationsMuted;
+    setNotificationsMuted(next);
+    setMuteBusy(true);
+    try {
+      const res = await fetch(`/api/chats/${chat.id}/notifications`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ muted: next }),
+      });
+      if (!res.ok) {
+        setNotificationsMuted(!next);
+        return;
+      }
+      onChatUpdated?.({ notificationsMuted: next });
+    } catch {
+      setNotificationsMuted(!next);
+    } finally {
+      setMuteBusy(false);
+    }
+  };
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -310,6 +341,7 @@ export default function ChatWindow({
   const reportedDeliveredRef = useRef<Set<number | string>>(new Set());
   const [receipts, setReceipts] = useState<ReceiptMap>({});
   const messageElsRef = useRef<Map<number | string, HTMLElement>>(new Map());
+  const readObserverRef = useRef<IntersectionObserver | null>(null);
   const [banUntil, setBanUntil] = useState<string | null>(currentUser.bannedUntil ?? null);
   const [banReason, setBanReason] = useState<string | null>(currentUser.banReason ?? null);
   const [banNow, setBanNow] = useState(() => Date.now());
@@ -480,9 +512,14 @@ export default function ChatWindow({
     };
   }, [chat.id, chat.securityMode]);
 
-  // IntersectionObserver: when a message becomes > 60% visible for 400ms, mark it read.
+  // Build (or rebuild) the IntersectionObserver once the container exists, and
+  // keep a stable instance in a ref so we can observe nodes as they register.
   useEffect(() => {
     if (chat.securityMode !== "public") return;
+    const container = messagesContainerRef.current;
+    if (!container) return;
+
+    readObserverRef.current?.disconnect();
     const observer = new IntersectionObserver((entries) => {
       const visibleIds: number[] = [];
       for (const entry of entries) {
@@ -496,28 +533,40 @@ export default function ChatWindow({
         visibleIds.push(id);
       }
       if (visibleIds.length) void sendReceipts(visibleIds, "read");
-    }, { root: messagesContainerRef.current, threshold: [0.6] });
+    }, { root: container, threshold: [0.5], rootMargin: "0px" });
+    readObserverRef.current = observer;
 
-    const nodes = messageElsRef.current;
-    // Observe all currently registered messages.
-    nodes.forEach((el) => observer.observe(el));
+    // Observe all currently-mounted message nodes.
+    messageElsRef.current.forEach((el) => observer.observe(el));
 
-    // Use a MutationObserver to attach to freshly rendered message nodes.
-    const container = messagesContainerRef.current;
-    if (!container) return () => observer.disconnect();
-    const mo = new MutationObserver(() => {
-      nodes.forEach((el, id) => {
-        if (!el.isConnected) { nodes.delete(id); return; }
-        // IntersectionObserver ignores duplicates safely.
-        observer.observe(el);
+    // After initial paint, if we're near the bottom (which is the default on
+    // open), mark every already-visible non-self message as read. This catches
+    // the case where messages are rendered at rest and never cross the IO
+    // threshold because they started visible.
+    const initialTimer = window.setTimeout(() => {
+      const queue: number[] = [];
+      messageElsRef.current.forEach((el, id) => {
+        if (typeof id !== "number") return;
+        if (reportedReadRef.current.has(id)) return;
+        const rect = el.getBoundingClientRect();
+        const cRect = container.getBoundingClientRect();
+        const visible = rect.bottom > cRect.top && rect.top < cRect.bottom;
+        if (!visible) return;
+        // Only mark others' messages read.
+        const msg = messages.find((m) => m.id === id);
+        if (!msg || msg.senderId === currentUser.id) return;
+        reportedReadRef.current.add(id);
+        queue.push(id);
       });
-    });
-    mo.observe(container, { childList: true, subtree: true });
+      if (queue.length) void sendReceipts(queue, "read");
+    }, 400);
+
     return () => {
-      mo.disconnect();
+      window.clearTimeout(initialTimer);
       observer.disconnect();
+      readObserverRef.current = null;
     };
-  }, [chat.id, chat.securityMode, messages.length, sendReceipts]);
+  }, [chat.id, chat.securityMode, sendReceipts, messages, currentUser.id]);
 
   const registerMessageEl = useCallback((id: number | string, el: HTMLElement | null) => {
     if (!el) {
@@ -526,6 +575,9 @@ export default function ChatWindow({
     }
     el.dataset.messageId = String(id);
     messageElsRef.current.set(id, el);
+    if (readObserverRef.current && typeof id === "number") {
+      readObserverRef.current.observe(el);
+    }
   }, []);
 
   const getMessageStatus = useCallback((msg: ChatMessage): ChatMessage["deliveryStatus"] => {
@@ -925,6 +977,24 @@ export default function ChatWindow({
                 : "Legacy-чат · новые сообщения заблокированы до E2EE"}
           </div>
         </div>
+        <button
+          type="button"
+          onClick={toggleChatMute}
+          disabled={muteBusy}
+          className={`rounded-lg p-2 transition touch-manipulation ${notificationsMuted ? "text-amber-300 hover:bg-amber-500/10" : "text-gray-400 hover:bg-dark-600 hover:text-white"} disabled:opacity-50`}
+          title={notificationsMuted ? "Уведомления отключены" : "Включить уведомления"}
+          aria-label={notificationsMuted ? "Включить уведомления чата" : "Отключить уведомления чата"}
+        >
+          {notificationsMuted ? (
+            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.4-1.4A2 2 0 0118 14.2V11a6 6 0 10-12 0v3.2c0 .5-.2 1-.6 1.4L4 17h5m6 0a3 3 0 11-6 0m6 0H9M3 3l18 18" />
+            </svg>
+          ) : (
+            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.4-1.4A2 2 0 0118 14.2V11a6 6 0 10-12 0v3.2c0 .5-.2 1-.6 1.4L4 17h5m6 0a3 3 0 11-6 0m6 0H9" />
+            </svg>
+          )}
+        </button>
         {chat.isGroup && chat.securityMode === "e2ee" && chat.matrixRoomId === invitePermissionRoomId && (
           <button
             onClick={() => setShowAddMembers(true)}

@@ -77,14 +77,14 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
     setPushBusy(false);
     if (result.ok) {
       setPushStatus("granted");
-      setPushNotice("Push-уведомления включены");
+      setPushNotice(result.iosHint
+        ? "Push включены. На iOS уведомления приходят только после «Добавить на главный экран»."
+        : "Push-уведомления включены");
       onProfileUpdated({ pushEnabled: true });
     } else {
-      setPushNotice(result.error || "Не удалось включить уведомления");
-      const p = await getPushPermissionState();
-      if (p === "denied") setPushStatus("denied");
-      else if (p === "granted") setPushStatus("granted");
+      if (result.denied) setPushStatus("denied");
       else setPushStatus("prompt");
+      setPushNotice(result.error || "Не удалось включить уведомления");
     }
   };
 
@@ -391,6 +391,11 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
                 {pushNotice && (
                   <p className={`mt-3 text-xs ${pushNotice.includes("Не") || pushNotice.includes("заблок") ? "text-red-300" : "text-emerald-300"}`}>
                     {pushNotice}
+                  </p>
+                )}
+                {pushStatus === "denied" && (
+                  <p className="mt-2 text-[11px] leading-relaxed text-amber-300/80">
+                    Нажмите на иконку замочка/настроек слева от адресной строки браузера, разрешите уведомления для этого сайта, затем вернитесь сюда.
                   </p>
                 )}
               </div>

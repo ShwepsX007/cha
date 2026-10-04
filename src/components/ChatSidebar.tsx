@@ -208,13 +208,21 @@ export default function ChatSidebar({
                   cacheKey={chat.isGroup ? null : otherMember?.avatarUpdatedAt || null}
                 />
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2">
                     <span className="font-medium text-sm truncate">{chat.name}</span>
-                    {chat.lastMessage && (
-                      <span className="text-xs text-gray-500 shrink-0 ml-2">
-                        {formatTime(chat.lastMessage.createdAt)}
-                      </span>
-                    )}
+                    <span className="flex shrink-0 items-center gap-1.5">
+                      {chat.notificationsMuted && (
+                        <svg className="h-3.5 w-3.5 text-amber-400/70" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-label="Уведомления отключены">
+                          <title>Уведомления отключены</title>
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.4-1.4A2 2 0 0118 14.2V11a6 6 0 10-12 0v3.2c0 .5-.2 1-.6 1.4L4 17h5m6 0a3 3 0 11-6 0M3 3l18 18" />
+                        </svg>
+                      )}
+                      {chat.lastMessage && (
+                        <span className="text-xs text-gray-500">
+                          {formatTime(chat.lastMessage.createdAt)}
+                        </span>
+                      )}
+                    </span>
                   </div>
                   <div className="text-xs text-gray-500 truncate mt-0.5">
                     {getLastMessagePreview(chat.lastMessage, chat.securityMode)}

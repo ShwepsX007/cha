@@ -62,10 +62,18 @@ export async function GET() {
           .limit(1);
 
         let chatName = chat.name;
+        let notificationsMuted = false;
         if (!chat.isGroup) {
           const otherUser = members.find((m) => m.id !== payload.userId);
           chatName = otherUser?.displayName || "Чат";
         }
+        // Find current user's own mute setting for this chat.
+        const myMember = await db
+          .select({ notificationsMuted: chatMembers.notificationsMuted })
+          .from(chatMembers)
+          .where(and(eq(chatMembers.chatId, chat.id), eq(chatMembers.userId, payload.userId)))
+          .limit(1);
+        notificationsMuted = myMember[0]?.notificationsMuted || false;
 
         const messageCount = await db
           .select({ count: sql<number>`count(*)` })
@@ -76,6 +84,7 @@ export async function GET() {
           ...chat,
           name: chatName,
           members,
+          notificationsMuted,
           lastMessage: lastMessage || null,
           messageCount: Number(messageCount[0]?.count || 0),
         };
