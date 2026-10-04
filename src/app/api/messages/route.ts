@@ -30,8 +30,12 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: "Not a member" }, { status: 403 });
     }
 
-    // Mark the user as "seen now" while they are actively polling messages.
-    await db.update(users).set({ lastSeen: new Date() }).where(eq(users.id, payload.userId));
+    // Do not treat a background tab's polling as active presence: that would
+    // suppress push notifications indefinitely while the app is merely open
+    // in another tab. Older clients without the header retain the old behavior.
+    if (req.headers.get("x-chat-visible") !== "0") {
+      await db.update(users).set({ lastSeen: new Date() }).where(eq(users.id, payload.userId));
+    }
 
     const msgs = await db
       .select({

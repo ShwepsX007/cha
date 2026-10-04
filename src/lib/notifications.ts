@@ -3,7 +3,7 @@ import { chatMembers, users } from "@/db/schema";
 import { eq, and, ne } from "drizzle-orm";
 import { sendPushToUser } from "@/lib/push";
 
-const ONLINE_WINDOW_MS = 120_000; // user is considered "online" if seen in the last 2 minutes
+const ONLINE_WINDOW_MS = 60_000; // matches the UI: suppress push only for recently active users
 
 interface NotifyChatMessageParams {
   chatId: number;

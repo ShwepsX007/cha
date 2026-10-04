@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Avatar from "@/components/Avatar";
 import type { User } from "./ChatApp";
 import {
@@ -48,7 +48,21 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
   const [pushSupported, setPushSupported] = useState(false);
   const [pushStatus, setPushStatus] = useState<"loading" | "granted" | "denied" | "prompt" | "unsupported">("loading");
   const [pushBusy, setPushBusy] = useState(false);
+  const [testingPush, setTestingPush] = useState(false);
+  const [pushSubscriptionCount, setPushSubscriptionCount] = useState<number | null>(null);
   const [pushNotice, setPushNotice] = useState("");
+
+  const refreshPushSubscriptionCount = useCallback(async () => {
+    try {
+      const response = await fetch("/api/push/status", { cache: "no-store" });
+      const data = await response.json();
+      setPushSubscriptionCount(
+        response.ok && Number.isInteger(data.subscriptionCount) ? data.subscriptionCount as number : null,
+      );
+    } catch {
+      setPushSubscriptionCount(null);
+    }
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -66,9 +80,10 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
       if (permission === "granted") setPushStatus("granted");
       else if (permission === "denied") setPushStatus("denied");
       else setPushStatus("prompt");
+      await refreshPushSubscriptionCount();
     })();
     return () => { mounted = false; };
-  }, []);
+  }, [refreshPushSubscriptionCount]);
 
   const handleEnablePush = async () => {
     setPushBusy(true);
@@ -81,6 +96,7 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
         ? "Push включены. На iOS уведомления приходят только после «Добавить на главный экран»."
         : "Push-уведомления включены");
       onProfileUpdated({ pushEnabled: true });
+      void refreshPushSubscriptionCount();
     } else {
       if (result.denied) setPushStatus("denied");
       else setPushStatus("prompt");
@@ -96,6 +112,23 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
     setPushStatus((await getPushPermissionState()) === "denied" ? "denied" : "prompt");
     setPushNotice("Push-уведомления отключены");
     onProfileUpdated({ pushEnabled: false });
+    void refreshPushSubscriptionCount();
+  };
+
+  const handleTestPush = async () => {
+    setTestingPush(true);
+    setPushNotice("");
+    try {
+      const response = await fetch("/api/push/test", { method: "POST" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Не удалось отправить тестовое уведомление");
+      setPushNotice(`Тестовое уведомление отправлено на устройств: ${String(data.sent ?? 0)}`);
+    } catch (error) {
+      setPushNotice(error instanceof Error ? error.message : "Не удалось отправить тестовое уведомление");
+    } finally {
+      setTestingPush(false);
+      void refreshPushSubscriptionCount();
+    }
   };
 
   useEffect(() => {
@@ -353,7 +386,7 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
                   <div>
                     <p className="text-sm font-medium text-white">Push-уведомления о сообщениях</p>
                     <p className="mt-1 text-xs leading-relaxed text-gray-400">
-                      Когда браузер закрыт или приложение свёрнуто, вам будут приходить уведомления о новых сообщениях в общем чате. Работает в Chrome, Edge, Firefox и Safari 16.4+. На iOS добавьте приложение на главный экран.
+                      Push этого приложения отправляет уведомления только для общего чата. Нужны HTTPS, разрешение браузера и сохранённая подписка на этом устройстве. Push не отправляется отправителю, в заглушённый чат или если получатель был активен последнюю минуту. Для приватных Matrix-чатов push пока не реализован; на iOS добавьте приложение на главный экран.
                     </p>
                   </div>
                 </div>
@@ -369,14 +402,32 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
                       </span>
                     </>
                   ) : pushStatus === "granted" ? (
-                    <button
-                      type="button"
-                      disabled={pushBusy}
-                      onClick={handleDisablePush}
-                      className="rounded-lg border border-red-500/30 px-4 py-2 text-xs font-semibold text-red-200 hover:bg-red-500/10 disabled:opacity-50"
-                    >
-                      {pushBusy ? "Отключаем…" : "Отключить уведомления"}
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        disabled={pushBusy}
+                        onClick={handleEnablePush}
+                        className="rounded-lg bg-purple-500 px-4 py-2 text-xs font-semibold text-white hover:bg-purple-600 disabled:opacity-50"
+                      >
+                        {pushBusy ? "Подключаем…" : "Переподключить push"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={pushBusy}
+                        onClick={handleDisablePush}
+                        className="rounded-lg border border-red-500/30 px-4 py-2 text-xs font-semibold text-red-200 hover:bg-red-500/10 disabled:opacity-50"
+                      >
+                        {pushBusy ? "Отключаем…" : "Отключить уведомления"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={testingPush}
+                        onClick={handleTestPush}
+                        className="rounded-lg border border-dark-500 px-4 py-2 text-xs font-semibold text-gray-200 hover:bg-dark-700 disabled:opacity-50"
+                      >
+                        {testingPush ? "Отправляем тест…" : "Тестовое уведомление"}
+                      </button>
+                    </>
                   ) : (
                     <button
                       type="button"
@@ -388,8 +439,13 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
                     </button>
                   )}
                 </div>
+                {pushSubscriptionCount !== null && (
+                  <p className="mt-3 text-xs text-gray-400">
+                    Сохранённых подписок браузера: {pushSubscriptionCount}
+                  </p>
+                )}
                 {pushNotice && (
-                  <p className={`mt-3 text-xs ${pushNotice.includes("Не") || pushNotice.includes("заблок") ? "text-red-300" : "text-emerald-300"}`}>
+                  <p className={`mt-3 text-xs ${pushNotice.includes("Не") || pushNotice.includes("не ") || pushNotice.includes("Нет") || pushNotice.includes("заблок") || pushNotice.includes("ошиб") ? "text-red-300" : "text-emerald-300"}`}>
                     {pushNotice}
                   </p>
                 )}

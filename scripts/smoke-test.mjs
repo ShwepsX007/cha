@@ -74,6 +74,13 @@ async function main() {
       body: JSON.stringify({ username: b, password: "smoke-password-1", displayName: `Smoke B ${suffix}` }),
     });
     check("register user B", regB.response.ok, `HTTP ${regB.response.status}`);
+    const pushStatus = await json("/api/push/status", {}, regA.cookie);
+    check("authenticated push status reports subscriptions", pushStatus.response.ok &&
+      Number.isInteger(pushStatus.body?.subscriptionCount), `HTTP ${pushStatus.response.status}`);
+    const pushTest = await json("/api/push/test", { method: "POST" }, regA.cookie);
+    check("push test endpoint gives a clear unconfigured/unsubscribed result",
+      pushTest.response.status === 409 || pushTest.response.status === 503,
+      `HTTP ${pushTest.response.status} ${JSON.stringify(pushTest.body)}`);
 
     const chats = await json("/api/chats", {}, regA.cookie);
     const general = chats.body?.chats?.find((chat) => chat.isGroup && chat.securityMode === "public");
@@ -92,14 +99,23 @@ async function main() {
       const seenByB = await json(`/api/messages?chatId=${general.id}`, {}, regB.cookie);
       check("user B reads the message", Array.isArray(seenByB.body?.messages) && seenByB.body.messages.some((m) => m.id === messageId));
 
-      const marked = await json(`/api/messages/${general.id}/receipts`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messageIds: [messageId], status: "read" }),
-      }, regB.cookie);
-      check("user B marks the message as read", marked.response.ok, `HTTP ${marked.response.status}`);
+      const receiptUrl = `/api/messages/${general.id}/receipts`;
+      const [delivered, marked] = await Promise.all([
+        json(receiptUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messageIds: [messageId], status: "delivered" }),
+        }, regB.cookie),
+        json(receiptUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messageIds: [messageId], status: "read" }),
+        }, regB.cookie),
+      ]);
+      check("concurrent delivered/read receipts succeed", delivered.response.ok && marked.response.ok,
+        `delivered HTTP ${delivered.response.status}, read HTTP ${marked.response.status}`);
 
-      const receipts = await json(`/api/messages/${general.id}/receipts`, {}, regA.cookie);
+      const receipts = await json(receiptUrl, {}, regA.cookie);
       check("sender sees the read receipt", receipts.body?.receipts?.[messageId]?.status === "read", JSON.stringify(receipts.body));
 
       const zlib = await import("node:zlib");

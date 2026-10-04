@@ -32,7 +32,8 @@ export async function POST(
     const status = body.status === "read" ? "read" : body.status === "delivered" ? "delivered" : "delivered";
     const { updated } = await markReceipts({ userId: payload.userId, chatId, messageIds, status });
     return NextResponse.json({ updated });
-  } catch {
+  } catch (error) {
+    console.error("Message receipt update failed:", error);
     return NextResponse.json({ error: "Server error" }, { status: 500 });
   }
 }
@@ -56,7 +57,8 @@ export async function GET(
     if (!membership) return NextResponse.json({ error: "Not a member" }, { status: 403 });
     const receipts = await getMessageReceipts(chatId);
     return NextResponse.json({ receipts });
-  } catch {
+  } catch (error) {
+    console.error("Message receipt read failed:", error);
     return NextResponse.json({ error: "Server error" }, { status: 500 });
   }
 }

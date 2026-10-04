@@ -32,10 +32,27 @@ function urlBase64ToUint8Array(base64String: string): Uint8Array {
 export async function registerServiceWorker(): Promise<ServiceWorkerRegistration | null> {
   if (!arePushNotificationsSupported()) return null;
   try {
-    return await navigator.serviceWorker.register("/sw.js");
+    return await navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" });
   } catch {
     return null;
   }
+}
+
+async function waitForActiveServiceWorker(timeoutMs = 10_000): Promise<ServiceWorkerRegistration | null> {
+  const registration = await registerServiceWorker();
+  if (!registration) return null;
+  if (registration.active) return registration;
+
+  return new Promise((resolve) => {
+    const timeout = window.setTimeout(() => resolve(null), timeoutMs);
+    void navigator.serviceWorker.ready.then((readyRegistration) => {
+      window.clearTimeout(timeout);
+      resolve(readyRegistration);
+    }, () => {
+      window.clearTimeout(timeout);
+      resolve(null);
+    });
+  });
 }
 
 export async function getPushPermissionState(): Promise<NotificationPermission | "unsupported"> {
@@ -50,23 +67,16 @@ export async function subscribeToPush(): Promise<{ ok: boolean; error?: string; 
   try {
     const configRes = await fetch("/api/push/subscribe", { cache: "no-store" });
     const config = await configRes.json().catch(() => ({}));
-    if (!config.configured || !config.publicKey) {
-      return { ok: false, error: "Push-уведомления не настроены на сервере (задайте VAPID-ключи в .env)" };
+    if (!configRes.ok || !config.configured || !config.publicKey) {
+      return { ok: false, error: config.error || "Push-уведомления не настроены на сервере (задайте VAPID-ключи в .env)" };
     }
 
-    // Ensure SW is registered and active before asking for permission.
-    let registration: ServiceWorkerRegistration | null = null;
-    try {
-      registration = await navigator.serviceWorker.ready;
-    } catch {
-      registration = await registerServiceWorker();
-      if (registration) {
-        // Give the SW a moment to activate.
-        await new Promise((resolve) => window.setTimeout(resolve, 300));
-        registration = await navigator.serviceWorker.ready;
-      }
+    // ready may remain pending forever if registration failed; use a bounded
+    // wait and give the user an actionable error instead of a stuck button.
+    const registration = await waitForActiveServiceWorker();
+    if (!registration) {
+      return { ok: false, error: "Service Worker не активировался. Проверьте HTTPS и доступность /sw.js, затем обновите страницу." };
     }
-    if (!registration) return { ok: false, error: "Не удалось зарегистрировать Service Worker" };
 
     // If user already denied permission, report it clearly.
     if (Notification.permission === "denied") {

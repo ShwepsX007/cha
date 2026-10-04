@@ -93,6 +93,7 @@ export interface MatrixTimelineMessage {
   body: string;
   timestamp: number;
   msgtype: "m.text" | "m.notice" | "m.file";
+  readByOther: boolean;
   mimeType?: string;
   fileSize?: number;
   encryptedFile?: IEncryptedFile & { url: string };
@@ -1475,6 +1476,10 @@ export async function getEncryptedRoomMessages(
   const undecryptableCount = encryptedEvents.filter(
     (event) => event.getType() === EventType.RoomMessageEncrypted,
   ).length;
+  const otherJoinedUserIds = room
+    .getMembers()
+    .filter((member) => member.membership === "join" && member.userId !== session.userId)
+    .map((member) => member.userId);
 
   const messages = timelineEvents
     .filter((event) => event.getType() === EventType.RoomMessage)
@@ -1494,6 +1499,7 @@ export async function getEncryptedRoomMessages(
           body,
           timestamp: event.getTs(),
           msgtype: content.msgtype as "m.text" | "m.notice",
+          readByOther: otherJoinedUserIds.some((userId) => room.hasUserReadEvent(userId, eventId)),
         } satisfies MatrixTimelineMessage;
       }
 
@@ -1508,6 +1514,7 @@ export async function getEncryptedRoomMessages(
           body,
           timestamp: event.getTs(),
           msgtype: "m.file",
+          readByOther: otherJoinedUserIds.some((userId) => room.hasUserReadEvent(userId, eventId)),
           mimeType: typeof info.mimetype === "string" ? info.mimetype : "application/octet-stream",
           fileSize: typeof info.size === "number" ? info.size : undefined,
           encryptedFile: content.file,
@@ -1520,6 +1527,22 @@ export async function getEncryptedRoomMessages(
     .sort((a, b) => a.timestamp - b.timestamp);
 
   return { messages, undecryptableCount };
+}
+
+/** Send a standard Matrix read receipt for the latest visible event in an E2EE room. */
+export async function sendMatrixReadReceipt(
+  session: MatrixSession,
+  roomId: string,
+  eventId: string,
+): Promise<void> {
+  const client = await ensureEncryptedRoomReady(session, roomId);
+  const room = client.getRoom(roomId);
+  if (!room || room.getMyMembership() !== "join") {
+    throw new Error("Matrix room is not joined on this device");
+  }
+  const event = room.findEventById(eventId);
+  if (!event) throw new Error("Matrix event is not available in the local timeline");
+  await client.sendReadReceipt(event);
 }
 
 export async function stopMatrixClient(logout = false): Promise<void> {

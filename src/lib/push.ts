@@ -1,5 +1,5 @@
 import webpush from "web-push";
-import { eq, and } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { pushSubscriptions } from "@/db/schema";
 
@@ -32,9 +32,27 @@ export interface PushPayload {
   messageId?: number;
 }
 
-export async function sendPushToUser(userId: number, payload: PushPayload) {
-  if (!isPushConfigured()) return { sent: 0 };
-  if (!configureWebPush()) return { sent: 0 };
+export interface PushSendResult {
+  configured: boolean;
+  subscriptions: number;
+  sent: number;
+  failed: number;
+  removed: number;
+  failureStatusCodes: number[];
+}
+
+const emptyPushResult = (configured: boolean): PushSendResult => ({
+  configured,
+  subscriptions: 0,
+  sent: 0,
+  failed: 0,
+  removed: 0,
+  failureStatusCodes: [],
+});
+
+export async function sendPushToUser(userId: number, payload: PushPayload): Promise<PushSendResult> {
+  if (!isPushConfigured()) return emptyPushResult(false);
+  if (!configureWebPush()) return emptyPushResult(false);
 
   const subs = await db
     .select()
@@ -42,7 +60,9 @@ export async function sendPushToUser(userId: number, payload: PushPayload) {
     .where(eq(pushSubscriptions.userId, userId));
 
   let sent = 0;
+  let failed = 0;
   const toDelete: number[] = [];
+  const failureStatusCodes: number[] = [];
   const json = JSON.stringify(payload);
 
   await Promise.all(
@@ -55,14 +75,20 @@ export async function sendPushToUser(userId: number, payload: PushPayload) {
         );
         sent += 1;
       } catch (err: unknown) {
+        failed += 1;
         const status =
           err && typeof err === "object" && "statusCode" in err
             ? (err as { statusCode?: number }).statusCode
             : undefined;
-        // 404 / 410 = subscription expired or was revoked
-        if (status === 404 || status === 410) {
-          toDelete.push(sub.id);
-        }
+        if (typeof status === "number") failureStatusCodes.push(status);
+        // Keep endpoint, VAPID keys and message content out of logs.
+        console.error("Web Push provider rejected a delivery", {
+          userId,
+          statusCode: typeof status === "number" ? status : null,
+          errorName: err instanceof Error ? err.name : "UnknownError",
+        });
+        // 404 / 410 = subscription expired or was revoked.
+        if (status === 404 || status === 410) toDelete.push(sub.id);
       }
     }),
   );
@@ -73,7 +99,22 @@ export async function sendPushToUser(userId: number, payload: PushPayload) {
     }
   }
 
-  return { sent, removed: toDelete.length };
+  return {
+    configured: true,
+    subscriptions: subs.length,
+    sent,
+    failed,
+    removed: toDelete.length,
+    failureStatusCodes,
+  };
+}
+
+export async function getPushSubscriptionCount(userId: number): Promise<number> {
+  const rows = await db
+    .select({ id: pushSubscriptions.id })
+    .from(pushSubscriptions)
+    .where(eq(pushSubscriptions.userId, userId));
+  return rows.length;
 }
 
 export async function savePushSubscription(
@@ -81,26 +122,16 @@ export async function savePushSubscription(
   sub: { endpoint: string; p256dh: string; auth: string },
 ) {
   if (!sub.endpoint || !sub.p256dh || !sub.auth) return null;
-  const existing = await db
-    .select({ id: pushSubscriptions.id })
-    .from(pushSubscriptions)
-    .where(
-      and(
-        eq(pushSubscriptions.userId, userId),
-        eq(pushSubscriptions.endpoint, sub.endpoint),
-      ),
-    );
-  if (existing.length > 0) {
-    const [row] = await db
-      .update(pushSubscriptions)
-      .set({ p256dh: sub.p256dh, auth: sub.auth })
-      .where(eq(pushSubscriptions.id, existing[0].id))
-      .returning({ id: pushSubscriptions.id });
-    return row;
-  }
+  // One browser endpoint is unique per origin. If a user switches accounts
+  // in the same browser, atomically transfer that endpoint instead of failing
+  // with a unique-constraint violation or leaving notifications on the old user.
   const [row] = await db
     .insert(pushSubscriptions)
     .values({ userId, endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth })
+    .onConflictDoUpdate({
+      target: pushSubscriptions.endpoint,
+      set: { userId, p256dh: sub.p256dh, auth: sub.auth },
+    })
     .returning({ id: pushSubscriptions.id });
   return row;
 }

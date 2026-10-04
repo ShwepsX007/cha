@@ -32,42 +32,25 @@ export async function markReceipts(params: {
   const ids = valid.map((r) => r.id);
   if (!ids.length) return { updated: 0 };
 
-  // Upsert receipts. If a row already exists, only promote status upward
-  // (sent < delivered < read).
-  const level = status === "read" ? 2 : status === "delivered" ? 1 : 0;
-  let updated = 0;
-  for (const id of ids) {
-    const [existing] = await db
-      .select({ id: messageReceipts.id, status: messageReceipts.status })
-      .from(messageReceipts)
-      .where(
-        and(
-          eq(messageReceipts.messageId, id),
-          eq(messageReceipts.userId, userId),
-        ),
-      );
-    const existingLevel = existing
-      ? existing.status === "read" ? 2 : existing.status === "delivered" ? 1 : 0
-      : -1;
-    if (!existing) {
-      await db.insert(messageReceipts).values({
-        messageId: id,
-        userId,
-        status: level >= 2 ? "read" : level === 1 ? "delivered" : "delivered",
-      });
-      updated += 1;
-    } else if (level > existingLevel) {
-      await db
-        .update(messageReceipts)
-        .set({
-          status: level >= 2 ? "read" : "delivered",
-          updatedAt: new Date(),
-        })
-        .where(eq(messageReceipts.id, existing.id));
-      updated += 1;
-    }
-  }
-  return { updated };
+  // Marking a message as delivered and read can happen almost at the same
+  // time when it is first rendered. A SELECT-then-INSERT races against the
+  // unique (message_id, user_id) constraint and can lose the read receipt.
+  // Use one atomic upsert and never downgrade read -> delivered.
+  const nextStatus = status === "read" ? "read" : "delivered";
+  await db
+    .insert(messageReceipts)
+    .values(ids.map((messageId) => ({ messageId, userId, status: nextStatus })))
+    .onConflictDoUpdate({
+      target: [messageReceipts.messageId, messageReceipts.userId],
+      set: {
+        status: sql`CASE
+          WHEN ${messageReceipts.status} = 'read' OR EXCLUDED.status = 'read' THEN 'read'
+          ELSE 'delivered'
+        END`,
+        updatedAt: new Date(),
+      },
+    });
+  return { updated: ids.length };
 }
 
 /**

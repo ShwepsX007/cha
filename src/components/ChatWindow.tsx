@@ -15,6 +15,7 @@ import {
   retryQueuedEncryptedMessage,
   sendEncryptedAttachment,
   sendQueuedEncryptedMessage,
+  sendMatrixReadReceipt,
   type EncryptedOutboxMessage,
   type MatrixOutboxUpdate,
 } from "@/lib/matrix/client";
@@ -352,6 +353,7 @@ export default function ChatWindow({
     if (chat.securityMode !== "public") return;
     let cancelled = false;
     const refreshBan = async () => {
+      if (document.visibilityState !== "visible") return;
       try {
         const response = await fetch("/api/auth/me", { cache: "no-store" });
         const data = await response.json();
@@ -364,11 +366,16 @@ export default function ChatWindow({
         // The server enforces bans even if this UI refresh is temporarily unavailable.
       }
     };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") void refreshBan();
+    };
     void refreshBan();
     const interval = window.setInterval(() => void refreshBan(), 5_000);
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       cancelled = true;
       window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [chat.securityMode]);
 
@@ -460,24 +467,74 @@ export default function ChatWindow({
     messageElsRef.current = new Map();
   }, [chat.id]);
 
-  const sendReceipts = useCallback(async (messageIds: Array<number | string>, status: "delivered" | "read") => {
-    if (chat.securityMode !== "public") return; // receipts for E2EE chats come from Matrix natively
-    const numericIds = messageIds.filter((id): id is number => typeof id === "number" && Number.isInteger(id));
-    if (!numericIds.length) return;
-    try {
-      await fetch(`/api/messages/${chat.id}/receipts`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messageIds: numericIds, status }),
-      });
-    } catch {
-      /* ignore */
+  const sendReceipts = useCallback(async (
+    messageIds: Array<number | string>,
+    status: "delivered" | "read",
+  ): Promise<boolean> => {
+    if (chat.securityMode === "public") {
+      const numericIds = messageIds.filter(
+        (id): id is number => typeof id === "number" && Number.isInteger(id),
+      );
+      if (!numericIds.length) return true;
+      try {
+        const response = await fetch(`/api/messages/${chat.id}/receipts`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messageIds: numericIds, status }),
+        });
+        if (!response.ok) {
+          console.warn(`Message receipt update failed (${response.status})`);
+          return false;
+        }
+        return true;
+      } catch (error) {
+        console.warn("Message receipt request failed", error);
+        return false;
+      }
     }
-  }, [chat.id, chat.securityMode]);
 
-  // On initial messages load, mark other users' messages as delivered.
+    // Private encrypted messages live only in Matrix. Send a standard Matrix
+    // read receipt for the newest visible incoming event; the remote sender
+    // reads that receipt from the encrypted room timeline state.
+    if (
+      chat.securityMode === "e2ee" && status === "read" && chat.matrixRoomId &&
+      currentUser.matrixSession
+    ) {
+      const requestedIds = new Set(messageIds.map(String));
+      const incoming = messages
+        .filter((message) =>
+          requestedIds.has(String(message.id)) &&
+          message.senderId !== currentUser.id &&
+          typeof message.id === "string" &&
+          !message.id.startsWith("outbox:"),
+        )
+        .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      const latest = incoming.at(-1);
+      if (!latest || typeof latest.id !== "string") return true;
+      try {
+        await sendMatrixReadReceipt(currentUser.matrixSession, chat.matrixRoomId, latest.id);
+        return true;
+      } catch (error) {
+        console.warn("Matrix read receipt failed", error);
+        return false;
+      }
+    }
+
+    return true;
+  }, [chat.id, chat.matrixRoomId, chat.securityMode, currentUser.id, currentUser.matrixSession, messages]);
+
+  const queueReadReceipts = useCallback((messageIds: Array<number | string>) => {
+    const pending = messageIds.filter((id) => !reportedReadRef.current.has(id));
+    if (!pending.length) return;
+    pending.forEach((id) => reportedReadRef.current.add(id));
+    void sendReceipts(pending, "read").then((sent) => {
+      if (!sent) pending.forEach((id) => reportedReadRef.current.delete(id));
+    });
+  }, [sendReceipts]);
+
+  // On initial messages load, mark other users' public-chat messages delivered.
   useEffect(() => {
-    if (messages.length === 0) return;
+    if (chat.securityMode !== "public" || messages.length === 0) return;
     const pending: number[] = [];
     for (const msg of messages) {
       if (msg.senderId === currentUser.id) continue;
@@ -486,8 +543,12 @@ export default function ChatWindow({
       reportedDeliveredRef.current.add(msg.id);
       pending.push(msg.id);
     }
-    if (pending.length) void sendReceipts(pending, "delivered");
-  }, [messages, currentUser.id, sendReceipts]);
+    if (pending.length) {
+      void sendReceipts(pending, "delivered").then((sent) => {
+        if (!sent) pending.forEach((id) => reportedDeliveredRef.current.delete(id));
+      });
+    }
+  }, [chat.securityMode, messages, currentUser.id, sendReceipts]);
 
   // Poll receipts every few seconds so we can upgrade sent→delivered→read.
   useEffect(() => {
@@ -515,58 +576,58 @@ export default function ChatWindow({
   // Build (or rebuild) the IntersectionObserver once the container exists, and
   // keep a stable instance in a ref so we can observe nodes as they register.
   useEffect(() => {
-    if (chat.securityMode !== "public") return;
+    if (chat.securityMode !== "public" && chat.securityMode !== "e2ee") return;
     const container = messagesContainerRef.current;
     if (!container) return;
 
     readObserverRef.current?.disconnect();
     const observer = new IntersectionObserver((entries) => {
-      const visibleIds: number[] = [];
+      if (document.visibilityState !== "visible") return;
+      const visibleIds: Array<number | string> = [];
       for (const entry of entries) {
         if (!entry.isIntersecting) continue;
         const idAttr = (entry.target as HTMLElement).dataset.messageId;
         if (!idAttr) continue;
-        const id = Number(idAttr);
-        if (!Number.isInteger(id)) continue;
-        if (reportedReadRef.current.has(id)) continue;
-        reportedReadRef.current.add(id);
-        visibleIds.push(id);
+        const message = messages.find((candidate) => String(candidate.id) === idAttr);
+        if (!message || message.senderId === currentUser.id) continue;
+        if (reportedReadRef.current.has(message.id)) continue;
+        visibleIds.push(message.id);
       }
-      if (visibleIds.length) void sendReceipts(visibleIds, "read");
+      if (visibleIds.length) queueReadReceipts(visibleIds);
     }, { root: container, threshold: [0.5], rootMargin: "0px" });
     readObserverRef.current = observer;
 
     // Observe all currently-mounted message nodes.
     messageElsRef.current.forEach((el) => observer.observe(el));
 
-    // After initial paint, if we're near the bottom (which is the default on
-    // open), mark every already-visible non-self message as read. This catches
-    // the case where messages are rendered at rest and never cross the IO
-    // threshold because they started visible.
-    const initialTimer = window.setTimeout(() => {
-      const queue: number[] = [];
+    // Some messages are visible on first paint and never cross the observer
+    // threshold. Also re-check after a hidden tab becomes visible so background
+    // layout does not falsely mark messages as read.
+    const markCurrentlyVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      const queue: Array<number | string> = [];
       messageElsRef.current.forEach((el, id) => {
-        if (typeof id !== "number") return;
         if (reportedReadRef.current.has(id)) return;
         const rect = el.getBoundingClientRect();
         const cRect = container.getBoundingClientRect();
         const visible = rect.bottom > cRect.top && rect.top < cRect.bottom;
         if (!visible) return;
-        // Only mark others' messages read.
-        const msg = messages.find((m) => m.id === id);
+        const msg = messages.find((m) => String(m.id) === String(id));
         if (!msg || msg.senderId === currentUser.id) return;
-        reportedReadRef.current.add(id);
-        queue.push(id);
+        queue.push(msg.id);
       });
-      if (queue.length) void sendReceipts(queue, "read");
-    }, 400);
+      if (queue.length) queueReadReceipts(queue);
+    };
+    const initialTimer = window.setTimeout(markCurrentlyVisible, 400);
+    document.addEventListener("visibilitychange", markCurrentlyVisible);
 
     return () => {
       window.clearTimeout(initialTimer);
+      document.removeEventListener("visibilitychange", markCurrentlyVisible);
       observer.disconnect();
       readObserverRef.current = null;
     };
-  }, [chat.id, chat.securityMode, sendReceipts, messages, currentUser.id]);
+  }, [chat.id, chat.securityMode, queueReadReceipts, messages, currentUser.id]);
 
   const registerMessageEl = useCallback((id: number | string, el: HTMLElement | null) => {
     if (!el) {
@@ -575,9 +636,7 @@ export default function ChatWindow({
     }
     el.dataset.messageId = String(id);
     messageElsRef.current.set(id, el);
-    if (readObserverRef.current && typeof id === "number") {
-      readObserverRef.current.observe(el);
-    }
+    readObserverRef.current?.observe(el);
   }, []);
 
   const getMessageStatus = useCallback((msg: ChatMessage): ChatMessage["deliveryStatus"] => {
@@ -608,7 +667,10 @@ export default function ChatWindow({
 
   const loadMessages = useCallback(async () => {
     try {
-      const res = await fetch(`/api/messages?chatId=${chat.id}`);
+      const isVisible = document.visibilityState === "visible";
+      const res = await fetch(`/api/messages?chatId=${chat.id}`, {
+        headers: { "X-Chat-Visible": isVisible ? "1" : "0" },
+      });
       const data = await res.json();
       if (!res.ok || !Array.isArray(data.messages)) return;
 
@@ -658,6 +720,7 @@ export default function ChatWindow({
               senderDisplayName: sender?.displayName || "Пользователь",
               senderAvatarColor: sender?.avatarColor || "#6C5CE7",
               senderAvatarUrl: sender?.avatarUrl || null,
+              deliveryStatus: message.readByOther ? "read" : "sent",
               isLegacy: false,
             };
           });
@@ -741,9 +804,16 @@ export default function ChatWindow({
 
   useEffect(() => {
     prevMsgCountRef.current = 0;
-    loadMessages();
-    const interval = setInterval(loadMessages, 2000);
-    return () => clearInterval(interval);
+    const pollIfVisible = () => {
+      if (document.visibilityState === "visible") void loadMessages();
+    };
+    pollIfVisible();
+    const interval = window.setInterval(pollIfVisible, 2000);
+    document.addEventListener("visibilitychange", pollIfVisible);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", pollIfVisible);
+    };
   }, [loadMessages]);
 
   useEffect(() => {
