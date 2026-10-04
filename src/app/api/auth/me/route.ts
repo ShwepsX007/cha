@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { users } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { getCurrentUser } from "@/lib/auth";
+import { ensureConfiguredInitialAdmin } from "@/lib/admin";
 
 export async function GET() {
   try {
@@ -11,12 +12,25 @@ export async function GET() {
       return NextResponse.json({ user: null }, { status: 401 });
     }
 
+    const [sessionUser] = await db
+      .select({ id: users.id, username: users.username })
+      .from(users)
+      .where(eq(users.id, payload.userId));
+    if (!sessionUser) {
+      return NextResponse.json({ user: null }, { status: 401 });
+    }
+    await ensureConfiguredInitialAdmin(sessionUser.id, sessionUser.username);
+
     const [user] = await db
       .select({
         id: users.id,
         username: users.username,
         displayName: users.displayName,
         avatarColor: users.avatarColor,
+        role: users.role,
+        bannedUntil: users.bannedUntil,
+        banReason: users.banReason,
+        matrixResetRequired: users.matrixResetRequired,
       })
       .from(users)
       .where(eq(users.id, payload.userId));

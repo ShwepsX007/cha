@@ -152,6 +152,52 @@ export function getPendingEncryptedMessages(
   return chatId === undefined ? messages : messages.filter((message) => message.chatId === chatId);
 }
 
+/** Remove this app user's Matrix crypto databases and any legacy SDK stores. */
+export async function clearLocalMatrixCryptoStores(appUserId: number): Promise<void> {
+  if (typeof window === "undefined" || !window.indexedDB) {
+    throw new Error("В этом браузере IndexedDB недоступна; Matrix-хранилище не очищено.");
+  }
+
+  const userDbId = `@chata_u${appUserId}`.replace(/[^A-Za-z0-9_-]/g, "_");
+  const currentPrefix = `secret-chat-${userDbId}-`;
+  const databaseNames = new Set<string>([
+    "matrix-js-sdk:crypto",
+    "matrix-js-sdk:default",
+    `${currentPrefix}::matrix-sdk-crypto`,
+    `${currentPrefix}::matrix-sdk-crypto-meta`,
+  ]);
+
+  if (typeof window.indexedDB.databases === "function") {
+    const databases = await window.indexedDB.databases();
+    for (const database of databases) {
+      const name = database.name;
+      if (!name) continue;
+      if (
+        name.startsWith("matrix-js-sdk:") ||
+        name.startsWith("matrix-crypto-") ||
+        name.includes(currentPrefix) ||
+        name.includes(`secret-chat-${userDbId}`)
+      ) {
+        databaseNames.add(name);
+      }
+    }
+  }
+
+  await Promise.all([...databaseNames].map((name) => new Promise<void>((resolve, reject) => {
+    const request = window.indexedDB.deleteDatabase(name);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error || new Error("Не удалось удалить Matrix IndexedDB"));
+    request.onblocked = () => reject(new Error("Закройте другие вкладки приложения и повторите Matrix-сброс."));
+  })));
+
+  try {
+    window.sessionStorage.removeItem("chata_matrix_session");
+    window.sessionStorage.removeItem("chata_matrix_availability");
+  } catch {
+    throw new Error("Не удалось очистить Matrix-сессию браузера.");
+  }
+}
+
 function emitOutboxUpdate(update: MatrixOutboxUpdate): void {
   if (typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent<MatrixOutboxUpdate>(MATRIX_OUTBOX_EVENT, { detail: update }));

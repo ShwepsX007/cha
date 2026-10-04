@@ -5,6 +5,7 @@ import { messages, chatMembers, chats } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { eq, and } from "drizzle-orm";
 import { uploadFileToTelegram } from "@/lib/telegram";
+import { getActivePublicChatBan } from "@/lib/moderation";
 
 const MAX_ENCRYPTED_FILE_SIZE = 45 * 1024 * 1024;
 
@@ -72,6 +73,18 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         { error: "Legacy private chats cannot accept new plaintext files", code: "E2EE_REQUIRED" },
         { status: 409 },
+      );
+    }
+
+    const activeBan = await getActivePublicChatBan(payload.userId);
+    if (activeBan) {
+      return NextResponse.json(
+        {
+          error: `Загрузка в общий чат заблокирована до ${activeBan.bannedUntil.toISOString()}`,
+          bannedUntil: activeBan.bannedUntil.toISOString(),
+          banReason: activeBan.banReason,
+        },
+        { status: 403 },
       );
     }
 

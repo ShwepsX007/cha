@@ -7,6 +7,7 @@ import {
   boolean,
   varchar,
   bigint,
+  jsonb,
 } from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
@@ -18,16 +19,30 @@ export const users = pgTable("users", {
   // PBKDF2-derived key before either value reaches the application server.
   matrixRecoveryKeyEncrypted: text("matrix_recovery_key_encrypted"),
   matrixRecoveryKeySalt: text("matrix_recovery_key_salt"),
+  role: varchar("role", { length: 20 }).notNull().default("user"),
+  bannedUntil: timestamp("banned_until", { withTimezone: true }),
+  banReason: text("ban_reason"),
+  matrixResetRequired: boolean("matrix_reset_required").notNull().default(false),
   avatarColor: varchar("avatar_color", { length: 7 }).notNull().default("#6C5CE7"),
   lastSeen: timestamp("last_seen").defaultNow(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const adminAuditLogs = pgTable("admin_audit_logs", {
+  id: serial("id").primaryKey(),
+  adminId: integer("admin_id").references(() => users.id, { onDelete: "set null" }),
+  action: varchar("action", { length: 100 }).notNull(),
+  targetType: varchar("target_type", { length: 50 }),
+  targetId: text("target_id"),
+  details: jsonb("details"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const chats = pgTable("chats", {
   id: serial("id").primaryKey(),
   name: varchar("name", { length: 100 }),
   isGroup: boolean("is_group").notNull().default(false),
-  createdBy: integer("created_by").references(() => users.id),
+  createdBy: integer("created_by").references(() => users.id, { onDelete: "set null" }),
   // Legacy is deliberately the default: historical rooms must not be
   // mistaken for encrypted until a verified Matrix room is linked.
   securityMode: varchar("security_mode", { length: 20 }).notNull().default("legacy"),

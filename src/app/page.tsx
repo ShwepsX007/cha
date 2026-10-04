@@ -10,6 +10,10 @@ interface User {
   username: string;
   displayName: string;
   avatarColor?: string;
+  role?: "user" | "admin";
+  bannedUntil?: string | null;
+  banReason?: string | null;
+  matrixResetRequired?: boolean;
   matrixAvailability?: MatrixAvailability;
   matrixSession?: MatrixSession | null;
   initialRecoveryKey?: string | null;
@@ -26,6 +30,13 @@ export default function Home() {
       .then((r) => r.json())
       .then((data) => {
         if (data.user) {
+          if (data.user.matrixResetRequired) {
+            sessionStorage.removeItem("chata_matrix_session");
+            sessionStorage.removeItem("chata_matrix_availability");
+            setUser(null);
+            return;
+          }
+
           let matrixSession: MatrixSession | null = null;
           try {
             const stored = sessionStorage.getItem("chata_matrix_session");

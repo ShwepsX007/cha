@@ -8,6 +8,7 @@ import ChatWindow from "./ChatWindow";
 const DeviceSecurityModal = dynamic(() => import("./DeviceSecurityModal"), { ssr: false });
 import { ClientEvent, SyncState } from "matrix-js-sdk";
 import {
+  clearLocalMatrixCryptoStores,
   drainEncryptedOutbox,
   getAutomaticRecoveryNotice,
   getMatrixClient,
@@ -26,6 +27,10 @@ export interface User {
   displayName: string;
   avatarColor?: string;
   lastSeen?: string;
+  role?: "user" | "admin";
+  bannedUntil?: string | null;
+  banReason?: string | null;
+  matrixResetRequired?: boolean;
   matrixAvailability?: MatrixAvailability;
   matrixSession?: MatrixSession | null;
   initialRecoveryKey?: string | null;
@@ -93,6 +98,32 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
     () => user.matrixSession ? getAutomaticRecoveryNotice(user.matrixSession.userId) : null,
   );
 
+  const handleLogout = useCallback(async () => {
+    try {
+      await stopMatrixClient(true);
+    } catch {
+      console.error("Matrix logout failed");
+    }
+    sessionStorage.removeItem("chata_matrix_session");
+    sessionStorage.removeItem("chata_matrix_availability");
+    await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
+    onLogout();
+  }, [onLogout]);
+
+  const handleFatalMatrixReset = useCallback(async () => {
+    try {
+      await stopMatrixClient(true);
+      await clearLocalMatrixCryptoStores(user.id);
+      await fetch("/api/auth/matrix-reset", { method: "POST", cache: "no-store" }).catch(() => undefined);
+    } catch {
+      console.error("Fatal matrix reset failed");
+    }
+    sessionStorage.removeItem("chata_matrix_session");
+    sessionStorage.removeItem("chata_matrix_availability");
+    await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
+    onLogout();
+  }, [onLogout, user.id]);
+
   const loadChats = useCallback(async () => {
     try {
       const res = await fetch("/api/chats");
@@ -151,15 +182,18 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
       })
       .catch((error) => {
         const errorType = error instanceof Error ? error.name : "Unknown Matrix sync error";
+        const fatalCryptoError = error instanceof Error && /unknown device|corrupted|indexeddb|crypto store|decryption|key error|invalid session/i.test(error.message);
         console.error("Matrix client unavailable:", errorType);
-        if (!cancelled) setMatrixState("unavailable");
+        if (cancelled) return;
+        setMatrixState("unavailable");
+        if (fatalCryptoError) void handleFatalMatrixReset();
       });
 
     return () => {
       cancelled = true;
       if (matrixClient) matrixClient.removeListener(ClientEvent.Sync, onSync);
     };
-  }, [user.matrixSession]);
+  }, [handleFatalMatrixReset, user.matrixSession]);
 
   useEffect(() => {
     if (!user.matrixSession) return;
@@ -199,18 +233,6 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
   const handleBack = () => {
     setShowSidebar(true);
     setSelectedChatId(null);
-  };
-
-  const handleLogout = async () => {
-    try {
-      await stopMatrixClient(true);
-    } catch {
-      console.error("Matrix logout failed");
-    }
-    sessionStorage.removeItem("chata_matrix_session");
-    sessionStorage.removeItem("chata_matrix_availability");
-    await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
-    onLogout();
   };
 
   const selectedChat = chats.find((c) => c.id === selectedChatId) || null;

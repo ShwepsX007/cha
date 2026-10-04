@@ -34,6 +34,19 @@ function formatFileSize(bytes: number | null) {
   return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
+function formatBanRemaining(milliseconds: number): string {
+  if (milliseconds > 50 * 365 * 24 * 60 * 60 * 1000) return "длительный срок";
+  const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000));
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  if (days > 0) return `${days} д ${hours} ч`;
+  if (hours > 0) return `${hours} ч ${minutes} мин`;
+  if (minutes > 0) return `${minutes} мин ${seconds} сек`;
+  return `${seconds} сек`;
+}
+
 function outboxItemToChatMessage(
   item: EncryptedOutboxMessage,
   user: Pick<User, "id" | "username" | "displayName" | "avatarColor">,
@@ -295,6 +308,42 @@ export default function ChatWindow({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const prevMsgCountRef = useRef(0);
+  const [banUntil, setBanUntil] = useState<string | null>(currentUser.bannedUntil ?? null);
+  const [banReason, setBanReason] = useState<string | null>(currentUser.banReason ?? null);
+  const [banNow, setBanNow] = useState(() => Date.now());
+  const banExpiresAt = banUntil ? Date.parse(banUntil) : Number.NaN;
+  const isPublicBanActive = chat.securityMode === "public" && Number.isFinite(banExpiresAt) && banExpiresAt > banNow;
+
+  useEffect(() => {
+    if (chat.securityMode !== "public") return;
+    let cancelled = false;
+    const refreshBan = async () => {
+      try {
+        const response = await fetch("/api/auth/me", { cache: "no-store" });
+        const data = await response.json();
+        if (!cancelled && response.ok && data.user) {
+          setBanUntil(typeof data.user.bannedUntil === "string" ? data.user.bannedUntil : null);
+          setBanReason(typeof data.user.banReason === "string" ? data.user.banReason : null);
+          setBanNow(Date.now());
+        }
+      } catch {
+        // The server enforces bans even if this UI refresh is temporarily unavailable.
+      }
+    };
+    void refreshBan();
+    const interval = window.setInterval(() => void refreshBan(), 5_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [chat.securityMode]);
+
+  useEffect(() => {
+    if (!banUntil) return;
+    const interval = window.setInterval(() => setBanNow(Date.now()), 1_000);
+    return () => window.clearInterval(interval);
+  }, [banUntil]);
+
   const updateLocalMessages = useCallback((update: (current: ChatMessage[]) => ChatMessage[]) => {
     const next = update(localMessagesRef.current);
     localMessagesRef.current = next;
@@ -541,6 +590,10 @@ export default function ChatWindow({
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newMessage.trim() || sending) return;
+    if (isPublicBanActive) {
+      setSendError("Отправка в общий чат заблокирована на время действия бана.");
+      return;
+    }
 
     const msgText = newMessage.trim();
     setSendError("");
@@ -587,7 +640,8 @@ export default function ChatWindow({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chatId: chat.id, content: msgText }),
         });
-        if (!response.ok) throw new Error("Не удалось отправить сообщение");
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || "Не удалось отправить сообщение");
       } else {
         throw new Error("Новые сообщения в legacy-чатах заблокированы до настройки E2EE.");
       }
@@ -615,6 +669,11 @@ export default function ChatWindow({
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (isPublicBanActive) {
+      setSendError("Загрузка файлов в общий чат заблокирована на время действия бана.");
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
 
     setSendError("");
     setUploading(true);
@@ -625,7 +684,8 @@ export default function ChatWindow({
         formData.append("chatId", String(chat.id));
 
         const response = await fetch("/api/upload", { method: "POST", body: formData });
-        if (!response.ok) throw new Error("Не удалось загрузить файл");
+        const uploadResult = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(uploadResult.error || "Не удалось загрузить файл");
       } else if (chat.securityMode === "e2ee" && chat.matrixRoomId && currentUser.matrixSession) {
         await prepareEncryptedChat();
         if (file.size > 45 * 1024 * 1024) {
@@ -675,7 +735,7 @@ export default function ChatWindow({
 
   const otherMember = chat.isGroup ? undefined : chat.members.find((m) => m.id !== currentUser.id);
   const canSendMessage =
-    chat.securityMode === "public" ||
+    (chat.securityMode === "public" && !isPublicBanActive) ||
     (chat.securityMode === "e2ee" && Boolean(chat.matrixRoomId && currentUser.matrixSession));
   const canAttachFile = canSendMessage;
 
@@ -768,6 +828,15 @@ export default function ChatWindow({
 
       {/* Input */}
       <div className="px-4 py-3 bg-dark-800 border-t border-dark-600">
+        {isPublicBanActive && (
+          <div role="alert" className="mb-3 rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs leading-relaxed text-red-200">
+            <div className="font-semibold">Отправка сообщений и файлов в общий чат временно заблокирована.</div>
+            <div className="mt-1">
+              Осталось: {formatBanRemaining(banExpiresAt - banNow)} · доступ восстановится {new Date(banExpiresAt).toLocaleString("ru-RU")}.
+            </div>
+            {banReason && <div className="mt-1">Причина: {banReason}</div>}
+          </div>
+        )}
         {sendError && (
           <div className="mb-2 text-xs text-amber-300" role="status">
             {sendError}
@@ -787,7 +856,7 @@ export default function ChatWindow({
             onClick={() => fileInputRef.current?.click()}
             disabled={uploading || !canAttachFile}
             className="p-2.5 text-gray-400 hover:text-purple-400 rounded-xl hover:bg-dark-700 transition-colors disabled:opacity-50"
-            title={canAttachFile ? "Прикрепить файл" : "Новые файлы доступны после настройки Matrix E2EE"}
+            title={isPublicBanActive ? "Загрузка заблокирована на время бана" : canAttachFile ? "Прикрепить файл" : "Новые файлы доступны после настройки Matrix E2EE"}
           >
             {uploading ? (
               <div className="w-5 h-5 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
@@ -804,7 +873,7 @@ export default function ChatWindow({
             onChange={(e) => setNewMessage(e.target.value)}
             disabled={!canSendMessage || sending}
             className="flex-1 px-4 py-2.5 bg-dark-700 border border-dark-500 rounded-xl text-sm text-white placeholder-gray-500 focus:outline-none focus:border-purple-500 transition-colors disabled:opacity-50"
-            placeholder={canSendMessage ? "Введите сообщение..." : "Новые сообщения заблокированы до подключения E2EE"}
+            placeholder={isPublicBanActive ? "Отправка заблокирована до окончания бана" : canSendMessage ? "Введите сообщение..." : "Новые сообщения заблокированы до подключения E2EE"}
             autoComplete="off"
           />
 

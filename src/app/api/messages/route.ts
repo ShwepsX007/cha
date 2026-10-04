@@ -3,6 +3,7 @@ import { db } from "@/db";
 import { messages, users, chatMembers, chats } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { eq, and, asc } from "drizzle-orm";
+import { getActivePublicChatBan } from "@/lib/moderation";
 
 export async function GET(req: NextRequest) {
   try {
@@ -88,6 +89,18 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         { error: "Private messages must use the encrypted Matrix room", code: "E2EE_REQUIRED" },
         { status: 409 },
+      );
+    }
+
+    const activeBan = await getActivePublicChatBan(payload.userId);
+    if (activeBan) {
+      return NextResponse.json(
+        {
+          error: `Отправка в общий чат заблокирована до ${activeBan.bannedUntil.toISOString()}`,
+          bannedUntil: activeBan.bannedUntil.toISOString(),
+          banReason: activeBan.banReason,
+        },
+        { status: 403 },
       );
     }
 

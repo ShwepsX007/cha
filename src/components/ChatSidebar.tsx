@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import type { User, Chat } from "./ChatApp";
 import NewChatModal from "./NewChatModal";
 
@@ -120,6 +121,19 @@ export default function ChatSidebar({
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
               </svg>
             </button>
+            {user.role === "admin" && (
+              <Link
+                href="/admin"
+                className="rounded-lg p-2 text-gray-500 transition-colors hover:bg-dark-600 hover:text-purple-300"
+                title="Панель администратора"
+                aria-label="Панель администратора"
+              >
+                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3 4.5 6v5c0 4.9 3.2 8.1 7.5 10 4.3-1.9 7.5-5.1 7.5-10V6L12 3z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="m9 12 2 2 4-4" />
+                </svg>
+              </Link>
+            )}
             <button
               type="button"
               onClick={onLogout}

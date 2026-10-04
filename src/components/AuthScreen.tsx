@@ -1,13 +1,17 @@
 "use client";
 
 import { useState } from "react";
-import { initializeMatrixCryptoAfterLogin } from "@/lib/matrix/client";
+import { clearLocalMatrixCryptoStores, initializeMatrixCryptoAfterLogin } from "@/lib/matrix/client";
 import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
 
 interface User {
   id: number;
   username: string;
   displayName: string;
+  role?: "user" | "admin";
+  bannedUntil?: string | null;
+  banReason?: string | null;
+  matrixResetRequired?: boolean;
   matrixAvailability?: MatrixAvailability;
   matrixSession?: MatrixSession | null;
   initialRecoveryKey?: string | null;
@@ -15,11 +19,11 @@ interface User {
   matrixNotice?: string;
 }
 
-function getMatrixDeviceId(username: string): string {
+function getMatrixDeviceId(username: string, forceNew = false): string {
   const storageKey = `chata_matrix_device_${username.toLowerCase()}`;
   try {
     const existing = localStorage.getItem(storageKey);
-    if (existing && /^[A-Za-z0-9._=-]{1,255}$/.test(existing)) return existing;
+    if (!forceNew && existing && /^[A-Za-z0-9._=-]{1,255}$/.test(existing)) return existing;
 
     const deviceId = crypto.randomUUID().replaceAll("-", "").toUpperCase();
     localStorage.setItem(storageKey, deviceId);
@@ -62,31 +66,78 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
         return;
       }
 
-      const matrixSession: MatrixSession | null = data.matrixSession || null;
+      let matrixSession: MatrixSession | null = data.matrixSession || null;
+      let matrixAvailability: MatrixAvailability = data.matrixAvailability || "unavailable";
+      let matrixResetRequired = Boolean(data.matrixResetRequired || data.user?.matrixResetRequired);
       let initialRecoveryKey: string | null = null;
       let initialRecoveryKeySaved = false;
       let matrixNotice = "";
 
-      if (matrixSession && data.matrixAvailability === "ready") {
+      if (matrixResetRequired) {
+        try {
+          // Do not start Rust crypto with the stale device ID or IndexedDB. The
+          // server waits for this clean client before provisioning a new device.
+          await clearLocalMatrixCryptoStores(data.user.id);
+          matrixSession = null;
+          matrixAvailability = "unavailable";
+          const freshDeviceId = getMatrixDeviceId(username, true);
+          const freshSessionResponse = await fetch("/api/auth/matrix-session", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password, deviceId: freshDeviceId }),
+            cache: "no-store",
+          });
+          const freshSessionData = await freshSessionResponse.json();
+          if (!freshSessionResponse.ok) throw new Error(freshSessionData.error || "Не удалось создать Matrix-сессию");
+          matrixSession = freshSessionData.matrixSession || null;
+          matrixAvailability = freshSessionData.matrixAvailability || "unavailable";
+
+          if (matrixSession && matrixAvailability === "ready") {
+            const completionResponse = await fetch("/api/auth/matrix-reset-complete", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ deviceId: matrixSession.deviceId }),
+              cache: "no-store",
+            });
+            if (!completionResponse.ok) {
+              const completion = await completionResponse.json().catch(() => ({}));
+              throw new Error(completion.error || "Не удалось подтвердить новый Matrix device");
+            }
+            matrixResetRequired = false;
+          } else {
+            matrixNotice = "Локальные Matrix-ключи очищены. Сервер Matrix пока недоступен; войдите снова, когда он заработает.";
+          }
+        } catch (resetError) {
+          matrixSession = null;
+          matrixAvailability = "unavailable";
+          matrixNotice = resetError instanceof Error
+            ? `Не удалось завершить безопасный сброс Matrix: ${resetError.message}`
+            : "Не удалось завершить безопасный сброс Matrix. Повторите вход.";
+          console.error("Matrix local reset failed");
+        }
+      }
+
+      if (matrixSession && matrixAvailability === "ready") {
         try {
           const initialization = await initializeMatrixCryptoAfterLogin(matrixSession, password);
           initialRecoveryKey = initialization.recoveryKey || null;
           initialRecoveryKeySaved = initialization.recoveryKeySaved || false;
-          matrixNotice = initialization.notice || "";
+          matrixNotice = initialization.notice || matrixNotice;
         } catch (matrixError) {
           matrixNotice = matrixError instanceof Error
             ? matrixError.message
             : "Matrix не синхронизирован. Приватные сообщения пока не отправляются.";
           console.error("Matrix crypto initialization failed");
         }
-      } else if (data.matrixAvailability === "unavailable") {
+      } else if (matrixAvailability === "unavailable" && !matrixNotice) {
         matrixNotice = "Matrix недоступен. Общий чат остаётся доступен, приватные сообщения не отправляются.";
       }
 
       const authenticatedUser: User = {
         ...data.user,
-        matrixAvailability: data.matrixAvailability || "unavailable",
+        matrixAvailability,
         matrixSession,
+        matrixResetRequired,
         initialRecoveryKey,
         initialRecoveryKeySaved,
         matrixNotice,

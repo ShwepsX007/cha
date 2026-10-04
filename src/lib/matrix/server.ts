@@ -115,6 +115,81 @@ function adminHeaders(config: MatrixConfig): HeadersInit {
   };
 }
 
+interface SynapseDeviceList {
+  devices?: Array<{ device_id?: unknown }>;
+}
+
+async function listSynapseDevices(config: MatrixConfig, appUserId: number): Promise<string[]> {
+  const mxid = matrixUserId(config, appUserId);
+  const response = await fetch(
+    `${config.internalUrl}/_synapse/admin/v2/users/${encodeURIComponent(mxid)}/devices`,
+    { headers: adminHeaders(config), cache: "no-store" },
+  );
+  if (response.status === 404) return [];
+  if (!response.ok) throw new Error(`Matrix device lookup failed (${response.status})`);
+  const payload = await response.json() as SynapseDeviceList;
+  return (payload.devices || [])
+    .map((device) => device.device_id)
+    .filter((deviceId): deviceId is string => typeof deviceId === "string");
+}
+
+/** Revoke every Synapse access token/device for one app user. Never returns the admin token. */
+export async function resetMatrixDevicesForAppUser(
+  appUserId: number,
+): Promise<{ configured: boolean; revokedDevices: number }> {
+  const config = getMatrixConfig();
+  if (!config) return { configured: false, revokedDevices: 0 };
+
+  const devices = await listSynapseDevices(config, appUserId);
+  if (devices.length === 0) return { configured: true, revokedDevices: 0 };
+
+  const mxid = matrixUserId(config, appUserId);
+  const response = await fetch(
+    `${config.internalUrl}/_synapse/admin/v2/users/${encodeURIComponent(mxid)}/delete_devices`,
+    {
+      method: "POST",
+      headers: adminHeaders(config),
+      body: JSON.stringify({ devices }),
+      cache: "no-store",
+    },
+  );
+  if (!response.ok) throw new Error(`Matrix device reset failed (${response.status})`);
+  return { configured: true, revokedDevices: devices.length };
+}
+
+/** Deactivate and erase a user's dedicated Synapse identity. */
+export async function deactivateMatrixIdentityForAppUser(
+  appUserId: number,
+): Promise<{ configured: boolean }> {
+  const config = getMatrixConfig();
+  if (!config) return { configured: false };
+
+  const mxid = matrixUserId(config, appUserId);
+  const response = await fetch(
+    `${config.internalUrl}/_synapse/admin/v1/deactivate/${encodeURIComponent(mxid)}`,
+    {
+      method: "POST",
+      headers: adminHeaders(config),
+      body: JSON.stringify({ erase: true }),
+      cache: "no-store",
+    },
+  );
+  if (response.status === 404) return { configured: true };
+  if (!response.ok) throw new Error(`Matrix account deactivation failed (${response.status})`);
+  return { configured: true };
+}
+
+/** Confirm that a freshly authenticated Matrix device has been provisioned. */
+export async function matrixDeviceExistsForAppUser(
+  appUserId: number,
+  deviceId: string,
+): Promise<boolean> {
+  const config = getMatrixConfig();
+  if (!config) return false;
+  const devices = await listSynapseDevices(config, appUserId);
+  return devices.includes(deviceId);
+}
+
 async function putMatrixUser(
   config: MatrixConfig,
   appUserId: number,
