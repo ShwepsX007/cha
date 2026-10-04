@@ -3,6 +3,7 @@
 import {
   ClientEvent,
   EventType,
+  HistoryVisibility,
   MsgType,
   Preset,
   Visibility,
@@ -23,6 +24,8 @@ import type { MatrixSession } from "./types";
 let clientPromise: Promise<MatrixClient> | null = null;
 let currentSessionKey: string | null = null;
 const backfilledRoomIds = new Set<string>();
+const roomPreparationPromises = new Map<string, Promise<MatrixClient>>();
+const directHistoryVisibilityPromises = new Map<string, Promise<void>>();
 const secretStorageKeyCache = new Map<
   string,
   { keyId?: string; key: Uint8Array<ArrayBuffer> }
@@ -38,6 +41,11 @@ export interface MatrixTimelineMessage {
   mimeType?: string;
   fileSize?: number;
   encryptedFile?: IEncryptedFile & { url: string };
+}
+
+export interface MatrixTimelineResult {
+  messages: MatrixTimelineMessage[];
+  undecryptableCount: number;
 }
 
 function sessionKey(session: MatrixSession): string {
@@ -107,6 +115,8 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
     oldClient?.stopClient();
     if (oldKey) clearSecretStorageKey(oldKey);
     backfilledRoomIds.clear();
+    roomPreparationPromises.clear();
+    directHistoryVisibilityPromises.clear();
   }
 
   currentSessionKey = key;
@@ -179,6 +189,196 @@ export async function waitForMatrixSync(client: MatrixClient): Promise<void> {
 
     client.on(ClientEvent.Sync, onSync);
   });
+}
+
+const MATRIX_ROOM_READY_TIMEOUT_MS = 20_000;
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function waitForRoomMembership(
+  client: MatrixClient,
+  roomId: string,
+  allowedMemberships: Array<"invite" | "join">,
+): Promise<"invite" | "join"> {
+  const deadline = Date.now() + MATRIX_ROOM_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const membership = client.getRoom(roomId)?.getMyMembership();
+    if (membership === "invite" || membership === "join") {
+      if (allowedMemberships.includes(membership)) return membership;
+    }
+    await wait(200);
+  }
+
+  throw new Error("Матрикс-комната ещё не синхронизирована на этом устройстве. Подождите и повторите попытку.");
+}
+
+async function waitForInvitedMembers(
+  client: MatrixClient,
+  roomId: string,
+  inviteeIds: string[],
+): Promise<void> {
+  const deadline = Date.now() + MATRIX_ROOM_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const room = client.getRoom(roomId);
+    const allInvited = inviteeIds.every((userId) => {
+      const membership = room
+        ?.currentState.getStateEvents(EventType.RoomMember, userId)
+        ?.getContent<Record<string, unknown>>().membership;
+      return membership === "invite" || membership === "join";
+    });
+    if (allInvited) return;
+    await wait(200);
+  }
+
+  throw new Error("Приглашения участников Matrix ещё не синхронизировались. Подождите и повторите попытку.");
+}
+
+async function waitForOtherRoomMember(
+  client: MatrixClient,
+  roomId: string,
+  currentUserId: string,
+): Promise<void> {
+  const deadline = Date.now() + MATRIX_ROOM_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const room = client.getRoom(roomId);
+    const otherActiveMemberExists = room?.currentState
+      .getStateEvents(EventType.RoomMember)
+      .some((event) => {
+        const membership = event.getContent<Record<string, unknown>>().membership;
+        return event.getStateKey() !== currentUserId &&
+          (membership === "invite" || membership === "join");
+      });
+    if (otherActiveMemberExists) return;
+    await wait(200);
+  }
+
+  throw new Error("Участник Matrix-чата ещё не синхронизирован или не приглашён. Сообщение не отправлено.");
+}
+
+async function waitForRoomEncryption(client: MatrixClient, roomId: string): Promise<void> {
+  const crypto = client.getCrypto();
+  if (!crypto) throw new Error("Matrix Rust crypto is unavailable");
+
+  const deadline = Date.now() + MATRIX_ROOM_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const room = client.getRoom(roomId);
+    const encryptionEvent = room?.currentState.getStateEvents(EventType.RoomEncryption, "");
+    if (encryptionEvent) {
+      const content = encryptionEvent.getContent<Record<string, unknown>>();
+      if (content.algorithm !== "m.megolm.v1.aes-sha2") {
+        throw new Error("В Matrix-комнате отсутствует поддерживаемое E2EE-шифрование.");
+      }
+    }
+    if (await crypto.isEncryptionEnabledInRoom(roomId)) return;
+    await wait(200);
+  }
+
+  throw new Error("Matrix ещё не подтвердил E2EE в этой комнате. Сообщение и файл не отправлены; обновите чат и попробуйте снова.");
+}
+
+async function prepareEncryptedRoom(client: MatrixClient, roomId: string): Promise<void> {
+  await waitForMatrixSync(client);
+  const membership = await waitForRoomMembership(client, roomId, ["invite", "join"]);
+  if (membership === "invite") {
+    await client.joinRoom(roomId);
+    await waitForRoomMembership(client, roomId, ["join"]);
+  }
+  await waitForRoomEncryption(client, roomId);
+}
+
+/** Wait for an invite to sync, join if necessary, and verify Rust crypto has loaded the room encryption state. */
+export async function ensureEncryptedRoomReady(
+  session: MatrixSession,
+  roomId: string,
+): Promise<MatrixClient> {
+  const key = `${sessionKey(session)}|${roomId}`;
+  let preparation = roomPreparationPromises.get(key);
+  if (!preparation) {
+    preparation = (async () => {
+      const client = await getMatrixClient(session);
+      await prepareEncryptedRoom(client, roomId);
+      return client;
+    })();
+    roomPreparationPromises.set(key, preparation);
+  }
+
+  try {
+    return await preparation;
+  } finally {
+    if (roomPreparationPromises.get(key) === preparation) {
+      roomPreparationPromises.delete(key);
+    }
+  }
+}
+
+export async function ensureDirectRoomHistoryVisibility(
+  session: MatrixSession,
+  roomId: string,
+): Promise<void> {
+  const key = `${sessionKey(session)}|${roomId}`;
+  const pending = directHistoryVisibilityPromises.get(key);
+  if (pending) return pending;
+
+  const update = (async () => {
+    const client = await ensureEncryptedRoomReady(session, roomId);
+    await waitForOtherRoomMember(client, roomId, session.userId);
+    const room = client.getRoom(roomId);
+    if (!room) throw new Error("Matrix room is not available on this device");
+
+    const createEvent = room.currentState.getStateEvents(EventType.RoomCreate, "");
+    const createContent = createEvent?.getContent<Record<string, unknown>>();
+    const additionalCreators = createContent?.additional_creators;
+    const isCreator = createEvent?.getSender() === session.userId ||
+      (Array.isArray(additionalCreators) && additionalCreators.includes(session.userId));
+    if (!isCreator) return;
+
+    const visibilityEvent = room.currentState.getStateEvents(EventType.RoomHistoryVisibility, "");
+    const visibility = visibilityEvent?.getContent<Record<string, unknown>>().history_visibility;
+    if (visibility === "invited") return;
+    if (visibility !== "joined") {
+      throw new Error("Личный Matrix-чат имеет неподдерживаемые настройки видимости истории.");
+    }
+
+    await client.sendStateEvent(
+      roomId,
+      EventType.RoomHistoryVisibility,
+      { history_visibility: HistoryVisibility.Invited },
+      "",
+    );
+
+    const deadline = Date.now() + MATRIX_ROOM_READY_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const currentVisibility = client
+        .getRoom(roomId)
+        ?.currentState.getStateEvents(EventType.RoomHistoryVisibility, "")
+        ?.getContent<Record<string, unknown>>().history_visibility;
+      if (currentVisibility === "invited") break;
+      await wait(200);
+    }
+
+    const currentVisibility = client
+      .getRoom(roomId)
+      ?.currentState.getStateEvents(EventType.RoomHistoryVisibility, "")
+      ?.getContent<Record<string, unknown>>().history_visibility;
+    if (currentVisibility !== "invited") {
+      throw new Error("Не удалось синхронизировать настройки личного Matrix-чата.");
+    }
+
+    const crypto = client.getCrypto();
+    if (!crypto) throw new Error("Matrix Rust crypto is unavailable");
+    await crypto.forceDiscardSession(roomId);
+  })();
+
+  directHistoryVisibilityPromises.set(key, update);
+  try {
+    await update;
+  } finally {
+    if (directHistoryVisibilityPromises.get(key) === update) {
+      directHistoryVisibilityPromises.delete(key);
+    }
+  }
 }
 
 export interface MatrixSecurityStatus {
@@ -407,7 +607,12 @@ export async function createEncryptedRoom(
       {
         type: EventType.RoomHistoryVisibility,
         state_key: "",
-        content: { history_visibility: "joined" },
+        // Direct invitees need access to messages sent while they are still
+        // offline/invited. Groups stay joined-only so later members cannot
+        // decrypt pre-join history.
+        content: {
+          history_visibility: options.isDirect ? HistoryVisibility.Invited : HistoryVisibility.Joined,
+        },
       },
     ],
     power_level_content_override: {
@@ -425,6 +630,8 @@ export async function createEncryptedRoom(
   });
 
   if (!roomId) throw new Error("Matrix did not return a room ID");
+  const readyClient = await ensureEncryptedRoomReady(session, roomId);
+  await waitForInvitedMembers(readyClient, roomId, options.inviteUserIds);
   return roomId;
 }
 
@@ -433,7 +640,7 @@ export async function sendEncryptedText(
   roomId: string,
   body: string,
 ): Promise<void> {
-  const client = await getMatrixClient(session);
+  const client = await ensureEncryptedRoomReady(session, roomId);
   const crypto = client.getCrypto();
   if (!crypto || !(await crypto.isEncryptionEnabledInRoom(roomId))) {
     throw new Error("Refusing to send: this Matrix room is not encrypted");
@@ -452,7 +659,7 @@ export async function sendEncryptedAttachment(
     encryptedFile: IEncryptedFile & { url: string };
   },
 ): Promise<void> {
-  const client = await getMatrixClient(session);
+  const client = await ensureEncryptedRoomReady(session, roomId);
   const crypto = client.getCrypto();
   if (!crypto || !(await crypto.isEncryptionEnabledInRoom(roomId))) {
     throw new Error("Refusing to send: this Matrix room is not encrypted");
@@ -485,24 +692,15 @@ export async function joinRoomIfInvited(
   session: MatrixSession,
   roomId: string,
 ): Promise<void> {
-  const client = await getMatrixClient(session);
-  await waitForMatrixSync(client);
-  const room = client.getRoom(roomId);
-  if (room?.getMyMembership() === "invite") {
-    await client.joinRoom(roomId);
-  }
+  await ensureEncryptedRoomReady(session, roomId);
 }
 
 export async function hasMatrixInvitePermission(
   session: MatrixSession,
   roomId: string,
 ): Promise<boolean> {
-  const client = await getMatrixClient(session);
-  await waitForMatrixSync(client);
-  let room = client.getRoom(roomId);
-  if (room?.getMyMembership() === "invite") {
-    room = await client.joinRoom(roomId);
-  }
+  const client = await ensureEncryptedRoomReady(session, roomId);
+  const room = client.getRoom(roomId);
   if (!room || room.getMyMembership() !== "join") return false;
 
   const powerEvent = room.currentState.getStateEvents(EventType.RoomPowerLevels, "");
@@ -537,24 +735,28 @@ export async function getEncryptedRoomMessages(
   session: MatrixSession,
   roomId: string,
   chatId: number,
-): Promise<MatrixTimelineMessage[]> {
-  const client = await getMatrixClient(session);
-  await waitForMatrixSync(client);
-
-  let room = client.getRoom(roomId);
-  if (room?.getMyMembership() === "invite") {
-    room = await client.joinRoom(roomId);
+): Promise<MatrixTimelineResult> {
+  const client = await ensureEncryptedRoomReady(session, roomId);
+  const room = client.getRoom(roomId);
+  if (!room || room.getMyMembership() !== "join") {
+    throw new Error("Authenticated Matrix user has not joined the encrypted room");
   }
-  if (!room || room.getMyMembership() !== "join") return [];
 
   if (!backfilledRoomIds.has(roomId)) {
     await client.scrollback(room, 100);
     backfilledRoomIds.add(roomId);
   }
 
-  return room
-    .getLiveTimeline()
-    .getEvents()
+  const timelineEvents = room.getLiveTimeline().getEvents();
+  const encryptedEvents = timelineEvents.filter(
+    (event) => event.getType() === EventType.RoomMessageEncrypted,
+  );
+  await Promise.allSettled(encryptedEvents.map((event) => client.decryptEventIfNeeded(event)));
+  const undecryptableCount = encryptedEvents.filter(
+    (event) => event.getType() === EventType.RoomMessageEncrypted,
+  ).length;
+
+  const messages = timelineEvents
     .filter((event) => event.getType() === EventType.RoomMessage)
     .map<MatrixTimelineMessage | null>((event) => {
       const content = event.getContent<Record<string, unknown>>();
@@ -596,12 +798,17 @@ export async function getEncryptedRoomMessages(
     })
     .filter((event): event is MatrixTimelineMessage => event !== null)
     .sort((a, b) => a.timestamp - b.timestamp);
+
+  return { messages, undecryptableCount };
 }
 
 export async function stopMatrixClient(logout = false): Promise<void> {
   const stoppedSessionKey = currentSessionKey;
   if (!clientPromise) {
     if (stoppedSessionKey) clearSecretStorageKey(stoppedSessionKey);
+    roomPreparationPromises.clear();
+    directHistoryVisibilityPromises.clear();
+    backfilledRoomIds.clear();
     return;
   }
   const client = await clientPromise.catch(() => null);
@@ -613,6 +820,8 @@ export async function stopMatrixClient(logout = false): Promise<void> {
   currentSessionKey = null;
   if (stoppedSessionKey) clearSecretStorageKey(stoppedSessionKey);
   backfilledRoomIds.clear();
+  roomPreparationPromises.clear();
+  directHistoryVisibilityPromises.clear();
 }
 
 export { EventType };

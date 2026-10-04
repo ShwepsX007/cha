@@ -4,7 +4,14 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import type { MouseEvent } from "react";
 import type { User, Chat, ChatMessage } from "./ChatApp";
 import { decryptAttachment, encryptAttachment } from "matrix-encrypt-attachment";
-import { getEncryptedRoomMessages, hasMatrixInvitePermission, sendEncryptedAttachment, sendEncryptedText } from "@/lib/matrix/client";
+import {
+  ensureDirectRoomHistoryVisibility,
+  ensureEncryptedRoomReady,
+  getEncryptedRoomMessages,
+  hasMatrixInvitePermission,
+  sendEncryptedAttachment,
+  sendEncryptedText,
+} from "@/lib/matrix/client";
 import AddGroupMembersModal from "./AddGroupMembersModal";
 
 function formatTime(dateStr: string) {
@@ -268,6 +275,21 @@ export default function ChatWindow({
     }
   }, []);
 
+  const prepareEncryptedChat = useCallback(async () => {
+    if (chat.securityMode !== "e2ee" || !chat.matrixRoomId || !currentUser.matrixSession) return;
+
+    if (!chat.isGroup) {
+      await ensureDirectRoomHistoryVisibility(currentUser.matrixSession, chat.matrixRoomId);
+    } else {
+      await ensureEncryptedRoomReady(currentUser.matrixSession, chat.matrixRoomId);
+    }
+  }, [
+    chat.isGroup,
+    chat.matrixRoomId,
+    chat.securityMode,
+    currentUser.matrixSession,
+  ]);
+
   const loadMessages = useCallback(async () => {
     try {
       const res = await fetch(`/api/messages?chatId=${chat.id}`);
@@ -282,13 +304,18 @@ export default function ChatWindow({
 
       if (chat.securityMode === "e2ee" && chat.matrixRoomId && currentUser.matrixSession) {
         try {
-          const matrixMessages = await getEncryptedRoomMessages(
+          await prepareEncryptedChat();
+          const matrixResult = await getEncryptedRoomMessages(
             currentUser.matrixSession,
             chat.matrixRoomId,
             chat.id,
           );
-          setMessageReadError("");
-          const liveMessages: ChatMessage[] = matrixMessages.map((message) => {
+          setMessageReadError(
+            matrixResult.undecryptableCount > 0
+              ? `${matrixResult.undecryptableCount} зашифрованных сообщений пока нельзя расшифровать на этом устройстве. Проверьте подключение или восстановление ключей.`
+              : "",
+          );
+          const liveMessages: ChatMessage[] = matrixResult.messages.map((message) => {
             const senderId = Number(message.senderUserId);
             const sender = chat.members.find((member) => member.id === senderId);
             const isFile = message.msgtype === "m.file";
@@ -344,6 +371,7 @@ export default function ChatWindow({
     chat.members,
     chat.securityMode,
     currentUser.matrixSession,
+    prepareEncryptedChat,
     scrollToBottom,
   ]);
 
@@ -372,6 +400,7 @@ export default function ChatWindow({
         });
         if (!response.ok) throw new Error("Не удалось отправить сообщение");
       } else if (chat.securityMode === "e2ee" && chat.matrixRoomId && currentUser.matrixSession) {
+        await prepareEncryptedChat();
         await sendEncryptedText(currentUser.matrixSession, chat.matrixRoomId, msgText);
       } else {
         throw new Error("Matrix E2EE не подключён. Сообщение не отправлено открытым текстом.");
@@ -404,6 +433,7 @@ export default function ChatWindow({
         const response = await fetch("/api/upload", { method: "POST", body: formData });
         if (!response.ok) throw new Error("Не удалось загрузить файл");
       } else if (chat.securityMode === "e2ee" && chat.matrixRoomId && currentUser.matrixSession) {
+        await prepareEncryptedChat();
         if (file.size > 45 * 1024 * 1024) {
           throw new Error("Размер файла для E2EE не должен превышать 45 МБ");
         }

@@ -177,6 +177,7 @@ export async function POST(req: NextRequest) {
         appUserIds: [payload.userId, ...memberUserIds],
         authenticatedAppUserId: payload.userId,
         creatorAppUserId: payload.userId,
+        expectedHistoryVisibility: isGroup ? "joined" : "invited",
       });
     } catch (error) {
       console.warn("Rejected unverified Matrix room for app chat:", error);

@@ -2,7 +2,7 @@
 
 ## Current status — production homeserver configured; app fix needs rollout
 
-The production Synapse homeserver and server-side Matrix settings are configured, and the `chata` app process has been restarted with them. Room creation exposed a compatibility issue with Synapse 1.162 using Matrix room version 12: the old app code explicitly listed the creator in `m.room.power_levels.users`, which v12 forbids. The code update now omits that entry, recognizes v12 implicit creator power, and accepts v12's hash-based room IDs. Deploy this update and complete the end-to-end checks below before treating E2EE as verified on the live app.
+The production Synapse homeserver and server-side Matrix settings are configured. The first room-version-12 fix let room creation proceed, but follow-up testing exposed two delivery issues: direct rooms used `history_visibility: joined`, so messages sent before the recipient joined were not key-shared to them; and the client could attempt a send before its local Rust crypto store had synced the room's encryption state. The current code uses `invited` history for one-to-one rooms (groups remain `joined`), waits for membership/encryption state before sending, and checks encryption before uploading ciphertext to Telegram. It also retains the v12 power-level and hash-based room-ID compatibility fixes. Deploy the latest update and complete the end-to-end checks below before treating E2EE as verified on the live app.
 
 The app has a Matrix client/authentication path, encrypted-room creation and verification, encrypted text messaging, encrypted attachment handling, device verification/recovery UI, and fail-closed behavior for private chats.
 
@@ -10,7 +10,7 @@ What is implemented in the code:
 
 - `matrix-js-sdk@43.0.0` with its Rust/WASM crypto stack for Olm/Megolm.
 - Dedicated Matrix IDs derived from existing app user IDs. Synapse identities are provisioned with its admin API; a user's Matrix password is synchronized only after the app has verified that user's existing password.
-- Private Matrix rooms are created encrypted from their initial state, invite-only, and use `history_visibility: joined`. Room linking is rejected unless the server verifies the encryption event, room permissions, membership list, and the caller's Matrix identity.
+- Private Matrix rooms are created encrypted and invite-only. One-to-one rooms use `history_visibility: invited`, so the original invitee can decrypt messages sent while they are offline; private groups use `history_visibility: joined`, so later invitees cannot decrypt pre-join history. Room linking is rejected unless the server verifies the encryption event, room permissions, membership list, history visibility, and the caller's Matrix identity.
 - New private text messages are sent through Matrix and are not written to the PostgreSQL `messages` table. Private plaintext POSTs are rejected.
 - `matrix-encrypt-attachment` (Matrix.org's attachment-format library) encrypts private file bytes in the browser. The Telegram gateway receives a random filename and `application/octet-stream` ciphertext; it does not store private attachment metadata in PostgreSQL. The filename, MIME type, original size, Telegram file reference, and Matrix decryption information are carried inside the encrypted Matrix event.
 - Private group creation supports multiple invitees. Matrix power levels restrict invitations to users with admin-level power; the app's group-member endpoint verifies that permission before adding a database membership.
@@ -21,13 +21,13 @@ What is implemented in the code:
 
 Still to complete against the live homeserver:
 
-- Deploy this room-version-12 compatibility update before retrying encrypted-room creation.
+- Deploy the latest room-version-12 and message/file delivery updates before retrying direct or group chats.
 - Run two-account/two-device acceptance tests, including QR verification and recovery, and verify that a newly invited group member cannot decrypt pre-join history. The SDK QR/backup flow has been wired into the app, but Synapse behavior must be tested before production use.
 
 ## Agreed product behavior
 
 - The existing `Общий чат` stays open and unencrypted.
-- New direct chats and private groups use Matrix E2EE.
+- New direct chats and private groups use Matrix E2EE. Direct invitees can decrypt messages sent from the moment of invitation, even if they join later; private groups expose history only from each member's join time.
 - Only a group creator/admin may invite members. Matrix power levels are the enforcement layer; the app API checks them before recording a new membership.
 - Existing chat history is retained as plaintext legacy data. It is never represented as encrypted.
 - Telegram is only the encrypted attachment byte store for private chats. Original names, MIME types, sizes, Telegram file IDs, and decryption information are kept inside the encrypted Matrix room event, not plaintext database fields.
@@ -77,7 +77,7 @@ Back up the chat database first. The schema change is represented in `src/db/sch
 
 1. Deploy Synapse, configure the reverse proxy and server-only variables, then confirm the Matrix client API and Synapse admin API are reachable from the app host.
 2. Apply the chat-app database schema update and deploy the app. Until this step is complete, the app UI reports Matrix unavailable/not configured; private chat sending remains blocked rather than falling back to plaintext.
-3. Test with two separate app accounts: create a direct chat and a private group, inspect the Matrix room's `m.room.encryption`, `m.room.join_rules`, `m.room.history_visibility`, and power levels, and confirm new text is readable by members but absent from PostgreSQL. For room version 12, the creator must not appear in the power-level `users` map but must retain effective creator permissions; also confirm the app accepts the hash-based room ID.
+3. Test with two separate app accounts: create a direct chat and a private group, inspect the Matrix room's `m.room.encryption`, `m.room.join_rules`, `m.room.history_visibility`, and power levels, and confirm new text is readable by members but absent from PostgreSQL. Send a direct-chat message while the recipient is offline, then log in as the recipient and verify it decrypts. For groups, invite a new member later and confirm they cannot decrypt pre-join history. For room version 12, the creator must not appear in the power-level `users` map but must retain effective creator permissions; also confirm the app accepts the hash-based room ID.
 4. Upload a harmless test file in a private room. Verify Telegram receives only an opaque, randomly named binary document; verify original filename/MIME/size and decryption information are only present after decrypting the Matrix event; then download/decrypt on the other account.
 5. In a group, invite a third account. Confirm a regular member cannot invite. Confirm the newly added member can read messages sent after joining but cannot decrypt earlier group messages.
 6. Verify old PostgreSQL messages/files remain readable and visibly labeled legacy. Verify `Общий чат` continues to send/read plaintext messages and files.

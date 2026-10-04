@@ -72,6 +72,7 @@ export async function POST(
         appUserIds: currentMemberIds,
         authenticatedAppUserId: payload.userId,
         creatorAppUserId: chat.createdBy,
+        expectedHistoryVisibility: "joined",
       });
     } catch {
       return NextResponse.json({ error: "Добавлять участников может только Matrix-создатель/администратор" }, { status: 403 });
@@ -86,6 +87,7 @@ export async function POST(
       appUserIds: [...currentMemberIds, target.id],
       authenticatedAppUserId: payload.userId,
       creatorAppUserId: chat.createdBy,
+      expectedHistoryVisibility: "joined",
     });
 
     await db.insert(chatMembers).values({ chatId, userId: target.id });

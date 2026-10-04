@@ -195,6 +195,7 @@ export async function verifyEncryptedRoom(input: {
   appUserIds: number[];
   authenticatedAppUserId: number;
   creatorAppUserId: number;
+  expectedHistoryVisibility: "invited" | "joined";
 }): Promise<void> {
   const config = getMatrixConfig();
   if (!config) throw new Error("Matrix is not configured");
@@ -239,7 +240,10 @@ export async function verifyEncryptedRoom(input: {
   if (encryption?.algorithm !== "m.megolm.v1.aes-sha2") {
     throw new Error("Matrix room is not end-to-end encrypted");
   }
-  if (joinRules?.join_rule !== "invite" || historyVisibility?.history_visibility !== "joined") {
+  if (
+    joinRules?.join_rule !== "invite" ||
+    historyVisibility?.history_visibility !== input.expectedHistoryVisibility
+  ) {
     throw new Error("Matrix room privacy settings are not strict enough");
   }
   if (!powerLevels) throw new Error("Matrix room permissions are missing");
