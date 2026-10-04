@@ -28,7 +28,10 @@ export async function POST(req: NextRequest) {
 
     const existing = await db.select().from(users).where(eq(users.username, username));
     if (existing.length > 0) {
-      return NextResponse.json({ error: "Пользователь уже существует" }, { status: 409 });
+      return NextResponse.json(
+        { error: username === "telegram_admin" ? "Этот логин зарезервирован для Telegram-админа" : "Пользователь уже существует" },
+        { status: 409 },
+      );
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
