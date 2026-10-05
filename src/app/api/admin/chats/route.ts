@@ -4,6 +4,7 @@ import { db } from "@/db";
 import { chatMembers, chats, users } from "@/db/schema";
 import { requireAdmin, writeAdminAuditLog } from "@/lib/admin";
 import { deleteChatPermanently } from "@/lib/chat-delete";
+import { validateChatName } from "@/lib/chats";
 import { removeAvatarFile } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
@@ -85,16 +86,11 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Некорректный запрос" }, { status: 400 });
   }
   const input = body as { name?: unknown; isGeneral?: unknown };
-  const name =
-    typeof input.name === "string"
-      ? input.name.normalize("NFKC").replace(/\s+/g, " ").trim().slice(0, 100)
-      : "";
-  if (/<[>|]|&lt;|&gt;|&amp;/.test(name)) {
-    return NextResponse.json({ error: "Название не должно содержать HTML-спецсимволы" }, { status: 400 });
+  const validated = validateChatName(input.name);
+  if (!validated.ok) {
+    return NextResponse.json({ error: validated.error }, { status: 400 });
   }
-  if (!name) {
-    return NextResponse.json({ error: "Название обязательно (1–100 символов)" }, { status: 400 });
-  }
+  const name = validated.name;
   const isGeneral = input.isGeneral === true;
 
   try {
@@ -164,15 +160,11 @@ export async function PATCH(request: NextRequest) {
     const patch: Partial<{ name: string; avatarUrl: string | null; avatarUpdatedAt: Date }> = {};
 
     if (wantsRename) {
-      const name = input.name as string;
-      const cleaned = name.normalize("NFKC").replace(/\s+/g, " ").trim().slice(0, 100);
-      if (!cleaned) {
-        return NextResponse.json({ error: "Название не может быть пустым" }, { status: 400 });
+      const validated = validateChatName(input.name);
+      if (!validated.ok) {
+        return NextResponse.json({ error: validated.error }, { status: 400 });
       }
-      if (/<[>|]|&lt;|&gt;|&amp;/.test(cleaned)) {
-        return NextResponse.json({ error: "Название не должно содержать HTML-спецсимволы" }, { status: 400 });
-      }
-      patch.name = cleaned;
+      patch.name = validated.name;
     }
 
     let removedAvatarPath: string | null = null;

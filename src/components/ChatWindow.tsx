@@ -304,6 +304,8 @@ export default function ChatWindow({
   const [muteBusy, setMuteBusy] = useState(false);
   const [deletingMessageId, setDeletingMessageId] = useState<number | null>(null);
   const [deletingChat, setDeletingChat] = useState(false);
+  const [renamingChat, setRenamingChat] = useState(false);
+  const [chatAvatarBusy, setChatAvatarBusy] = useState(false);
 
   useEffect(() => {
     setNotificationsMuted(Boolean(chat.notificationsMuted));
@@ -335,6 +337,7 @@ export default function ChatWindow({
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messageInputRef = useRef<HTMLInputElement>(null);
+  const chatAvatarInputRef = useRef<HTMLInputElement>(null);
   const prevMsgCountRef = useRef(0);
   const initialLoadRef = useRef(true);
   const reportedReadRef = useRef<Set<number | string>>(new Set());
@@ -722,6 +725,12 @@ export default function ChatWindow({
   // conversation for everybody; the general chat is protected on the server.
   const canDeleteChat = !chat.isGeneralChat
     && (chat.createdBy === currentUser.id || currentUser.role === "admin");
+  // Group appearance (name + avatar) belongs to the creator; public chats
+  // stay admin-only even though the auto-created one technically has a
+  // first-user creator. Mirrors the server-side rules in lib/chat-manage.ts.
+  const canManageGroup = chat.isGroup
+    && (chat.createdBy === currentUser.id || currentUser.role === "admin")
+    && (!chat.isGeneralChat || currentUser.role === "admin");
 
   const handleDeleteMessage = useCallback(async (message: ChatMessage) => {
     if (deletingMessageId !== null || typeof message.id !== "number") return;
@@ -741,6 +750,80 @@ export default function ChatWindow({
       setDeletingMessageId(null);
     }
   }, [deletingMessageId, loadMessages, onMessageSent]);
+
+  const handleRenameGroup = useCallback(async () => {
+    if (renamingChat) return;
+    const next = window.prompt("Новое название группы", chat.name || "");
+    if (next === null) return;
+    const name = next.trim();
+    if (!name) {
+      setSendError("Название не может быть пустым");
+      return;
+    }
+    if (name.length > 100) {
+      setSendError("Название длиннее 100 символов");
+      return;
+    }
+    setRenamingChat(true);
+    setSendError("");
+    try {
+      const response = await fetch(`/api/chats/${chat.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : "Не удалось переименовать группу");
+      onChatUpdated?.({ name });
+      onMessageSent();
+    } catch (err) {
+      console.error("Failed to rename group", err);
+      setSendError(err instanceof Error ? err.message : "Не удалось переименовать группу");
+    } finally {
+      setRenamingChat(false);
+    }
+  }, [chat.id, chat.name, onChatUpdated, onMessageSent, renamingChat]);
+
+  const handleUploadChatAvatar = useCallback(async (file: File | null) => {
+    if (!file || chatAvatarBusy) return;
+    setChatAvatarBusy(true);
+    setSendError("");
+    try {
+      const form = new FormData();
+      form.append("avatar", file);
+      const response = await fetch(`/api/chats/${chat.id}/avatar`, { method: "POST", body: form });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : "Не удалось сохранить аватарку группы");
+      onChatUpdated?.({
+        avatarUrl: typeof data?.avatarUrl === "string" ? data.avatarUrl : null,
+        avatarUpdatedAt: typeof data?.avatarUpdatedAt === "string" ? data.avatarUpdatedAt : null,
+      });
+    } catch (err) {
+      console.error("Failed to set chat avatar", err);
+      setSendError(err instanceof Error ? err.message : "Не удалось сохранить аватарку группы");
+    } finally {
+      setChatAvatarBusy(false);
+      if (chatAvatarInputRef.current) chatAvatarInputRef.current.value = "";
+    }
+  }, [chat.id, chatAvatarBusy, onChatUpdated]);
+
+  const handleRemoveChatAvatar = useCallback(async () => {
+    if (chatAvatarBusy) return;
+    if (!window.confirm("Убрать аватарку группы?")) return;
+    setChatAvatarBusy(true);
+    setSendError("");
+    try {
+      const response = await fetch(`/api/chats/${chat.id}/avatar`, { method: "DELETE" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : "Не удалось убрать аватарку группы");
+      onChatUpdated?.({ avatarUrl: null, avatarUpdatedAt: typeof data?.avatarUpdatedAt === "string" ? data.avatarUpdatedAt : null });
+    } catch (err) {
+      console.error("Failed to remove chat avatar", err);
+      setSendError(err instanceof Error ? err.message : "Не удалось убрать аватарку группы");
+    } finally {
+      setChatAvatarBusy(false);
+    }
+  }, [chat.id, chatAvatarBusy, onChatUpdated]);
 
   const handleDeleteChat = useCallback(async () => {
     if (deletingChat) return;
@@ -821,6 +904,60 @@ export default function ChatWindow({
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18 9a3 3 0 11-6 0 3 3 0 016 0zM3 20a6 6 0 0112 0M19 8v6m3-3h-6" />
             </svg>
           </button>
+        )}
+        {canManageGroup && (
+          <>
+            <button
+              type="button"
+              onClick={() => void handleRenameGroup()}
+              disabled={renamingChat}
+              className="rounded-lg p-2 text-gray-400 hover:bg-dark-600 hover:text-white touch-manipulation disabled:opacity-50"
+              title="Переименовать группу (создатель)"
+              aria-label="Переименовать группу"
+            >
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+              </svg>
+            </button>
+            <input
+              ref={chatAvatarInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              className="hidden"
+              onChange={(event) => void handleUploadChatAvatar(event.target.files?.[0] ?? null)}
+            />
+            <button
+              type="button"
+              onClick={() => chatAvatarInputRef.current?.click()}
+              disabled={chatAvatarBusy}
+              className="rounded-lg p-2 text-gray-400 hover:bg-dark-600 hover:text-white touch-manipulation disabled:opacity-50"
+              title={chat.avatarUrl ? "Заменить аватарку группы" : "Установить аватарку группы"}
+              aria-label="Сменить аватарку группы"
+            >
+              {chatAvatarBusy ? (
+                <span className="block h-5 w-5 animate-spin rounded-full border-2 border-purple-400 border-t-transparent" />
+              ) : (
+                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+              )}
+            </button>
+            {chat.avatarUrl && (
+              <button
+                type="button"
+                onClick={() => void handleRemoveChatAvatar()}
+                disabled={chatAvatarBusy}
+                className="rounded-lg p-2 text-gray-500 hover:bg-dark-600 hover:text-amber-300 touch-manipulation disabled:opacity-50"
+                title="Убрать аватарку группы"
+                aria-label="Убрать аватарку группы"
+              >
+                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4l16 16M15 10a3 3 0 01-3.6 3M9.9 7.5A2 2 0 0111.93 6h.07a2 2 0 011.664.89M21 12v5a2 2 0 01-2 2H7" />
+                </svg>
+              </button>
+            )}
+          </>
         )}
         {canDeleteChat && (
           <button

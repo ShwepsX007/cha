@@ -12,6 +12,20 @@ export function isGeneralChat(chat: { isGeneral?: boolean | null }): boolean {
 }
 
 /**
+ * Single source of truth for chat names (admin create/rename and the
+ * group-owner rename use it): normalized, 1–100 chars, no HTML noise.
+ */
+export function validateChatName(input: unknown): { ok: true; name: string } | { ok: false; error: string } {
+  if (typeof input !== "string") return { ok: false, error: "Название обязательно (1–100 символов)" };
+  const name = input.normalize("NFKC").replace(/\s+/g, " ").trim().slice(0, 100);
+  if (!name) return { ok: false, error: "Название не может быть пустым" };
+  if (/<[>|]|&lt;|&gt;|&amp;/.test(name)) {
+    return { ok: false, error: "Название не должно содержать HTML-спецсимволы" };
+  }
+  return { ok: true, name };
+}
+
+/**
  * Makes sure at least one general chat exists and that `userId` is a member
  * of every general chat ("public" means everyone is auto-joined, including
  * chats the admin created while the user was offline).

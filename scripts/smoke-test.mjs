@@ -236,6 +236,54 @@ async function main() {
     check("user A is a member of the public chat", Boolean(general), JSON.stringify(chats.body).slice(0, 200));
 
     if (general) {
+      console.log("\nGroup rename and avatar permissions");
+      const group = await json("/api/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ isGroup: true, memberUserIds: [regB.body?.user?.id], name: "Smoke group" }),
+      }, regA.cookie);
+      check("group created", group.response.ok && group.body?.chat?.id > 0, `HTTP ${group.response.status}`);
+      if (group.body?.chat?.id) {
+        const groupId = group.body.chat.id;
+        const bRename = await json(`/api/chats/${groupId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: "перехвачено" }),
+        }, regB.cookie);
+        check("non-creator cannot rename the group", bRename.response.status === 403, `HTTP ${bRename.response.status}`);
+
+        const aRename = await json(`/api/chats/${groupId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: "Smoke group v2" }),
+        }, regA.cookie);
+        check("creator renames the group", aRename.response.ok && aRename.body?.chat?.name === "Smoke group v2",
+          `HTTP ${aRename.response.status} ${JSON.stringify(aRename.body)}`);
+
+        const bAvatar = await json(`/api/chats/${groupId}/avatar`, { method: "POST" }, regB.cookie);
+        check("non-creator cannot touch the group avatar", bAvatar.response.status === 403, `HTTP ${bAvatar.response.status}`);
+        const aAvatarNoFile = await json(`/api/chats/${groupId}/avatar`, { method: "POST" }, regA.cookie);
+        check("avatar upload without a file answers a clear 400",
+          aAvatarNoFile.response.status === 400 && /аватарк|файл/i.test(String(aAvatarNoFile.body?.error)),
+          JSON.stringify(aAvatarNoFile.body));
+        const aAvatarRemove = await json(`/api/chats/${groupId}/avatar`, { method: "DELETE" }, regA.cookie);
+        check("avatar removal is idempotent", aAvatarRemove.response.ok && aAvatarRemove.body?.avatarUrl === null,
+          `HTTP ${aAvatarRemove.response.status}`);
+
+        const cleanupGroup = await json(`/api/chats/${groupId}`, { method: "DELETE" }, regA.cookie);
+        check("test group deleted (cleanup)", cleanupGroup.response.ok, `HTTP ${cleanupGroup.response.status}`);
+      }
+
+      const publicRename = await json(`/api/chats/${general.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "Теперь мой чат" }),
+      }, regA.cookie);
+      check("public chat refuses renames by non-admins", publicRename.response.status === 403,
+        `HTTP ${publicRename.response.status}`);
+    }
+
+    if (general) {
       console.log("\nMessages, receipts, avatars");
       const sent = await json("/api/messages", {
         method: "POST",
