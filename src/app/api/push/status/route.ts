@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
-import { getPushSubscriptionCount, isPushConfigured } from "@/lib/push";
+import { getPushSubscriptionCount, isPushConfigured, missingPushEnv } from "@/lib/push";
 
 export const dynamic = "force-dynamic";
 
@@ -11,7 +11,11 @@ export async function GET() {
   try {
     const subscriptionCount = await getPushSubscriptionCount(user.userId);
     return NextResponse.json(
-      { configured: isPushConfigured(), subscriptionCount },
+      {
+        configured: isPushConfigured(),
+        subscriptionCount,
+        ...(isPushConfigured() ? {} : { missingEnv: missingPushEnv() }),
+      },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {

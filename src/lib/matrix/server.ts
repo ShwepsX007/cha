@@ -67,6 +67,22 @@ export function isMatrixConfigured(): boolean {
   }
 }
 
+/**
+ * Opt-in refresh tokens.
+ *
+ * When a client asks Synapse for refresh tokens it is issued a *short-lived*
+ * access token: `refreshable_access_token_lifetime` defaults to 5 minutes,
+ * while `nonrefreshable_access_token_lifetime` defaults to infinite. A browser
+ * session that only re-authenticates on `M_UNKNOWN_TOKEN` therefore dies on
+ * almost every reload. Refreshing is only useful when the client refreshes
+ * proactively (the matrix-js-sdk `TokenManager` does), so it stays off unless
+ * `MATRIX_REFRESH_TOKENS` is explicitly enabled.
+ */
+export function matrixRefreshTokensEnabled(): boolean {
+  const flag = process.env.MATRIX_REFRESH_TOKENS?.trim().toLowerCase();
+  return flag === "1" || flag === "true" || flag === "yes" || flag === "on";
+}
+
 /** A secret-free probe for the app host's configured Synapse client API. */
 export async function getMatrixHealthStatus(): Promise<"ok" | "not_configured" | "unavailable"> {
   let config: MatrixConfig | null;
@@ -528,9 +544,10 @@ export async function createMatrixSession(
       password: options.password,
       device_id: deviceId,
       initial_device_display_name: `Secret Chat — ${options.username}`,
-      // Homeservers that support Matrix refresh tokens can keep a long-lived
-      // device session alive without making the user sign out and back in.
-      refresh_token: true,
+      // Only when explicitly enabled: see `matrixRefreshTokensEnabled()`.
+      // With refresh tokens the homeserver issues expiring access tokens, so a
+      // client that cannot refresh them loses its session shortly after login.
+      ...(matrixRefreshTokensEnabled() ? { refresh_token: true } : {}),
     }),
     cache: "no-store",
   });
@@ -570,5 +587,75 @@ export async function createMatrixSession(
         ? { expiresAt: Date.now() + data.expires_in_ms }
         : {}),
     },
+  };
+}
+
+/**
+ * Exchanges a stored refresh token for a new Matrix access token, server-side.
+ *
+ * This is what makes a reload recoverable without typing the account password:
+ * the browser only ever needs the (single-use) refresh token, and the rotated
+ * pair is validated against `/whoami` before it is handed back, so a token from
+ * another device or another app account can never be adopted.
+ */
+export async function refreshMatrixSession(input: {
+  appUserId: number;
+  deviceId: string;
+  refreshToken: string;
+}): Promise<MatrixSession> {
+  const config = getMatrixConfig();
+  if (!config) throw new Error("Matrix is not configured");
+  if (!/^[A-Za-z0-9._=-]{1,255}$/u.test(input.deviceId)) {
+    throw new Error("Invalid Matrix device ID");
+  }
+  if (typeof input.refreshToken !== "string" || !input.refreshToken || input.refreshToken.length > 8192) {
+    throw new Error("Invalid Matrix refresh token");
+  }
+
+  const response = await fetch(`${config.internalUrl}/_matrix/client/v3/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: input.refreshToken }),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    // 401/M_UNKNOWN_TOKEN means the refresh token was already rotated away or the
+    // device was revoked; only a password login can recover from that.
+    throw new Error(`Matrix refresh rejected (${response.status})`);
+  }
+
+  const data = (await response.json()) as {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in_ms?: number;
+  };
+  if (!data.access_token) throw new Error("Matrix refresh returned no access token");
+
+  const headers = { Authorization: `Bearer ${data.access_token}` };
+  const whoami = await fetch(`${config.internalUrl}/_matrix/client/v3/account/whoami`, {
+    headers,
+    cache: "no-store",
+  });
+  if (!whoami.ok) throw new Error("Matrix session could not be verified");
+  const identity = (await whoami.json()) as { user_id?: unknown; device_id?: unknown };
+  const expectedMxid = matrixUserId(config, input.appUserId);
+  if (identity.user_id !== expectedMxid) {
+    throw new Error("Matrix session does not match the authenticated app user");
+  }
+  if (typeof identity.device_id === "string" && identity.device_id !== input.deviceId) {
+    throw new Error("Matrix session does not match the authenticated app device");
+  }
+
+  return {
+    baseUrl: config.publicUrl,
+    userId: expectedMxid,
+    accessToken: data.access_token,
+    deviceId: input.deviceId,
+    ...(typeof data.refresh_token === "string" && data.refresh_token
+      ? { refreshToken: data.refresh_token }
+      : {}),
+    ...(typeof data.expires_in_ms === "number" && Number.isFinite(data.expires_in_ms) && data.expires_in_ms > 0
+      ? { expiresAt: Date.now() + data.expires_in_ms }
+      : {}),
   };
 }

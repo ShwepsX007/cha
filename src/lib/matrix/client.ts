@@ -29,9 +29,17 @@ import {
   fetchStoredRecoveryKey,
   saveRecoveryKeyToProfile,
 } from "./recovery-key-storage";
+import {
+  appUserIdFromMatrixUserId,
+  clearMatrixSession,
+  loadMatrixSession,
+  refreshMatrixSessionFromServer,
+  saveMatrixSession,
+} from "./session-store";
 
 let clientPromise: Promise<MatrixClient> | null = null;
 let currentSessionKey: string | null = null;
+let currentSessionToken: string | null = null;
 const backfilledRoomIds = new Set<string>();
 const roomPreparationPromises = new Map<string, Promise<MatrixClient>>();
 const directHistoryVisibilityPromises = new Map<string, Promise<void>>();
@@ -130,8 +138,17 @@ export interface MatrixTimelineResult {
   undecryptableCount: number;
 }
 
+/**
+ * Identifies the *device session*, i.e. everything the Matrix client and its
+ * IndexedDB crypto store are bound to.
+ *
+ * The access token is deliberately excluded: tokens rotate (refresh flow, a
+ * recovery re-login), and keying the cache on them used to tear down the
+ * client and re-open the Rust crypto store on every rotation. `getMatrixClient`
+ * now adopts a rotated token in place instead.
+ */
 function sessionKey(session: MatrixSession): string {
-  return `${session.baseUrl}|${session.userId}|${session.deviceId}|${session.accessToken}`;
+  return `${session.baseUrl}|${session.userId}|${session.deviceId}`;
 }
 
 function matrixOutboxStorageKey(appUserId: number): string {
@@ -232,8 +249,7 @@ export async function clearLocalMatrixCryptoStores(appUserId: number): Promise<v
   })));
 
   try {
-    window.sessionStorage.removeItem("chata_matrix_session");
-    window.sessionStorage.removeItem("chata_matrix_availability");
+    clearMatrixSession(appUserId);
   } catch {
     throw new Error("Не удалось очистить Matrix-сессию браузера.");
   }
@@ -359,6 +375,18 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
 
   const key = sessionKey(session);
   if (clientPromise && currentSessionKey === key) {
+    // Same device, possibly a rotated access token (refresh, recovery re-login,
+    // another tab). Hand the new token to the running client instead of
+    // rebuilding it, which would interrupt sync and re-open the crypto store.
+    if (currentSessionToken !== session.accessToken) {
+      const pending = clientPromise;
+      currentSessionToken = session.accessToken;
+      void pending.then((existing) => {
+        if (existing.getAccessToken() !== session.accessToken) {
+          existing.setAccessToken(session.accessToken);
+        }
+      }).catch(() => undefined);
+    }
     return clientPromise;
   }
 
@@ -377,6 +405,7 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
   }
 
   currentSessionKey = key;
+  currentSessionToken = session.accessToken;
   clientPromise = (async () => {
     const cryptoCallbacks: CryptoCallbacks = {
       getSecretStorageKey: async ({ keys }) => {
@@ -402,6 +431,28 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
       accessToken: session.accessToken,
       deviceId: session.deviceId,
       cryptoCallbacks,
+      ...(session.refreshToken
+        ? {
+            refreshToken: session.refreshToken,
+            // The SDK's token manager refreshes *before* the access token
+            // expires, so sync never enters the terminal M_UNKNOWN_TOKEN state.
+            // Rotated tokens are single-use, so they must land in browser
+            // storage immediately - including for the other tabs.
+            onTokenRefresh: (tokens: { accessToken: string; refreshToken?: string; expiry?: Date }) => {
+              currentSessionToken = tokens.accessToken;
+              const nextSession: MatrixSession = {
+                baseUrl: session.baseUrl,
+                userId: session.userId,
+                accessToken: tokens.accessToken,
+                deviceId: session.deviceId,
+                ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
+                ...(tokens.expiry ? { expiresAt: tokens.expiry.getTime() } : {}),
+              };
+              const appUserId = appUserIdFromMatrixUserId(session.userId);
+              if (appUserId !== null) saveMatrixSession(appUserId, nextSession);
+            },
+          }
+        : {}),
     });
 
     const cryptoDatabasePrefix = `secret-chat-${session.userId}-${session.deviceId}`
@@ -441,6 +492,7 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
   } catch (error) {
     clientPromise = null;
     currentSessionKey = null;
+    currentSessionToken = null;
     throw error;
   }
 }
@@ -450,10 +502,30 @@ export async function restartMatrixClient(session: MatrixSession): Promise<Matri
   if (clientPromise && currentSessionKey === sessionKey(session)) {
     const current = await clientPromise.catch(() => null);
     const state = current?.getSyncState();
-    if (current && state !== SyncState.Error && state !== SyncState.Stopped) return current;
+    if (current && state !== SyncState.Error && state !== SyncState.Stopped) {
+      // Reuse the running client, but still adopt a rotated token.
+      if (currentSessionToken !== session.accessToken) {
+        currentSessionToken = session.accessToken;
+        if (current.getAccessToken() !== session.accessToken) current.setAccessToken(session.accessToken);
+      }
+      return current;
+    }
     await stopMatrixClient(false);
   }
   return getMatrixClient(session);
+}
+
+/**
+ * Errors that genuinely mean the local crypto store is unusable and must be
+ * rebuilt. Deliberately narrow: the previous pattern also matched "decryption"
+ * and "invalid session", both of which appear during normal operation (history
+ * keys still restoring, an expired access token) and must NOT wipe the device
+ * identity, which is what turned a bad reload into a permanent Matrix outage.
+ */
+export function isFatalMatrixCryptoError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /corrupt|unreadable|version conflict|database is not open|cannot open database|InvalidStateError|Storage is not initialized|indexeddb.*(?:blocked|closed|denied)/i
+    .test(error.message);
 }
 
 const MATRIX_INITIAL_SYNC_TIMEOUT_MS = 45_000;
@@ -1261,26 +1333,53 @@ async function relayEncryptedMessagePush(
   roomId: string,
   eventId: string,
 ): Promise<void> {
-  try {
-    const response = await fetch("/api/messages/matrix-push", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chatId,
-        roomId,
-        eventId,
-        accessToken: session.accessToken,
-        deviceId: session.deviceId,
-      }),
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      console.warn("Encrypted message push relay failed", { statusCode: response.status });
+  // A push relay failure must never fail a send that already succeeded - the
+  // encrypted message is on the homeserver. But it used to be a single
+  // fire-and-forget request, so any 401/403 from an access token that a reload
+  // or another tab rotated meant "no notifications for this chat", silently.
+  const appUserId = appUserIdFromMatrixUserId(session.userId);
+  let activeSession = session;
+  let attemptedRefresh = false;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const stored = appUserId === null ? null : loadMatrixSession(appUserId);
+    if (stored?.accessToken) activeSession = stored;
+
+    try {
+      const response = await fetch("/api/messages/matrix-push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chatId,
+          roomId,
+          eventId,
+          accessToken: activeSession.accessToken,
+          deviceId: activeSession.deviceId,
+        }),
+        cache: "no-store",
+      });
+      if (response.ok) return;
+
+      const statusCode = response.status;
+      if ((statusCode === 401 || statusCode === 403) && !attemptedRefresh) {
+        attemptedRefresh = true;
+        try {
+          const refreshed = await refreshMatrixSessionFromServer(activeSession);
+          if (refreshed) {
+            activeSession = refreshed;
+            await delay(250);
+            continue;
+          }
+        } catch {
+          // Refresh is best effort too; fall through to the generic warning.
+        }
+      }
+      console.warn("Encrypted message push relay failed", { statusCode, chatId });
+    } catch {
+      console.warn("Encrypted message push relay failed", { reason: "network", chatId });
     }
-  } catch {
-    console.warn("Encrypted message push relay failed", { reason: "network" });
-    // The encrypted message has already been sent. Push is best-effort and
-    // must never turn a successful Matrix send into an outbox failure.
+
+    if (attempt < 2) await delay(1_000 * (attempt + 1));
   }
 }
 
@@ -1712,6 +1811,7 @@ export async function sendMatrixReadReceipt(
 export async function stopMatrixClient(logout = false): Promise<void> {
   const stoppedSessionKey = currentSessionKey;
   if (!clientPromise) {
+    currentSessionToken = null;
     if (stoppedSessionKey) clearSecretStorageKey(stoppedSessionKey);
     roomPreparationPromises.clear();
     directHistoryVisibilityPromises.clear();
@@ -1729,6 +1829,7 @@ export async function stopMatrixClient(logout = false): Promise<void> {
   }
   clientPromise = null;
   currentSessionKey = null;
+  currentSessionToken = null;
   if (stoppedSessionKey) clearSecretStorageKey(stoppedSessionKey);
   backfilledRoomIds.clear();
   roomPreparationPromises.clear();
