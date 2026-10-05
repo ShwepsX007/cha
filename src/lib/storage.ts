@@ -43,7 +43,12 @@ export async function readAvatarFile(fileName: string): Promise<Buffer | null> {
   if (!isSafeFileName(fileName)) return null;
   for (const dir of [getAvatarDir(), getLegacyAvatarDir()]) {
     try {
-      return await readFile(join(dir, fileName));
+      return await readFile(
+        /*turbopackIgnore: true*/ join(
+          /*turbopackIgnore: true*/ dir,
+          fileName,
+        ),
+      );
     } catch {
       // Try the next location.
     }
@@ -57,7 +62,12 @@ export async function removeAvatarFile(publicPath?: string | null): Promise<void
   if (!isSafeFileName(fileName)) return;
   for (const dir of [getAvatarDir(), getLegacyAvatarDir()]) {
     try {
-      await unlink(join(dir, fileName));
+      await unlink(
+        /*turbopackIgnore: true*/ join(
+          /*turbopackIgnore: true*/ dir,
+          fileName,
+        ),
+      );
     } catch {
       // Already gone or never existed in this location.
     }

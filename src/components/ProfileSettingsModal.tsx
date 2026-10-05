@@ -31,7 +31,6 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
   const [savingName, setSavingName] = useState(false);
   const [nameNotice, setNameNotice] = useState("");
 
-  const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [passwordError, setPasswordError] = useState("");
@@ -196,8 +195,8 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
     event.preventDefault();
     setPasswordError("");
     setPasswordNotice("");
-    if (!currentPassword || !newPassword || !confirmPassword) {
-      setPasswordError("Заполните все поля");
+    if (!newPassword || !confirmPassword) {
+      setPasswordError("Введите новый пароль и подтвердите его");
       return;
     }
     if (newPassword.length < 6) {
@@ -213,11 +212,10 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
       const response = await fetch("/api/profile/password", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ currentPassword, newPassword, confirmPassword }),
+        body: JSON.stringify({ newPassword, confirmPassword }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Не удалось сменить пароль");
-      setCurrentPassword("");
       setNewPassword("");
       setConfirmPassword("");
       setPasswordNotice("Пароль изменён. Для Matrix-сессий он синхронизируется на сервере.");
@@ -352,10 +350,7 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
 
           {tab === "password" && (
             <form onSubmit={changePassword} className="max-w-xl space-y-4">
-              <div>
-                <label htmlFor="current-password" className="block text-sm font-medium text-gray-300">Текущий пароль</label>
-                <input id="current-password" type={showPassword ? "text" : "password"} value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} autoComplete="current-password" className="mt-1.5 w-full rounded-xl border border-dark-500 bg-dark-900 px-4 py-3 text-sm text-white outline-none focus:border-purple-500" />
-              </div>
+              <p className="text-sm text-gray-400">Укажите новый пароль и повторите его для подтверждения.</p>
               <div>
                 <label htmlFor="new-password" className="block text-sm font-medium text-gray-300">Новый пароль</label>
                 <input id="new-password" type={showPassword ? "text" : "password"} value={newPassword} onChange={(e) => setNewPassword(e.target.value)} minLength={6} autoComplete="new-password" className="mt-1.5 w-full rounded-xl border border-dark-500 bg-dark-900 px-4 py-3 text-sm text-white outline-none focus:border-purple-500" />
