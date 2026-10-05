@@ -20,8 +20,15 @@ export async function POST(req: NextRequest) {
     const formData = await req.formData();
     const file = formData.get("file");
     const chatId = Number(formData.get("chatId"));
+    const rawReplyToMessageId = formData.get("replyToMessageId");
+    const replyToMessageId = rawReplyToMessageId === null || rawReplyToMessageId === ""
+      ? null
+      : Number(rawReplyToMessageId);
 
-    if (!(file instanceof File) || !Number.isInteger(chatId) || chatId <= 0) {
+    if (
+      !(file instanceof File) || !Number.isInteger(chatId) || chatId <= 0 ||
+      (replyToMessageId !== null && (!Number.isInteger(replyToMessageId) || replyToMessageId <= 0))
+    ) {
       return NextResponse.json({ error: "file and chatId required" }, { status: 400 });
     }
 
@@ -77,6 +84,15 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    if (replyToMessageId !== null) {
+      const [target] = await db
+        .select({ id: messages.id })
+        .from(messages)
+        .where(and(eq(messages.id, replyToMessageId), eq(messages.chatId, chatId)))
+        .limit(1);
+      if (!target) return NextResponse.json({ error: "Reply target not found in this chat" }, { status: 404 });
+    }
+
     const activeBan = await getActivePublicChatBan(payload.userId);
     if (activeBan) {
       return NextResponse.json(
@@ -108,6 +124,7 @@ export async function POST(req: NextRequest) {
         senderId: payload.userId,
         content: fileName,
         messageType,
+        replyToMessageId,
         telegramFileId: telegramResult?.fileId || null,
         fileName,
         fileSize: telegramResult?.fileSize || buffer.length,
@@ -120,7 +137,7 @@ export async function POST(req: NextRequest) {
       .from(users)
       .where(eq(users.id, payload.userId));
 
-    void notifyChatMessage({
+    await notifyChatMessage({
       chatId,
       senderId: payload.userId,
       senderName: sender?.displayName || "Пользователь",

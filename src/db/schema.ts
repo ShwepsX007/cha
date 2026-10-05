@@ -1,4 +1,5 @@
 import {
+  AnyPgColumn,
   pgTable,
   serial,
   text,
@@ -75,6 +76,10 @@ export const messages = pgTable("messages", {
     .notNull(),
   content: text("content"),
   messageType: varchar("message_type", { length: 20 }).notNull().default("text"),
+  replyToMessageId: integer("reply_to_message_id").references(
+    (): AnyPgColumn => messages.id,
+    { onDelete: "set null" },
+  ),
   // Telegram file storage
   telegramFileId: text("telegram_file_id"),
   fileName: varchar("file_name", { length: 500 }),
@@ -104,5 +109,16 @@ export const pushSubscriptions = pgTable("push_subscriptions", {
   endpoint: text("endpoint").notNull().unique(),
   p256dh: text("p256dh").notNull(),
   auth: text("auth").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+// Idempotency records for client-relayed E2EE push notifications. Only Matrix
+// event IDs and app chat IDs are stored; message plaintext never reaches this
+// table (or the push service) for encrypted rooms.
+export const matrixPushEvents = pgTable("matrix_push_events", {
+  eventId: text("event_id").primaryKey(),
+  chatId: integer("chat_id")
+    .references(() => chats.id, { onDelete: "cascade" })
+    .notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });

@@ -297,6 +297,73 @@ function isValidMatrixRoomId(roomId: string): boolean {
   return /^![^:]+:.+$/.test(roomId) || /^![A-Za-z0-9_-]+$/.test(roomId);
 }
 
+/**
+ * Verify a client-relayed event before sending a generic E2EE push. The app
+ * server checks only the sender and ciphertext envelope; it never decrypts or
+ * forwards message plaintext.
+ */
+export async function verifyEncryptedMessageEvent(input: {
+  roomId: string;
+  eventId: string;
+  accessToken: string;
+  deviceId: string;
+  authenticatedAppUserId: number;
+}): Promise<void> {
+  const config = getMatrixConfig();
+  if (!config) throw new Error("Matrix is not configured");
+  if (!isValidMatrixRoomId(input.roomId)) throw new Error("Invalid Matrix room ID");
+  if (
+    typeof input.eventId !== "string" || input.eventId.length > 255 ||
+    !input.eventId.startsWith("$") || /\s/u.test(input.eventId)
+  ) {
+    throw new Error("Invalid Matrix event ID");
+  }
+  if (!input.accessToken || input.accessToken.length > 8192) {
+    throw new Error("Missing Matrix access token");
+  }
+  if (!/^[A-Za-z0-9._=-]{1,255}$/u.test(input.deviceId)) {
+    throw new Error("Invalid Matrix device ID");
+  }
+
+  const expectedMxid = matrixUserId(config, input.authenticatedAppUserId);
+  const headers = { Authorization: `Bearer ${input.accessToken}` };
+  const whoamiResponse = await fetch(`${config.internalUrl}/_matrix/client/v3/account/whoami`, {
+    headers,
+    cache: "no-store",
+  });
+  if (!whoamiResponse.ok) throw new Error("Matrix session could not be verified");
+  const whoami = await whoamiResponse.json() as { user_id?: unknown; device_id?: unknown };
+  if (
+    whoami.user_id !== expectedMxid ||
+    (typeof whoami.device_id === "string" && whoami.device_id !== input.deviceId)
+  ) {
+    throw new Error("Matrix session does not match the authenticated app user/device");
+  }
+
+  const eventResponse = await fetch(
+    `${config.internalUrl}/_matrix/client/v3/rooms/${encodeURIComponent(input.roomId)}/event/${encodeURIComponent(input.eventId)}`,
+    { headers, cache: "no-store" },
+  );
+  if (!eventResponse.ok) throw new Error("Matrix event could not be verified");
+  const event = await eventResponse.json() as {
+    event_id?: unknown;
+    room_id?: unknown;
+    sender?: unknown;
+    type?: unknown;
+    content?: Record<string, unknown>;
+  };
+  if (
+    event.event_id !== input.eventId ||
+    (event.room_id !== undefined && event.room_id !== input.roomId) ||
+    event.sender !== expectedMxid ||
+    event.type !== "m.room.encrypted" ||
+    event.content?.algorithm !== "m.megolm.v1.aes-sha2" ||
+    typeof event.content.ciphertext !== "string"
+  ) {
+    throw new Error("Matrix event is not a verified encrypted message from this user");
+  }
+}
+
 export async function verifyEncryptedRoom(input: {
   roomId: string;
   accessToken: string;
@@ -461,6 +528,9 @@ export async function createMatrixSession(
       password: options.password,
       device_id: deviceId,
       initial_device_display_name: `Secret Chat — ${options.username}`,
+      // Homeservers that support Matrix refresh tokens can keep a long-lived
+      // device session alive without making the user sign out and back in.
+      refresh_token: true,
     }),
     cache: "no-store",
   });
@@ -473,6 +543,8 @@ export async function createMatrixSession(
     user_id?: string;
     access_token?: string;
     device_id?: string;
+    refresh_token?: string;
+    expires_in_ms?: number;
   };
   const expectedUserId = matrixUserId(config, options.appUserId);
 
@@ -491,6 +563,12 @@ export async function createMatrixSession(
       userId: data.user_id,
       accessToken: data.access_token,
       deviceId: data.device_id,
+      ...(typeof data.refresh_token === "string" && data.refresh_token
+        ? { refreshToken: data.refresh_token }
+        : {}),
+      ...(typeof data.expires_in_ms === "number" && Number.isFinite(data.expires_in_ms) && data.expires_in_ms > 0
+        ? { expiresAt: Date.now() + data.expires_in_ms }
+        : {}),
     },
   };
 }

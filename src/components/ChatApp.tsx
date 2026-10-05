@@ -8,6 +8,7 @@ import { registerServiceWorker } from "@/lib/push-client";
 
 const DeviceSecurityModal = dynamic(() => import("./DeviceSecurityModal"), { ssr: false });
 const ProfileSettingsModal = dynamic(() => import("./ProfileSettingsModal"), { ssr: false });
+const MatrixSessionRecoveryModal = dynamic(() => import("./MatrixSessionRecoveryModal"), { ssr: false });
 import { ClientEvent, SyncState } from "matrix-js-sdk";
 import {
   clearLocalMatrixCryptoStores,
@@ -16,12 +17,14 @@ import {
   getMatrixClient,
   joinRoomIfInvited,
   MATRIX_RECOVERY_EVENT,
+  restartMatrixClient,
   stopMatrixClient,
   waitForMatrixSync,
   type MatrixRecoveryNotice,
 } from "@/lib/matrix/client";
 import type { IEncryptedFile } from "matrix-encrypt-attachment";
 import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
+import { getMatrixDeviceId } from "@/lib/matrix/device-id";
 
 export interface User {
   id: number;
@@ -43,6 +46,16 @@ export interface User {
   matrixNotice?: string;
 }
 
+export interface ChatMessageReply {
+  id: number | string;
+  senderId: number | string;
+  senderDisplayName: string;
+  senderUsername?: string;
+  content: string | null;
+  messageType: string;
+  fileName?: string | null;
+}
+
 export interface ChatMessage {
   id: number | string;
   chatId: number;
@@ -58,6 +71,11 @@ export interface ChatMessage {
   createdAt: string;
   deliveryStatus?: "sending" | "sent" | "delivered" | "read" | "error";
   deliveryError?: string;
+  replyTo?: ChatMessageReply | null;
+  readByCount?: number;
+  deliveredToCount?: number;
+  recipientCount?: number;
+  mentionUserIds?: string[];
   outboxId?: string;
   matrixEventId?: string;
   senderUsername: string;
@@ -103,6 +121,7 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
   const [showSidebar, setShowSidebar] = useState(true);
   const [showDeviceSecurity, setShowDeviceSecurity] = useState(Boolean(user.initialRecoveryKey));
   const [showProfileSettings, setShowProfileSettings] = useState(false);
+  const [showMatrixRecovery, setShowMatrixRecovery] = useState(false);
   const [initialRecoveryKey, setInitialRecoveryKey] = useState(user.initialRecoveryKey || null);
   const [initialRecoveryKeySaved, setInitialRecoveryKeySaved] = useState(Boolean(user.initialRecoveryKeySaved));
   const [currentUserState, setCurrentUserState] = useState<User>(user);
@@ -121,7 +140,7 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
       const onMessage = (event: MessageEvent) => {
         const data = event?.data;
         if (data && data.type === "chata-open-chat") {
-          // Default view handles "/" (chat list); deeper routing can be added later.
+          // The chat ID query opens the conversation even if another chat is active.
           window.location.href = data.url || "/";
         }
       };
@@ -156,6 +175,46 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
     onLogout();
   }, [onLogout, currentUserState.id]);
 
+  const handleRecoverMatrixSession = useCallback(async (password: string) => {
+    const deviceId = getMatrixDeviceId(currentUserState.username);
+    // Stop the old SDK instance before re-authenticating this same device so
+    // Rust crypto can reopen its existing IndexedDB without losing keys.
+    await stopMatrixClient(false);
+    const response = await fetch("/api/auth/matrix-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password, deviceId }),
+      cache: "no-store",
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "Не удалось восстановить Matrix-сессию");
+    if (data.matrixAvailability !== "ready" || !data.matrixSession) {
+      throw new Error("Matrix пока недоступен. Повторите попытку позже.");
+    }
+
+    const matrixSession = data.matrixSession as MatrixSession;
+    sessionStorage.setItem("chata_matrix_session", JSON.stringify(matrixSession));
+    sessionStorage.setItem("chata_matrix_availability", "ready");
+    setCurrentUserState((current) => ({
+      ...current,
+      matrixSession,
+      matrixAvailability: "ready",
+      matrixNotice: undefined,
+    }));
+    setMatrixState("checking");
+    try {
+      await waitForMatrixSync(await getMatrixClient(matrixSession));
+      setMatrixState("connected");
+      setAutomaticRecoveryNotice({
+        status: "restored",
+        message: "Matrix-сессия восстановлена на прежнем устройстве. Локальные ключи E2EE сохранены.",
+      });
+    } catch (error) {
+      setMatrixState("unavailable");
+      throw new Error(error instanceof Error ? error.message : "Matrix пока не синхронизируется");
+    }
+  }, [currentUserState.username]);
+
   const loadChats = useCallback(async () => {
     try {
       const res = await fetch("/api/chats");
@@ -184,13 +243,122 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
     const session = currentUserState.matrixSession;
     let cancelled = false;
     let matrixClient: Awaited<ReturnType<typeof getMatrixClient>> | null = null;
-    const onSync = (state: SyncState, previousState: SyncState | null) => {
+    let recoveryTimer: number | null = null;
+    let recoveryAttempts = 0;
+    let recoveryInFlight = false;
+    let refreshInFlight = false;
+
+    const clearRecoveryTimer = () => {
+      if (recoveryTimer !== null) {
+        window.clearTimeout(recoveryTimer);
+        recoveryTimer = null;
+      }
+    };
+
+    const scheduleRestart = () => {
+      if (cancelled || recoveryTimer !== null || recoveryInFlight || recoveryAttempts >= 4) return;
+      const waitMs = Math.min(2_000 * (2 ** recoveryAttempts), 20_000);
+      recoveryTimer = window.setTimeout(() => {
+        recoveryTimer = null;
+        recoveryInFlight = true;
+        recoveryAttempts += 1;
+        let restartFailed = false;
+        void (async () => {
+          const previousClient = matrixClient;
+          if (previousClient) previousClient.removeListener(ClientEvent.Sync, onSync);
+          const nextClient = await restartMatrixClient(session);
+          if (cancelled) return;
+          matrixClient = nextClient;
+          nextClient.on(ClientEvent.Sync, onSync);
+          await waitForMatrixSync(nextClient);
+          if (cancelled) return;
+          recoveryAttempts = 0;
+          setMatrixState("connected");
+          setAutomaticRecoveryNotice({ status: "restored", message: "Matrix-синхронизация восстановлена." });
+          void drainEncryptedOutbox(session).catch(() => undefined);
+        })().catch(() => {
+          restartFailed = true;
+          if (!cancelled) setMatrixState("unavailable");
+        }).finally(() => {
+          recoveryInFlight = false;
+          if (restartFailed) scheduleRestart();
+        });
+      }, waitMs);
+    };
+
+    const handleUnknownToken = async (client: Awaited<ReturnType<typeof getMatrixClient>>) => {
+      if (refreshInFlight || cancelled) return;
+      if (!session.refreshToken) {
+        setAutomaticRecoveryNotice({
+          status: "needs-recovery",
+          message: "Matrix-сессия истекла, а сервер не выдал refresh token. Нажмите «Восстановить Matrix-сессию»; выходить из аккаунта не нужно.",
+        });
+        return;
+      }
+
+      refreshInFlight = true;
+      setMatrixState("checking");
+      setAutomaticRecoveryNotice({ status: "restoring", message: "Обновляем Matrix-сессию…" });
+      try {
+        const tokens = await client.refreshToken(session.refreshToken);
+        if (cancelled) return;
+        client.setAccessToken(tokens.access_token);
+        const nextSession: MatrixSession = {
+          ...session,
+          accessToken: tokens.access_token,
+          refreshToken: tokens.refresh_token,
+          expiresAt: Date.now() + tokens.expires_in_ms,
+        };
+        try {
+          sessionStorage.setItem("chata_matrix_session", JSON.stringify(nextSession));
+          sessionStorage.setItem("chata_matrix_availability", "ready");
+        } catch {
+          // Keep this tab working even if browser storage is full or disabled.
+        }
+        setCurrentUserState((current) => current.id === user.id
+          ? { ...current, matrixSession: nextSession, matrixAvailability: "ready", matrixNotice: undefined }
+          : current);
+        setAutomaticRecoveryNotice({ status: "restored", message: "Matrix-сессия автоматически обновлена." });
+      } catch {
+        if (!cancelled) {
+          setMatrixState("unavailable");
+          setAutomaticRecoveryNotice({
+            status: "needs-recovery",
+            message: "Не удалось обновить Matrix-сессию. Нажмите «Восстановить Matrix-сессию»; локальные ключи сохранятся.",
+          });
+        }
+      } finally {
+        refreshInFlight = false;
+      }
+    };
+
+    const onSync = (
+      state: SyncState,
+      previousState: SyncState | null,
+      data?: { error?: unknown },
+    ) => {
       if (cancelled) return;
       if (state === SyncState.Error || state === SyncState.Stopped) {
         setMatrixState("unavailable");
+        const error = data?.error;
+        const errcode = error && typeof error === "object" && "errcode" in error
+          ? (error as { errcode?: unknown }).errcode
+          : undefined;
+        if (errcode === "M_UNKNOWN_TOKEN") {
+          if (matrixClient) void handleUnknownToken(matrixClient);
+        } else {
+          const errorMessage = error instanceof Error ? error.message : "";
+          if (/unknown device|corrupted|indexeddb|crypto store|decryption|key error|invalid session/i.test(errorMessage)) {
+            void handleFatalMatrixReset();
+          } else {
+            scheduleRestart();
+          }
+        }
         return;
       }
       if (state === SyncState.Prepared || state === SyncState.Syncing || state === SyncState.Catchup) {
+        clearRecoveryTimer();
+        recoveryAttempts = 0;
         setMatrixState("connected");
       }
       if (
@@ -218,14 +386,22 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
         console.error("Matrix client unavailable:", errorType);
         if (cancelled) return;
         setMatrixState("unavailable");
-        if (fatalCryptoError) void handleFatalMatrixReset();
+        if (fatalCryptoError) {
+          void handleFatalMatrixReset();
+        } else if (matrixClient) {
+          const currentState = matrixClient.getSyncState();
+          if (currentState === SyncState.Error || currentState === SyncState.Stopped) {
+            onSync(currentState, null, matrixClient.getSyncStateData() || undefined);
+          }
+        }
       });
 
     return () => {
       cancelled = true;
+      clearRecoveryTimer();
       if (matrixClient) matrixClient.removeListener(ClientEvent.Sync, onSync);
     };
-  }, [handleFatalMatrixReset, currentUserState.matrixSession]);
+  }, [handleFatalMatrixReset, currentUserState.matrixSession, user.id]);
 
   useEffect(() => {
     if (!currentUserState.matrixSession) return;
@@ -255,8 +431,20 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
     };
   }, [loadChats]);
 
+  useEffect(() => {
+    if (chats.length === 0) return;
+    const url = new URL(window.location.href);
+    const requestedChatId = Number(url.searchParams.get("chatId"));
+    if (!Number.isInteger(requestedChatId) || requestedChatId <= 0) return;
+    if (!chats.some((chat) => chat.id === requestedChatId)) return;
+    setSelectedChatId(requestedChatId);
+  }, [chats]);
+
   const handleSelectChat = (chatId: number) => {
     setSelectedChatId(chatId);
+    const url = new URL(window.location.href);
+    url.searchParams.set("chatId", String(chatId));
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
     if (window.innerWidth < 768) {
       setShowSidebar(false);
     }
@@ -265,6 +453,9 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
   const handleBack = () => {
     setShowSidebar(true);
     setSelectedChatId(null);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("chatId");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
   };
 
   const selectedChat = chats.find((c) => c.id === selectedChatId) || null;
@@ -289,6 +480,7 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
           matrixNotice={automaticRecoveryNotice?.message || currentUserState.matrixNotice}
           onOpenDeviceSecurity={() => setShowDeviceSecurity(true)}
           onOpenProfileSettings={() => setShowProfileSettings(true)}
+          onRecoverMatrixSession={() => setShowMatrixRecovery(true)}
         />
       </div>
 
@@ -330,6 +522,13 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
           setInitialRecoveryKey(null);
           setInitialRecoveryKeySaved(false);
         }}
+      />
+    )}
+    {showMatrixRecovery && (
+      <MatrixSessionRecoveryModal
+        username={currentUserState.username}
+        onClose={() => setShowMatrixRecovery(false)}
+        onRecover={handleRecoverMatrixSession}
       />
     )}
     {showProfileSettings && (

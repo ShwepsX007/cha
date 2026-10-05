@@ -43,6 +43,7 @@ export default function ChatSidebar({
   matrixNotice,
   onOpenDeviceSecurity,
   onOpenProfileSettings,
+  onRecoverMatrixSession,
 }: {
   user: User;
   chats: Chat[];
@@ -54,6 +55,7 @@ export default function ChatSidebar({
   matrixNotice?: string;
   onOpenDeviceSecurity: () => void;
   onOpenProfileSettings: () => void;
+  onRecoverMatrixSession: () => void;
 }) {
   const [showNewChat, setShowNewChat] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -79,8 +81,8 @@ export default function ChatSidebar({
                 title={
                   matrixState === "unavailable"
                     ? user.matrixSession
-                      ? "Matrix-сессия есть, но синхронизация не прошла. Проверьте подключение; если не поможет, выйдите и войдите снова. Не очищайте данные сайта: там хранятся ключи устройства."
-                      : "В этой вкладке нет Matrix-сессии. Выйдите из аккаунта и войдите снова, чтобы восстановить её. Не очищайте данные сайта: там хранятся ключи устройства."
+                      ? "Matrix-сессия есть, но синхронизация не прошла. Проверьте подключение или восстановите сессию. Не очищайте данные сайта: там хранятся ключи устройства."
+                      : "В этой вкладке нет Matrix-сессии. Нажмите «Восстановить Matrix-сессию»; локальные ключи устройства сохранятся."
                     : matrixState === "not_configured"
                       ? "На сервере не настроен Matrix; личные чаты E2EE недоступны."
                       : "E2EE пока не включено для отправки новых личных сообщений"
@@ -93,9 +95,18 @@ export default function ChatSidebar({
                     : matrixState === "not_configured"
                       ? "E2EE не настроено на сервере"
                       : !user.matrixSession
-                        ? "Нет Matrix-сессии · выйдите и войдите снова"
-                        : "Matrix не синхронизируется · выйдите и войдите снова"}
+                        ? "Нет Matrix-сессии · восстановить"
+                        : "Matrix не синхронизируется · восстановить"}
               </div>
+              {matrixState === "unavailable" && (
+                <button
+                  type="button"
+                  onClick={onRecoverMatrixSession}
+                  className="mt-1 text-[10px] font-medium text-purple-300 hover:text-purple-200"
+                >
+                  Восстановить Matrix-сессию
+                </button>
+              )}
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">

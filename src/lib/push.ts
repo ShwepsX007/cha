@@ -5,7 +5,7 @@ import { pushSubscriptions } from "@/db/schema";
 
 export function isPushConfigured(): boolean {
   return Boolean(
-    process.env.VAPID_PUBLIC_KEY
+    (process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY)
     && process.env.VAPID_PRIVATE_KEY
     && process.env.VAPID_EMAIL,
   );
@@ -30,6 +30,9 @@ export interface PushPayload {
   chatId: number;
   url: string;
   messageId?: number;
+  eventId?: string;
+  /** Test notifications are shown even while the app is in the foreground. */
+  force?: boolean;
 }
 
 export interface PushSendResult {

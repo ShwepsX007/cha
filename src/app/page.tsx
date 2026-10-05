@@ -50,6 +50,8 @@ export default function Home() {
               typeof candidate.accessToken === "string" &&
               typeof candidate.deviceId === "string" &&
               typeof candidate.userId === "string" &&
+              (candidate.refreshToken === undefined || typeof candidate.refreshToken === "string") &&
+              (candidate.expiresAt === undefined || (typeof candidate.expiresAt === "number" && Number.isFinite(candidate.expiresAt))) &&
               candidate.userId.startsWith(`@chata_u${data.user.id}:`)
             ) {
               matrixSession = candidate;

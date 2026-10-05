@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { MouseEvent } from "react";
-import type { User, Chat, ChatMessage } from "./ChatApp";
+import type { User, Chat, ChatMessage, ChatMessageReply } from "./ChatApp";
 import { decryptAttachment, encryptAttachment } from "matrix-encrypt-attachment";
 import {
   ensureDirectRoomHistoryVisibility,
@@ -18,12 +18,18 @@ import {
   sendMatrixReadReceipt,
   type EncryptedOutboxMessage,
   type MatrixOutboxUpdate,
+  type MatrixReplyReference,
 } from "@/lib/matrix/client";
 import AddGroupMembersModal from "./AddGroupMembersModal";
 import Avatar from "./Avatar";
 import MessageStatus from "./MessageStatus";
 
-type ReceiptMap = Record<number | string, { status: "sent" | "delivered" | "read" }>;
+type ReceiptMap = Record<number, {
+  status: "sent" | "delivered" | "read";
+  readByCount: number;
+  deliveredToCount: number;
+  recipientCount: number;
+}>;
 
 function formatTime(dateStr: string) {
   return new Date(dateStr).toLocaleTimeString("ru-RU", {
@@ -52,6 +58,62 @@ function formatBanRemaining(milliseconds: number): string {
   return `${seconds} сек`;
 }
 
+function getReplyPreviewText(message: Pick<ChatMessageReply, "content" | "messageType" | "fileName">): string {
+  if (message.messageType === "image") return `📷 ${message.fileName || "Фото"}`;
+  if (message.messageType === "video") return `🎬 ${message.fileName || "Видео"}`;
+  if (message.messageType !== "text") return `📎 ${message.fileName || message.content || "Файл"}`;
+  return message.content?.trim() || "Сообщение";
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function renderMessageText(text: string, members: User[]) {
+  const handles = [...new Set(members.map((member) => `@${member.username}`).filter((name) => name.length > 1))]
+    .sort((a, b) => b.length - a.length);
+  if (handles.length === 0) return text;
+  const matcher = new RegExp(`(${handles.map(escapeRegExp).join("|")})`, "gi");
+  return text.split(matcher).map((part, index) => {
+    const isMention = handles.some((handle) => handle.toLowerCase() === part.toLowerCase());
+    return isMention
+      ? <span key={`${index}-${part}`} className="rounded bg-sky-400/15 px-0.5 font-medium text-sky-200">{part}</span>
+      : part;
+  });
+}
+
+function getMatrixMentionUserIds(text: string, members: User[], session: NonNullable<User["matrixSession"]>): string[] {
+  const separator = session.userId.indexOf(":");
+  const serverName = separator >= 0 ? session.userId.slice(separator + 1) : "";
+  if (!serverName) return [];
+  return members
+    .filter((member) => {
+      const mentionPattern = new RegExp(`(^|[^A-Za-z0-9_])@${escapeRegExp(member.username)}(?=$|[^A-Za-z0-9_])`, "i");
+      return mentionPattern.test(text);
+    })
+    .map((member) => `@chata_u${member.id}:${serverName}`);
+}
+
+function createMatrixReplyReference(
+  message: ChatMessage,
+  session: NonNullable<User["matrixSession"]>,
+): MatrixReplyReference | undefined {
+  if (message.isLegacy || typeof message.id !== "string" || message.id.startsWith("outbox:")) return undefined;
+  const senderId = Number(message.senderId);
+  const separator = session.userId.indexOf(":");
+  const serverName = separator >= 0 ? session.userId.slice(separator + 1) : "";
+  if (!Number.isInteger(senderId) || senderId <= 0 || !serverName) return undefined;
+  return {
+    eventId: message.id,
+    senderMxid: `@chata_u${senderId}:${serverName}`,
+    senderUserId: String(senderId),
+    senderDisplayName: message.senderDisplayName,
+    senderUsername: message.senderUsername,
+    body: getReplyPreviewText(message),
+    messageType: message.messageType,
+  };
+}
+
 function outboxItemToChatMessage(
   item: EncryptedOutboxMessage,
   user: Pick<User, "id" | "username" | "displayName" | "avatarColor" | "avatarUrl">,
@@ -63,6 +125,15 @@ function outboxItemToChatMessage(
     chatId,
     senderId: user.id,
     content: item.body,
+    replyTo: item.replyTo ? {
+      id: item.replyTo.eventId,
+      senderId: item.replyTo.senderUserId,
+      senderDisplayName: item.replyTo.senderDisplayName,
+      senderUsername: item.replyTo.senderUsername,
+      content: item.replyTo.body,
+      messageType: item.replyTo.messageType,
+    } : null,
+    mentionUserIds: item.mentionUserIds,
     messageType: "text",
     telegramFileId: null,
     fileName: null,
@@ -84,12 +155,24 @@ function MessageBubble({
   onRetry,
   registerRef,
   status,
+  statusTitle,
+  members,
+  canReply,
+  onReply,
+  onMention,
+  onJumpToMessage,
 }: {
   msg: ChatMessage;
   isOwn: boolean;
   onRetry?: (message: ChatMessage) => void;
   registerRef?: (id: number | string, el: HTMLDivElement | null) => void;
   status?: ChatMessage["deliveryStatus"];
+  statusTitle?: string;
+  members: User[];
+  canReply: boolean;
+  onReply: (message: ChatMessage) => void;
+  onMention?: (message: ChatMessage) => void;
+  onJumpToMessage: (id: number | string) => void;
 }) {
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState("");
@@ -235,9 +318,21 @@ function MessageBubble({
         {!isOwn && (
           <div className="mb-1 flex items-center gap-2">
             <Avatar src={msg.senderAvatarUrl} name={msg.senderDisplayName} color={msg.senderAvatarColor} size={24} initialsClassName="text-[10px]" />
-            <span className="text-xs font-medium" style={{ color: msg.senderAvatarColor }}>
-              {msg.senderDisplayName}
-            </span>
+            {onMention ? (
+              <button
+                type="button"
+                onClick={() => onMention(msg)}
+                className="text-xs font-medium hover:underline"
+                style={{ color: msg.senderAvatarColor }}
+                title={`Упомянуть @${msg.senderUsername} в этом чате`}
+              >
+                {msg.senderDisplayName}<span className="ml-1 text-[10px] opacity-60">@</span>
+              </button>
+            ) : (
+              <span className="text-xs font-medium" style={{ color: msg.senderAvatarColor }}>
+                {msg.senderDisplayName}
+              </span>
+            )}
           </div>
         )}
         <div
@@ -247,6 +342,21 @@ function MessageBubble({
               : "bg-dark-600 text-gray-100 rounded-bl-md"
           }`}
         >
+          {msg.replyTo && (
+            <button
+              type="button"
+              onClick={() => onJumpToMessage(msg.replyTo!.id)}
+              className={`mb-2 block w-full rounded-lg border-l-2 px-2 py-1 text-left ${isOwn ? "border-purple-200/70 bg-purple-700/30" : "border-sky-400/70 bg-dark-700/70"}`}
+              title="Перейти к исходному сообщению"
+            >
+              <span className="block truncate text-[10px] font-semibold opacity-90">
+                {msg.replyTo.senderDisplayName || "Исходное сообщение"}
+              </span>
+              <span className="block max-w-full truncate text-[11px] opacity-80">
+                {getReplyPreviewText(msg.replyTo)}
+              </span>
+            </button>
+          )}
           {msg.isLegacy && (
             <div className="mb-1 text-[9px] uppercase tracking-wide text-amber-300/80">
               Legacy · не зашифровано
@@ -256,15 +366,26 @@ function MessageBubble({
           {downloading && <div className="text-xs text-gray-400">Скачиваем и расшифровываем…</div>}
           {downloadError && <div className="text-xs text-red-300">{downloadError}</div>}
           {msg.messageType === "text" && msg.content && (
-            <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
+            <p className="text-sm whitespace-pre-wrap break-words">{renderMessageText(msg.content, members)}</p>
           )}
           <div
             className={`mt-1 flex items-center justify-end gap-1 text-[10px] ${
               isOwn ? "text-purple-200" : "text-gray-500"
             }`}
           >
+            {canReply && (
+              <button
+                type="button"
+                onClick={() => onReply(msg)}
+                className="mr-1 rounded px-1 text-[12px] opacity-70 transition hover:bg-black/10 hover:opacity-100"
+                title="Ответить на сообщение"
+                aria-label="Ответить на сообщение"
+              >
+                ↩
+              </button>
+            )}
             {formatTime(msg.createdAt)}
-            {isOwn && <MessageStatus status={status} />}
+            {isOwn && <MessageStatus status={status} title={statusTitle} />}
           </div>
           {isOwn && status === "error" && (
             <div className="mt-1 flex flex-wrap items-center justify-end gap-2 text-[10px]">
@@ -298,6 +419,7 @@ export default function ChatWindow({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const localMessagesRef = useRef<ChatMessage[]>([]);
   const [newMessage, setNewMessage] = useState("");
+  const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [sendError, setSendError] = useState("");
@@ -336,6 +458,7 @@ export default function ChatWindow({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const messageInputRef = useRef<HTMLInputElement>(null);
   const prevMsgCountRef = useRef(0);
   const initialLoadRef = useRef(true);
   const reportedReadRef = useRef<Set<number | string>>(new Set());
@@ -461,6 +584,7 @@ export default function ChatWindow({
 
   useEffect(() => {
     initialLoadRef.current = true;
+    setReplyingTo(null);
     reportedReadRef.current = new Set();
     reportedDeliveredRef.current = new Set();
     setReceipts({});
@@ -650,6 +774,50 @@ export default function ChatWindow({
     return msg.deliveryStatus || "sent";
   }, [currentUser.id, receipts]);
 
+  const handleReplyToMessage = useCallback((message: ChatMessage) => {
+    if (
+      chat.securityMode === "e2ee" &&
+      (message.isLegacy || typeof message.id !== "string" || message.id.startsWith("outbox:"))
+    ) return;
+    setReplyingTo(message);
+    window.setTimeout(() => messageInputRef.current?.focus(), 0);
+  }, [chat.securityMode]);
+
+  const handleMentionMessageAuthor = useCallback((message: ChatMessage) => {
+    const member = chat.members.find((candidate) => candidate.id === Number(message.senderId));
+    if (!member) return;
+    setNewMessage((current) => {
+      const prefix = current.replace(/\s+$/u, "");
+      return `${prefix ? `${prefix} ` : ""}@${member.username} `;
+    });
+    window.setTimeout(() => messageInputRef.current?.focus(), 0);
+  }, [chat.members]);
+
+  const jumpToMessage = useCallback((messageId: number | string) => {
+    const element = messageElsRef.current.get(messageId);
+    if (!element) return;
+    element.scrollIntoView({ behavior: "smooth", block: "center" });
+    element.classList.add("ring-2", "ring-sky-400/70");
+    window.setTimeout(() => element.classList.remove("ring-2", "ring-sky-400/70"), 1200);
+  }, []);
+
+  const getMessageReceiptTitle = useCallback((message: ChatMessage): string | undefined => {
+    if (message.senderId !== currentUser.id) return undefined;
+    const summary = typeof message.id === "number" ? receipts[message.id] : undefined;
+    const readByCount = summary?.readByCount ?? message.readByCount;
+    const deliveredToCount = summary?.deliveredToCount ?? message.deliveredToCount;
+    const recipientCount = summary?.recipientCount ?? message.recipientCount;
+    if (message.deliveryStatus === "read" && readByCount !== undefined && recipientCount !== undefined) {
+      return `Прочитано: ${readByCount} из ${recipientCount}`;
+    }
+    if (message.deliveryStatus === "delivered" && deliveredToCount !== undefined && recipientCount !== undefined) {
+      return `Доставлено: ${deliveredToCount} из ${recipientCount}`;
+    }
+    if (summary?.status === "read") return `Прочитано: ${summary.readByCount} из ${summary.recipientCount}`;
+    if (summary?.status === "delivered") return `Доставлено: ${summary.deliveredToCount} из ${summary.recipientCount}`;
+    return undefined;
+  }, [currentUser.id, receipts]);
+
   const prepareEncryptedChat = useCallback(async () => {
     if (chat.securityMode !== "e2ee" || !chat.matrixRoomId || !currentUser.matrixSession) return;
 
@@ -698,11 +866,29 @@ export default function ChatWindow({
             const sender = chat.members.find((member) => member.id === senderId);
             const isFile = message.msgtype === "m.file";
             const mimeType = message.mimeType || null;
+            const replySenderId = message.replyTo ? Number(message.replyTo.senderUserId) : Number.NaN;
+            const replySender = Number.isFinite(replySenderId)
+              ? chat.members.find((member) => member.id === replySenderId)
+              : undefined;
+            const replyIsFile = message.replyTo?.msgtype === "m.file";
+            const replyTo: ChatMessageReply | null = message.replyToEventId ? {
+              id: message.replyToEventId,
+              senderId: Number.isFinite(replySenderId) ? replySenderId : "",
+              senderDisplayName: replySender?.displayName || "Исходное сообщение",
+              senderUsername: replySender?.username,
+              content: replyIsFile ? null : message.replyTo?.body || null,
+              messageType: replyIsFile ? "file" : "text",
+              fileName: replyIsFile ? message.replyTo?.body || "Файл" : null,
+            } : null;
             return {
               id: message.eventId,
               chatId: chat.id,
               senderId,
               content: isFile ? null : message.body,
+              replyTo,
+              readByCount: message.readByCount,
+              recipientCount: message.recipientCount,
+              mentionUserIds: message.mentionUserIds,
               messageType: isFile
                 ? mimeType?.startsWith("image/")
                   ? "image"
@@ -732,7 +918,7 @@ export default function ChatWindow({
           setMessageReadError("Не удалось загрузить зашифрованные сообщения на этом устройстве.");
         }
       } else if (chat.securityMode === "e2ee" && chat.matrixRoomId) {
-        setMessageReadError("На этой вкладке нет активной Matrix-сессии. Войдите снова, чтобы читать новые сообщения.");
+        setMessageReadError("На этой вкладке нет Matrix-сессии. Восстановите её в боковой панели; локальные ключи E2EE сохранятся.");
       } else {
         setMessageReadError("");
       }
@@ -878,6 +1064,8 @@ export default function ChatWindow({
           roomId: chat.matrixRoomId,
           isDirect: !chat.isGroup,
           body: msgText,
+          replyTo: replyingTo ? createMatrixReplyReference(replyingTo, currentUser.matrixSession) : undefined,
+          mentionUserIds: getMatrixMentionUserIds(msgText, chat.members, currentUser.matrixSession),
         });
         const optimisticMessage: ChatMessage = {
           ...outboxItemToChatMessage(item, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor, avatarUrl: currentUser.avatarUrl }, chat.id),
@@ -887,6 +1075,7 @@ export default function ChatWindow({
         };
         updateLocalMessages((current) => [...current, optimisticMessage]);
         setNewMessage("");
+        setReplyingTo(null);
         setSending(false);
         scrollToBottom("smooth");
         void sendQueuedEncryptedMessage(currentUser.matrixSession, item.id).catch(() => undefined);
@@ -905,7 +1094,11 @@ export default function ChatWindow({
         const response = await fetch("/api/messages", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chatId: chat.id, content: msgText }),
+          body: JSON.stringify({
+            chatId: chat.id,
+            content: msgText,
+            replyToMessageId: typeof replyingTo?.id === "number" ? replyingTo.id : null,
+          }),
         });
         const result = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(result.error || "Не удалось отправить сообщение");
@@ -914,6 +1107,7 @@ export default function ChatWindow({
       }
 
       await loadMessages();
+      setReplyingTo(null);
       onMessageSent();
       scrollToBottom("smooth");
     } catch (err) {
@@ -949,6 +1143,9 @@ export default function ChatWindow({
         const formData = new FormData();
         formData.append("file", file);
         formData.append("chatId", String(chat.id));
+        if (typeof replyingTo?.id === "number") {
+          formData.append("replyToMessageId", String(replyingTo.id));
+        }
 
         const response = await fetch("/api/upload", { method: "POST", body: formData });
         const uploadResult = await response.json().catch(() => ({}));
@@ -979,16 +1176,19 @@ export default function ChatWindow({
         fileUrl.searchParams.set("chatId", String(chat.id));
         fileUrl.searchParams.set("fileId", uploadResult.telegramFileId);
         await sendEncryptedAttachment(currentUser.matrixSession, chat.matrixRoomId, {
+          chatId: chat.id,
           fileName: file.name,
           mimeType: file.type || "application/octet-stream",
           fileSize: file.size,
           encryptedFile: { ...encrypted.info, url: fileUrl.toString() },
+          replyTo: replyingTo ? createMatrixReplyReference(replyingTo, currentUser.matrixSession) : undefined,
         });
       } else {
         throw new Error("Этот чат не готов к безопасной загрузке файлов");
       }
 
       await loadMessages();
+      setReplyingTo(null);
       onMessageSent();
       scrollToBottom("smooth");
     } catch (err) {
@@ -1108,6 +1308,12 @@ export default function ChatWindow({
               onRetry={handleRetryMessage}
               registerRef={registerMessageEl}
               status={getMessageStatus(msg)}
+              statusTitle={getMessageReceiptTitle(msg)}
+              members={chat.members}
+              canReply={chat.securityMode === "public" || (!msg.isLegacy && typeof msg.id === "string" && !msg.id.startsWith("outbox:"))}
+              onReply={handleReplyToMessage}
+              onMention={chat.isGroup ? handleMentionMessageAuthor : undefined}
+              onJumpToMessage={jumpToMessage}
             />
           ))
         )}
@@ -1123,6 +1329,25 @@ export default function ChatWindow({
               Осталось: {formatBanRemaining(banExpiresAt - banNow)} · доступ восстановится {new Date(banExpiresAt).toLocaleString("ru-RU")}.
             </div>
             {banReason && <div className="mt-1">Причина: {banReason}</div>}
+          </div>
+        )}
+        {replyingTo && (
+          <div className="mb-2 flex items-center gap-3 rounded-xl border border-sky-400/20 bg-sky-400/5 px-3 py-2">
+            <div className="min-w-0 flex-1 border-l-2 border-sky-400 pl-2">
+              <div className="truncate text-[11px] font-semibold text-sky-200">
+                Ответ: {replyingTo.senderDisplayName}
+              </div>
+              <div className="truncate text-xs text-gray-400">{getReplyPreviewText(replyingTo)}</div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setReplyingTo(null)}
+              className="rounded-lg p-1 text-gray-400 hover:bg-dark-600 hover:text-white"
+              aria-label="Отменить ответ"
+              title="Отменить ответ"
+            >
+              ×
+            </button>
           </div>
         )}
         {sendError && (
@@ -1156,6 +1381,7 @@ export default function ChatWindow({
           </button>
 
           <input
+            ref={messageInputRef}
             type="text"
             value={newMessage}
             onChange={(e) => setNewMessage(e.target.value)}
