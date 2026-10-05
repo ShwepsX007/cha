@@ -32,7 +32,6 @@ export async function GET() {
         role: users.role,
         bannedUntil: users.bannedUntil,
         banReason: users.banReason,
-        matrixResetRequired: users.matrixResetRequired,
       })
       .from(users)
       .where(eq(users.id, payload.userId));

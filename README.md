@@ -1,8 +1,21 @@
 # Secret Chat (chata)
 
-Веб-мессенджер на Next.js 16 + PostgreSQL: общий публичный чат, приватные чаты и
-группы с Matrix E2EE, вложения через Telegram, push-уведомления, админ-панель.
-Интерфейс на русском, хранилище — PostgreSQL (Drizzle ORM).
+Веб-мессенджер на Next.js 16 + PostgreSQL: общий публичный чат, личные чаты и
+группы, вложения через Telegram, receipt-статусы (отправлено/доставлено/прочитано),
+push-уведомления, админ-панель. Интерфейс на русском, хранилище — PostgreSQL
+(Drizzle ORM).
+
+## Удаление Matrix (2026-10-05)
+
+Раньше личные чаты были построены на Matrix/Synapse с E2EE. От этого слоя
+отказались: он давал большую часть «неотправленных сообщений», «сессия
+отвалилась», «нужно восстановить ключи» и прочей операционной боли при
+сомнительной для внутреннего чата пользе. Теперь **все чаты (общие, личные,
+группы) идут через один и тот же путь**: PostgreSQL для сообщений, Telegram для
+вложений, web-push для уведомлений. `drizzle/0010_drop_matrix.sql` удаляет
+Matrix-колонки и таблицы; Synapse с сервера можно выключить и удалить, приложение
+его больше не вызывает. Исторические документы по прежнему устройству — в `docs/`
+(e2ee-implementation.md, matrix-session-and-push-diagnosis), помечены как архив.
 
 ## Почему приложение «запускается, но не работает»
 
@@ -84,17 +97,6 @@ location / {
     proxy_read_timeout 600s;
     client_max_body_size 50m;
 }
-
-# только если настроен Matrix/Synapse
-location ^~ /_matrix/ {
-    proxy_pass http://127.0.0.1:8008;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_read_timeout 600s;
-    client_max_body_size 50m;
-}
 ```
 
 ## Переменные окружения
@@ -108,8 +110,6 @@ location ^~ /_matrix/ {
 | `DATABASE_POOL_MAX` | нет | Размер пула соединений на процесс (по умолчанию 10) |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | нет | Хранилище вложений |
 | `BOT_OWNER_TELEGRAM_ID` | нет | Владелец Telegram-бота администратора |
-| `MATRIX_PUBLIC_URL`, `MATRIX_INTERNAL_URL`, `MATRIX_SERVER_NAME`, `MATRIX_ADMIN_ACCESS_TOKEN` | нет | Matrix E2EE; задаются **только все вместе** |
-| `MATRIX_REFRESH_TOKENS` | нет | `1` — запрашивать refresh-токены Matrix (тогда в Synapse нужно выставить длинный `refreshable_access_token_lifetime`); по умолчанию выключено, токены не истекают |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_EMAIL` | нет | Web Push; `VAPID_EMAIL` обязателен (`mailto:` или `https:`) |
 | `NEXT_PUBLIC_VAPID_PUBLIC_KEY` | нет | Запасной публичный ключ для браузера; обычно не нужен — клиент получает ключ из `/api/push/subscribe` |
 
@@ -120,10 +120,9 @@ Web Push настраивается тремя переменными `VAPID_*`:
 браузере. Страница должна открываться по HTTPS: вне secure context `serviceWorker`
 недоступен, и приложение честно пишет «Push требует HTTPS».
 
-Push отправляется в общий чат сервером при сохранении сообщения, а в приватные
-Matrix-чаты — через ретрансляцию `/api/messages/matrix-push` из браузера
-отправителя (содержимое E2EE-сообщений в уведомления не попадает). Уведомление
-намеренно не показывается, если нужный чат открыт в фокусе, и не отправляется
+Push рассылает **сервер** при сохранении сообщения в любой чат (общий, личный,
+групповой) — браузер отправителя не участвует. Уведомление намеренно не
+показывается, если нужный чат открыт у получателя в фокусе, и не отправляется
 отправителю и в заглушённый чат. На iOS доставка работает только для
 установлённого PWA («Добавить на главный экран»).
 
@@ -147,9 +146,29 @@ push-провайдера дольше 10 секунд.
 (`pushsubscriptionchange` в service worker) — «включать тумблер заново» после
 того, как уведомления однажды работали, не нужно.
 
-Без Matrix приложение работает в режиме «только общий чат»: приватные чаты не
-создаются, старые приватные чаты помечены как `legacy`, новые сообщения в них
-не отправляются и не сохраняются в открытом виде.
+### Что сделать на сервере после этого обновления
+
+```bash
+cd /path/to/chata
+git pull
+npm ci                       # зависимости стали меньше: matrix-js-sdk больше нет
+npm run db:setup             # применит 0010_drop_matrix.sql
+npm run build
+npx pm2 restart chata --update-env
+```
+
+В `.env` можно удалить переменные `MATRIX_*` (приложение их больше не читает),
+а сам Synapse — остановить и удалить: контейнер (`docker stop synapse && docker
+rm synapse`) или systemd-юнит (`systemctl disable --now matrix-synapse`). База
+Synapse (`synapse_db`) и nginx-проксирование `/_matrix/` больше не нужны —
+удалите их, когда убедитесь, что чат работает. Старые E2EE-переписки жили только
+в Synapse: после удаления они не переносятся в PostgreSQL (так было всегда с
+e2ee — сервер не имел доступа к ключам), поэтому перед удалением при желании
+сделайте дамп базы Synapse. Удаление истории Synapse — необратимая операция,
+выполняйте её только если точно решили.
+
+Старые приватные чаты в списке не исчезнут: `security_mode` удалён, и они
+становятся обычными чатами приложения — с новой перепиской в PostgreSQL.
 
 ## Проверки
 
@@ -179,10 +198,7 @@ SMOKE_ALLOW_WRITES=1 npm run smoke   # + регистрация, сообщен�
 | `/api/health` → `"schema":"missing"` | `npm run db:setup` |
 | Вход выдаёт «Ошибка сервера» | Не задан `JWT_SECRET` (production), смотреть `pm2 logs chata` |
 | Аватарка загружается, но картинка не открывается (404) | Обновление до версии, где аватары отдаёт `/avatars/<file>` из `UPLOAD_DIR`; старые сборки хранили их в `public/`, который Next.js кэширует на старте процесса |
-| «Matrix недоступен. Приватные сообщения не отправляются» | `MATRIX_*` не заданы или Synapse недоступен — общий чат продолжает работать |
 | «Push-уведомления не настроены на сервере» | Не заданы VAPID-ключи (см. `.env.example`) |
-| Чаты не создаются | Приватные чаты требуют Matrix-сессии; проверьте `matrix` в `/api/health` |
-| Matrix «отваливается» при каждом обновлении страницы | Проверьте `select id, username, matrix_reset_required from users;` (флаг `true` = устройство отозвано, нужно один раз ввести пароль в «Восстановить Matrix-сессию») и `refreshable_access_token_lifetime` в `homeserver.yaml`; в консоли браузера признак — `Token no longer valid - assuming logout`. Приложение больше не запрашивает refresh-токены, поэтому токены Synapse не истекают, если `MATRIX_REFRESH_TOKENS` не включён |
 | Уведомления не приходят, хотя подписка есть | `curl -s -X POST .../api/push/test`; `401/403` — VAPID-ключи не пара, `404/410` — пересоздать подписку, пустые коды — VPS не видит push-сервис; `missingEnv` в `/api/push/status` = не хватает переменных в `.env` |
 | Список чатов пуст, хотя «Общий чат» был | Обновление восстановит членство автоматически при открытии чатов (`ensureGeneralChatMembership`) |
 
@@ -200,10 +216,9 @@ psql "$DATABASE_URL" -c '\dt'          # список таблиц
 src/app/api/**        HTTP API (auth, chats, messages, files, profile, admin, push)
 src/app/avatars/**    отдача загруженных аватарок (runtime-файлы вне public/)
 src/components/**     интерфейс мессенджера и админ-панели
-src/lib/matrix/**     Matrix/Synapse: логин, E2EE, восстановление ключей
 src/db/schema.ts      схема Drizzle (источник истины)
 drizzle/*.sql         идемпотентные миграции; применяются npm run db:setup
 scripts/db-setup.mjs  применение миграций без drizzle-kit (работает в prod)
 scripts/admin-bot.ts  Telegram-бот для bootstrap/ротации админа
-docs/                 отчёты аудита и описание E2EE
+docs/                 исторические отчёты аудита и архив по удалённому E2EE
 ```

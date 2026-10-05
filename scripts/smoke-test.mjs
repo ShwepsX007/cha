@@ -62,19 +62,6 @@ async function main() {
   });
   check("password change without a session is 401", passwordChangeUnauthorized.response.status === 401);
 
-  // Silent Matrix session recovery must never be callable anonymously, and must
-  // not accept a body without a refresh token/device ID.
-  const matrixRefreshAnonymous = await json("/api/auth/matrix-refresh", { method: "POST" });
-  check("POST /api/auth/matrix-refresh without a session is 401",
-    matrixRefreshAnonymous.response.status === 401, `HTTP ${matrixRefreshAnonymous.response.status}`);
-
-  const privatePingAnonymous = await json("/api/messages/private-ping", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chatId: 1, eventId: "$smoke" }),
-  });
-  check("POST /api/messages/private-ping without a session is 401", privatePingAnonymous.response.status === 401);
-
   const pushStatusPublic = await json("/api/push/status");
   check("push status without a session is 401", pushStatusPublic.response.status === 401);
 
@@ -127,21 +114,35 @@ async function main() {
     const pushStatus = await json("/api/push/status", {}, regA.cookie);
     check("authenticated push status reports subscriptions", pushStatus.response.ok &&
       Number.isInteger(pushStatus.body?.subscriptionCount), `HTTP ${pushStatus.response.status}`);
-    const matrixRefreshBadBody = await json("/api/auth/matrix-refresh", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceId: "SMOKEDEVICE" }),
-    }, regA.cookie);
-    check("matrix-refresh rejects a body without a refresh token",
-      matrixRefreshBadBody.response.status === 400, `HTTP ${matrixRefreshBadBody.response.status}`);
-
     const pushTest = await json("/api/push/test", { method: "POST" }, regA.cookie);
     check("push test endpoint gives a clear unconfigured/unsubscribed result",
       pushTest.response.status === 409 || pushTest.response.status === 503,
       `HTTP ${pushTest.response.status} ${JSON.stringify(pushTest.body)}`);
 
+    // A private chat is just a chat now: create a DM, post, read it back.
+    const dmChat = await json("/api/chats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetUserId: regB.body?.user?.id }),
+    }, regA.cookie);
+    check("direct chat created", dmChat.response.ok && dmChat.body?.chat?.id > 0,
+      `HTTP ${dmChat.response.status}`);
+    if (dmChat.body?.chat?.id) {
+      const dmMessage = await json("/api/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chatId: dmChat.body.chat.id, content: "smoke dm ping" }),
+      }, regA.cookie);
+      check("message accepted into the direct chat", dmMessage.response.status === 200,
+        `HTTP ${dmMessage.response.status} ${JSON.stringify(dmMessage.body)}`);
+      const dmTimeline = await json(`/api/messages?chatId=${dmChat.body.chat.id}`, {}, regA.cookie);
+      check("direct chat timeline contains the message",
+        Array.isArray(dmTimeline.body?.messages) &&
+        dmTimeline.body.messages.some((message) => message.content === "smoke dm ping"));
+    }
+
     const chats = await json("/api/chats", {}, regA.cookie);
-    const general = chats.body?.chats?.find((chat) => chat.isGroup && chat.securityMode === "public");
+    const general = chats.body?.chats?.find((chat) => chat.isGeneralChat);
     check("user A is a member of the public chat", Boolean(general), JSON.stringify(chats.body).slice(0, 200));
 
     if (general) {

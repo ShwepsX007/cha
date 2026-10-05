@@ -4,6 +4,11 @@ import { chatMembers, chats } from "@/db/schema";
 
 export const GENERAL_CHAT_NAME = "Общий чат";
 
+/** The general chat is identified by its reserved name; no flags or modes. */
+export function isGeneralChat(chat: { name: string | null; isGroup: boolean }): boolean {
+  return chat.isGroup && chat.name === GENERAL_CHAT_NAME;
+}
+
 /**
  * Makes sure the public "Общий чат" exists and that `userId` is a member of it.
  *
@@ -28,7 +33,6 @@ export async function ensureGeneralChatMembership(userId: number): Promise<numbe
           and(
             eq(chats.name, GENERAL_CHAT_NAME),
             eq(chats.isGroup, true),
-            eq(chats.securityMode, "public"),
           ),
         )
         .limit(1);
@@ -41,7 +45,6 @@ export async function ensureGeneralChatMembership(userId: number): Promise<numbe
             name: GENERAL_CHAT_NAME,
             isGroup: true,
             createdBy: userId,
-            securityMode: "public",
           })
           .returning({ id: chats.id });
         chatId = created.id;

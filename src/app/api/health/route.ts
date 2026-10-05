@@ -1,6 +1,5 @@
 import { db } from "@/db";
 import { sql } from "drizzle-orm";
-import { getMatrixHealthStatus, isMatrixConfigured, matrixRefreshTokensEnabled } from "@/lib/matrix/server";
 import { isPushConfigured, missingPushEnv } from "@/lib/push";
 
 export const dynamic = "force-dynamic";
@@ -28,11 +27,9 @@ const REQUIRED_TABLES = [
 export async function GET() {
   const config = {
     jwtSecret: Boolean(process.env.JWT_SECRET),
-    matrix: isMatrixConfigured(),
     telegram: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID),
     // Same predicate the sending code uses, so the probe cannot lie about push.
     push: isPushConfigured(),
-    matrixRefreshTokens: matrixRefreshTokensEnabled(),
   };
   const pushMissing = missingPushEnv();
 
@@ -60,7 +57,6 @@ export async function GET() {
     schema = "missing";
   }
 
-  const matrix = await getMatrixHealthStatus();
   const ok = schema === "ok" && config.jwtSecret;
 
   return Response.json(
@@ -70,7 +66,6 @@ export async function GET() {
       schema,
       ...(missingTables.length > 0 ? { missingTables, hint: "Run: npm run db:setup" } : {}),
       ...(pushMissing.length > 0 ? { pushMissingEnv: pushMissing } : {}),
-      matrix,
       config,
     },
     { status: ok ? 200 : 503 },

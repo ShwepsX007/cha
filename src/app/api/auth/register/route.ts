@@ -4,7 +4,6 @@ import { users } from "@/db/schema";
 import { eq, sql } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import { createToken } from "@/lib/auth";
-import { createMatrixSession, type MatrixLoginResult } from "@/lib/matrix/server";
 import { ensureGeneralChatMembership } from "@/lib/chats";
 
 // Reserved for the Telegram bootstrap bot: anyone who registers this name
@@ -18,7 +17,7 @@ const AVATAR_COLORS = [
 
 export async function POST(req: NextRequest) {
   try {
-    const { username, password, displayName, matrixDeviceId } = await req.json();
+    const { username, password, displayName } = await req.json();
 
     if (!username || !password) {
       return NextResponse.json({ error: "Логин и пароль обязательны" }, { status: 400 });
@@ -72,20 +71,6 @@ export async function POST(req: NextRequest) {
     // member row of the chat and could insert duplicate memberships.
     await ensureGeneralChatMembership(user.id);
 
-    let matrix: MatrixLoginResult = { availability: "unavailable", session: null };
-    try {
-      matrix = await createMatrixSession({
-        appUserId: user.id,
-        username: user.username,
-        displayName: user.displayName,
-        password,
-        deviceId: matrixDeviceId,
-      });
-    } catch (error) {
-      // Registration remains available for the public chat if Matrix is offline.
-      console.error("Matrix session unavailable:", error);
-    }
-
     const token = await createToken(user.id, user.username);
 
     const response = NextResponse.json({
@@ -99,11 +84,7 @@ export async function POST(req: NextRequest) {
         role: user.role,
         bannedUntil: user.bannedUntil,
         banReason: user.banReason,
-        matrixResetRequired: user.matrixResetRequired,
       },
-      matrixAvailability: matrix.availability,
-      matrixSession: matrix.session,
-      matrixResetRequired: false,
     });
     response.cookies.set("auth_token", token, {
       httpOnly: true,

@@ -121,37 +121,6 @@ export async function notifyChatMessage({
   }
 }
 
-/**
- * Notification for an end-to-end encrypted chat. Deliberately content-free:
- * the plaintext never reaches this server, so the alert can only announce that
- * something arrived. Unlike the encrypted relay in
- * `/api/messages/matrix-push`, this path needs nothing but the app session, so
- * a revoked Matrix device, a rotated access token or a re-created room can no
- * longer turn into "private chats never notify".
- */
-export async function notifyPrivateChatMessage({
-  chatId,
-  senderId,
-  senderName,
-}: {
-  chatId: number;
-  senderId: number;
-  senderName: string;
-}): Promise<ChatPushFanOutResult> {
-  try {
-    return await fanOutToChatMembers({
-      chatId,
-      senderId,
-      title: senderName,
-      body: "Новое сообщение в приватном чате",
-      url: `/?chatId=${chatId}`,
-    });
-  } catch (err) {
-    console.error("Private chat push fan-out failed:", err instanceof Error ? err.name : "UnknownError");
-    return { configured: false, recipients: 0, mutedRecipients: 0, sent: 0, failed: 1 };
-  }
-}
-
 export function messagePreview(kind: string, content: string | null, fileName: string | null) {
   if (kind === "text") return content?.trim() || "";
   if (kind === "image") return `📷 ${fileName || "Фото"}`;

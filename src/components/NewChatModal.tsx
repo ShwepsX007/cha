@@ -1,8 +1,6 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { createEncryptedRoom } from "@/lib/matrix/client";
-import type { MatrixSession } from "@/lib/matrix/types";
 import Avatar from "./Avatar";
 
 interface AvailableUser {
@@ -12,20 +10,12 @@ interface AvailableUser {
   avatarColor: string;
   avatarUrl: string | null;
   lastSeen: string | null;
-  matrixUserId: string | null;
-}
-
-interface CurrentUser {
-  id: number;
-  matrixSession?: MatrixSession | null;
 }
 
 export default function NewChatModal({
-  currentUser,
   onClose,
   onChatCreated,
 }: {
-  currentUser: CurrentUser;
   onClose: () => void;
   onChatCreated: (chatId: number) => void;
 }) {
@@ -58,63 +48,24 @@ export default function NewChatModal({
     if (creating) return;
     setError("");
 
-    const session = currentUser.matrixSession;
-    if (!session) {
-      setError("Matrix не подключён. Зашифрованные чаты пока недоступны.");
-      return;
-    }
-
-    const targetUsers = memberUserIds
-      .map((userId) => users.find((user) => user.id === userId))
-      .filter((user): user is AvailableUser => Boolean(user));
-    if (targetUsers.length !== memberUserIds.length || targetUsers.some((user) => !user.matrixUserId)) {
-      setError("Не удалось подготовить Matrix-аккаунты участников. Попробуйте позже.");
-      return;
-    }
-
     const request = isGroup
-      ? { isGroup: true, memberUserIds, name: groupName.trim() || "Приватная группа" }
+      ? { isGroup: true, memberUserIds, name: groupName.trim() || "Группа" }
       : { targetUserId: memberUserIds[0] };
 
     setCreating(true);
     try {
-      const firstResponse = await fetch("/api/chats", {
+      const response = await fetch("/api/chats", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(request),
       });
-      const firstData = await firstResponse.json();
-      if (!firstResponse.ok) {
-        throw new Error(firstData.error || "Не удалось проверить чат");
-      }
-
-      if (firstData.chat && !firstData.requiresEncryptedRoom) {
-        onChatCreated(firstData.chat.id);
-        return;
-      }
-
-      const matrixRoomId = await createEncryptedRoom(session, {
-        name: isGroup ? (groupName.trim() || "Приватная группа") : targetUsers[0].displayName,
-        inviteUserIds: targetUsers.map((user) => user.matrixUserId as string),
-        isDirect: !isGroup,
-      });
-
-      const response = await fetch("/api/chats", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ...request,
-          matrixRoomId,
-          matrixAccessToken: session.accessToken,
-        }),
-      });
       const data = await response.json();
       if (!response.ok || !data.chat) {
-        throw new Error(data.error || "Не удалось сохранить зашифрованный чат");
+        throw new Error(data.error || "Не удалось создать чат");
       }
       onChatCreated(data.chat.id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Не удалось создать зашифрованный чат");
+      setError(err instanceof Error ? err.message : "Не удалось создать чат");
     } finally {
       setCreating(false);
     }
@@ -137,8 +88,8 @@ export default function NewChatModal({
       <div className="bg-dark-800 rounded-2xl border border-dark-600 w-full max-w-md max-h-[80vh] flex flex-col">
         <div className="p-4 border-b border-dark-600 flex items-center justify-between">
           <div>
-            <h3 className="text-lg font-semibold">{groupMode ? "Новая приватная группа" : "Новый личный чат"}</h3>
-            <p className="text-xs text-gray-500 mt-1">Комната Matrix создаётся с E2EE до первого сообщения</p>
+            <h3 className="text-lg font-semibold">{groupMode ? "Новая группа" : "Новый личный чат"}</h3>
+            <p className="text-xs text-gray-500 mt-1">Личный чат и история хранятся на сервере, как в обычных мессенджерах</p>
           </div>
           <button
             onClick={onClose}
@@ -204,12 +155,6 @@ export default function NewChatModal({
           </div>
         )}
 
-        {!currentUser.matrixSession && (
-          <div className="mx-3 mb-2 p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-200 text-sm">
-            Matrix E2EE ещё не настроено или недоступно. Личные сообщения не будут отправляться открытым текстом.
-          </div>
-        )}
-
         <div className="flex-1 overflow-y-auto p-2">
           {loading ? (
             <div className="p-6 text-center text-gray-500">Загрузка...</div>
@@ -222,7 +167,7 @@ export default function NewChatModal({
               <button
                 key={user.id}
                 onClick={() => startChat(user.id)}
-                disabled={creating || !currentUser.matrixSession || !user.matrixUserId}
+                disabled={creating}
                 className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-dark-700 transition-colors text-left disabled:opacity-50 ${groupMode && selectedUserIds.includes(user.id) ? "bg-purple-500/20" : ""}`}
               >
                 <Avatar src={user.avatarUrl} name={user.displayName} color={user.avatarColor} size={40} />
@@ -250,10 +195,10 @@ export default function NewChatModal({
           <div className="p-3 border-t border-dark-600">
             <button
               onClick={() => void createChat(selectedUserIds, true)}
-              disabled={creating || selectedUserIds.length < 2 || !currentUser.matrixSession}
+              disabled={creating || selectedUserIds.length < 2}
               className="w-full py-2.5 bg-purple-500 hover:bg-purple-600 disabled:opacity-40 text-white rounded-xl font-medium text-sm"
             >
-              {creating ? "Создаём зашифрованную группу…" : `Создать группу (${selectedUserIds.length})`}
+              {creating ? "Создаём группу…" : `Создать группу (${selectedUserIds.length})`}
             </button>
           </div>
         )}

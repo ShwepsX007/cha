@@ -3,7 +3,6 @@ import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { users } from "@/db/schema";
 import { requireProfile, sanitizeDisplayName, validateDisplayName } from "@/lib/profile";
-import { synchronizeMatrixAppUserPassword } from "@/lib/matrix/server";
 
 export const dynamic = "force-dynamic";
 
@@ -30,7 +29,6 @@ export async function PATCH(req: NextRequest) {
         role: users.role,
         bannedUntil: users.bannedUntil,
         banReason: users.banReason,
-        matrixResetRequired: users.matrixResetRequired,
       });
 
     if (!updated) return NextResponse.json({ error: "Пользователь не найден" }, { status: 404 });

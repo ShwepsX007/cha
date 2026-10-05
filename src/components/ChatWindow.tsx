@@ -1,25 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import type { MouseEvent } from "react";
-import type { User, Chat, ChatMessage, ChatMessageReply } from "./ChatApp";
-import { decryptAttachment, encryptAttachment } from "matrix-encrypt-attachment";
-import {
-  ensureDirectRoomHistoryVisibility,
-  ensureEncryptedRoomReady,
-  getEncryptedRoomMessages,
-  createEncryptedOutboxMessage,
-  getPendingEncryptedMessages,
-  hasMatrixInvitePermission,
-  MATRIX_OUTBOX_EVENT,
-  retryQueuedEncryptedMessage,
-  sendEncryptedAttachment,
-  sendQueuedEncryptedMessage,
-  sendMatrixReadReceipt,
-  type EncryptedOutboxMessage,
-  type MatrixOutboxUpdate,
-  type MatrixReplyReference,
-} from "@/lib/matrix/client";
+import type { User, Chat, ChatMessage } from "./ChatApp";
 import AddGroupMembersModal from "./AddGroupMembersModal";
 import Avatar from "./Avatar";
 import MessageStatus from "./MessageStatus";
@@ -58,7 +40,8 @@ function formatBanRemaining(milliseconds: number): string {
   return `${seconds} сек`;
 }
 
-function getReplyPreviewText(message: Pick<ChatMessageReply, "content" | "messageType" | "fileName">): string {
+function getReplyPreviewText(message: ChatMessage["replyTo"]): string {
+  if (!message) return "Сообщение";
   if (message.messageType === "image") return `📷 ${message.fileName || "Фото"}`;
   if (message.messageType === "video") return `🎬 ${message.fileName || "Видео"}`;
   if (message.messageType !== "text") return `📎 ${message.fileName || message.content || "Файл"}`;
@@ -82,142 +65,36 @@ function renderMessageText(text: string, members: User[]) {
   });
 }
 
-function getMatrixMentionUserIds(text: string, members: User[], session: NonNullable<User["matrixSession"]>): string[] {
-  const separator = session.userId.indexOf(":");
-  const serverName = separator >= 0 ? session.userId.slice(separator + 1) : "";
-  if (!serverName) return [];
-  return members
-    .filter((member) => {
-      const mentionPattern = new RegExp(`(^|[^A-Za-z0-9_])@${escapeRegExp(member.username)}(?=$|[^A-Za-z0-9_])`, "i");
-      return mentionPattern.test(text);
-    })
-    .map((member) => `@chata_u${member.id}:${serverName}`);
-}
-
-function createMatrixReplyReference(
-  message: ChatMessage,
-  session: NonNullable<User["matrixSession"]>,
-): MatrixReplyReference | undefined {
-  if (message.isLegacy || typeof message.id !== "string" || message.id.startsWith("outbox:")) return undefined;
-  const senderId = Number(message.senderId);
-  const separator = session.userId.indexOf(":");
-  const serverName = separator >= 0 ? session.userId.slice(separator + 1) : "";
-  if (!Number.isInteger(senderId) || senderId <= 0 || !serverName) return undefined;
-  return {
-    eventId: message.id,
-    senderMxid: `@chata_u${senderId}:${serverName}`,
-    senderUserId: String(senderId),
-    senderDisplayName: message.senderDisplayName,
-    senderUsername: message.senderUsername,
-    body: getReplyPreviewText(message),
-    messageType: message.messageType,
-  };
-}
-
-function outboxItemToChatMessage(
-  item: EncryptedOutboxMessage,
-  user: Pick<User, "id" | "username" | "displayName" | "avatarColor" | "avatarUrl">,
-  chatId: number,
-): ChatMessage {
-  return {
-    id: `outbox:${item.id}`,
-    outboxId: item.id,
-    chatId,
-    senderId: user.id,
-    content: item.body,
-    replyTo: item.replyTo ? {
-      id: item.replyTo.eventId,
-      senderId: item.replyTo.senderUserId,
-      senderDisplayName: item.replyTo.senderDisplayName,
-      senderUsername: item.replyTo.senderUsername,
-      content: item.replyTo.body,
-      messageType: item.replyTo.messageType,
-    } : null,
-    mentionUserIds: item.mentionUserIds,
-    messageType: "text",
-    telegramFileId: null,
-    fileName: null,
-    fileSize: null,
-    mimeType: null,
-    createdAt: item.createdAt,
-    deliveryStatus: item.status === "error" ? "error" : "sending",
-    deliveryError: item.status === "error" ? item.error || "Сообщение не отправлено. Нажмите «Повторить»." : undefined,
-    senderUsername: user.username,
-    senderDisplayName: user.displayName,
-    senderAvatarColor: user.avatarColor || "#6C5CE7",
-    senderAvatarUrl: user.avatarUrl || null,
-  };
-}
-
 function MessageBubble({
   msg,
   isOwn,
-  onRetry,
   registerRef,
   status,
   statusTitle,
   members,
-  canReply,
   onReply,
   onMention,
   onJumpToMessage,
 }: {
   msg: ChatMessage;
   isOwn: boolean;
-  onRetry?: (message: ChatMessage) => void;
   registerRef?: (id: number | string, el: HTMLDivElement | null) => void;
   status?: ChatMessage["deliveryStatus"];
   statusTitle?: string;
   members: User[];
-  canReply: boolean;
   onReply: (message: ChatMessage) => void;
   onMention?: (message: ChatMessage) => void;
   onJumpToMessage: (id: number | string) => void;
 }) {
-  const [downloading, setDownloading] = useState(false);
-  const [downloadError, setDownloadError] = useState("");
-
-  const downloadEncryptedFile = async () => {
-    if (!msg.encryptedAttachment || downloading) return;
-    setDownloading(true);
-    setDownloadError("");
-    try {
-      const response = await fetch(msg.encryptedAttachment.url);
-      if (!response.ok) throw new Error("Ciphertext download failed");
-      const ciphertext = await response.arrayBuffer();
-      const plaintext = await decryptAttachment(ciphertext, msg.encryptedAttachment);
-      const blob = new Blob([plaintext], { type: msg.mimeType || "application/octet-stream" });
-      const objectUrl = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = objectUrl;
-      anchor.download = msg.fileName || "attachment";
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
-    } catch (error) {
-      console.error("Encrypted attachment download failed");
-      setDownloadError("Не удалось скачать или расшифровать файл на этом устройстве.");
-    } finally {
-      setDownloading(false);
-    }
-  };
-
-  const handleAttachmentClick = (event: MouseEvent<HTMLAnchorElement>) => {
-    if (!msg.encryptedAttachment) return;
-    event.preventDefault();
-    void downloadEncryptedFile();
-  };
-
   const renderFileContent = () => {
-    const hasFile = Boolean(msg.telegramFileId || msg.encryptedAttachment);
-    const fileUrl = msg.encryptedAttachment?.url || `/api/file/${msg.id}`;
+    const hasFile = Boolean(msg.telegramFileId);
+    const fileUrl = `/api/file/${msg.id}`;
 
     if (msg.messageType === "image") {
       return (
         <div className="mb-1">
           {hasFile ? (
-            <a href={fileUrl} onClick={handleAttachmentClick} target="_blank" rel="noopener noreferrer" className="block">
+            <a href={fileUrl} target="_blank" rel="noopener noreferrer" className="block">
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 src={fileUrl}
@@ -236,7 +113,7 @@ function MessageBubble({
               <span className="text-xl">📷</span>
               <div>
                 <div className="text-sm font-medium">{msg.fileName}</div>
-                <div className="text-xs text-gray-500">Telegram не настроен</div>
+                <div className="text-xs text-gray-500">Хранилище файлов недоступно</div>
               </div>
             </div>
           )}
@@ -248,7 +125,7 @@ function MessageBubble({
       return (
         <div className="mb-1">
           {hasFile ? (
-            <a href={fileUrl} onClick={handleAttachmentClick} target="_blank" rel="noopener noreferrer">
+            <a href={fileUrl} target="_blank" rel="noopener noreferrer">
               <div className="bg-dark-600 rounded-lg p-3 flex items-center gap-3 hover:bg-dark-500 transition-colors">
                 <div className="w-10 h-10 bg-blue-500/20 rounded-lg flex items-center justify-center">
                   <span className="text-xl">🎬</span>
@@ -267,7 +144,7 @@ function MessageBubble({
               <span className="text-xl">🎬</span>
               <div>
                 <div className="text-sm font-medium">{msg.fileName}</div>
-                <div className="text-xs text-gray-500">Telegram не настроен</div>
+                <div className="text-xs text-gray-500">Хранилище файлов недоступно</div>
               </div>
             </div>
           )}
@@ -279,7 +156,7 @@ function MessageBubble({
       return (
         <div className="mb-1">
           {hasFile ? (
-            <a href={fileUrl} onClick={handleAttachmentClick} target="_blank" rel="noopener noreferrer">
+            <a href={fileUrl} target="_blank" rel="noopener noreferrer">
               <div className="bg-dark-600 rounded-lg p-3 flex items-center gap-3 hover:bg-dark-500 transition-colors">
                 <div className="w-10 h-10 bg-green-500/20 rounded-lg flex items-center justify-center">
                   <span className="text-xl">📎</span>
@@ -298,7 +175,7 @@ function MessageBubble({
               <span className="text-xl">📎</span>
               <div>
                 <div className="text-sm font-medium">{msg.fileName}</div>
-                <div className="text-xs text-gray-500">Telegram не настроен</div>
+                <div className="text-xs text-gray-500">Хранилище файлов недоступно</div>
               </div>
             </div>
           )}
@@ -357,14 +234,7 @@ function MessageBubble({
               </span>
             </button>
           )}
-          {msg.isLegacy && (
-            <div className="mb-1 text-[9px] uppercase tracking-wide text-amber-300/80">
-              Legacy · не зашифровано
-            </div>
-          )}
           {msg.messageType !== "text" && renderFileContent()}
-          {downloading && <div className="text-xs text-gray-400">Скачиваем и расшифровываем…</div>}
-          {downloadError && <div className="text-xs text-red-300">{downloadError}</div>}
           {msg.messageType === "text" && msg.content && (
             <p className="text-sm whitespace-pre-wrap break-words">{renderMessageText(msg.content, members)}</p>
           )}
@@ -373,30 +243,18 @@ function MessageBubble({
               isOwn ? "text-purple-200" : "text-gray-500"
             }`}
           >
-            {canReply && (
-              <button
-                type="button"
-                onClick={() => onReply(msg)}
-                className="mr-1 rounded px-1 text-[12px] opacity-70 transition hover:bg-black/10 hover:opacity-100"
-                title="Ответить на сообщение"
-                aria-label="Ответить на сообщение"
-              >
-                ↩
-              </button>
-            )}
-            {formatTime(msg.createdAt)}
+            <button
+              type="button"
+              onClick={() => onReply(msg)}
+              className="mr-1 rounded px-1 text-[12px] opacity-70 transition hover:bg-black/10 hover:opacity-100"
+              title="Ответить на сообщение"
+              aria-label="Ответить на сообщение"
+            >
+              ↩
+            </button>
+            {formatTime(String(msg.createdAt))}
             {isOwn && <MessageStatus status={status} title={statusTitle} />}
           </div>
-          {isOwn && status === "error" && (
-            <div className="mt-1 flex flex-wrap items-center justify-end gap-2 text-[10px]">
-              <span className="max-w-56 truncate text-red-200" title={msg.deliveryError}>{msg.deliveryError || "Не отправлено"}</span>
-              {onRetry && msg.outboxId && (
-                <button type="button" onClick={() => onRetry(msg)} className="font-semibold text-red-100 underline underline-offset-2 hover:text-white">
-                  Повторить
-                </button>
-              )}
-            </div>
-          )}
         </div>
       </div>
     </div>
@@ -417,15 +275,12 @@ export default function ChatWindow({
   onChatUpdated?: (patch: Partial<Chat>) => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const localMessagesRef = useRef<ChatMessage[]>([]);
   const [newMessage, setNewMessage] = useState("");
   const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [sendError, setSendError] = useState("");
-  const [messageReadError, setMessageReadError] = useState("");
   const [showAddMembers, setShowAddMembers] = useState(false);
-  const [invitePermissionRoomId, setInvitePermissionRoomId] = useState<string | null>(null);
   const [notificationsMuted, setNotificationsMuted] = useState(Boolean(chat.notificationsMuted));
   const [muteBusy, setMuteBusy] = useState(false);
 
@@ -470,10 +325,12 @@ export default function ChatWindow({
   const [banReason, setBanReason] = useState<string | null>(currentUser.banReason ?? null);
   const [banNow, setBanNow] = useState(() => Date.now());
   const banExpiresAt = banUntil ? Date.parse(banUntil) : Number.NaN;
-  const isPublicBanActive = chat.securityMode === "public" && Number.isFinite(banExpiresAt) && banExpiresAt > banNow;
+  // The timed ban is a moderation tool for the open general chat only; DMs
+  // and private groups are never affected by it.
+  const isPublicBanActive = chat.isGeneralChat && Number.isFinite(banExpiresAt) && banExpiresAt > banNow;
 
   useEffect(() => {
-    if (chat.securityMode !== "public") return;
+    if (!chat.isGeneralChat) return;
     let cancelled = false;
     const refreshBan = async () => {
       if (document.visibilityState !== "visible") return;
@@ -500,63 +357,13 @@ export default function ChatWindow({
       window.clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [chat.securityMode]);
+  }, [chat.isGeneralChat]);
 
   useEffect(() => {
     if (!banUntil) return;
     const interval = window.setInterval(() => setBanNow(Date.now()), 1_000);
     return () => window.clearInterval(interval);
   }, [banUntil]);
-
-  const updateLocalMessages = useCallback((update: (current: ChatMessage[]) => ChatMessage[]) => {
-    const next = update(localMessagesRef.current);
-    localMessagesRef.current = next;
-    const visibleLocalMessages = next.filter((message) => message.chatId === chat.id);
-    setMessages((current) => {
-      const byOutboxId = new Map(
-        visibleLocalMessages.filter((message) => message.outboxId)
-          .map((message) => [message.outboxId as string, message]),
-      );
-      const visibleOutboxIds = new Set<string>();
-      const merged = current.map((message) => {
-        if (!message.outboxId) return message;
-        const replacement = byOutboxId.get(message.outboxId);
-        if (!replacement) return message;
-        visibleOutboxIds.add(message.outboxId);
-        return replacement;
-      });
-      const additions = visibleLocalMessages.filter((message) =>
-        message.outboxId && !visibleOutboxIds.has(message.outboxId),
-      );
-      return [...merged, ...additions].sort(
-        (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
-      );
-    });
-  }, [chat.id]);
-
-  useEffect(() => {
-    if (
-      !chat.isGroup ||
-      chat.securityMode !== "e2ee" ||
-      !chat.matrixRoomId ||
-      !currentUser.matrixSession
-    ) {
-      return;
-    }
-
-    let cancelled = false;
-    hasMatrixInvitePermission(currentUser.matrixSession, chat.matrixRoomId)
-      .then((allowed) => {
-        if (!cancelled) setInvitePermissionRoomId(allowed ? chat.matrixRoomId : null);
-      })
-      .catch(() => {
-        if (!cancelled) setInvitePermissionRoomId(null);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [chat.isGroup, chat.matrixRoomId, chat.securityMode, currentUser.matrixSession]);
 
   const isNearBottom = useCallback(() => {
     const el = messagesContainerRef.current;
@@ -595,57 +402,26 @@ export default function ChatWindow({
     messageIds: Array<number | string>,
     status: "delivered" | "read",
   ): Promise<boolean> => {
-    if (chat.securityMode === "public") {
-      const numericIds = messageIds.filter(
-        (id): id is number => typeof id === "number" && Number.isInteger(id),
-      );
-      if (!numericIds.length) return true;
-      try {
-        const response = await fetch(`/api/messages/${chat.id}/receipts`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messageIds: numericIds, status }),
-        });
-        if (!response.ok) {
-          console.warn(`Message receipt update failed (${response.status})`);
-          return false;
-        }
-        return true;
-      } catch (error) {
-        console.warn("Message receipt request failed", error);
+    const numericIds = messageIds.filter(
+      (id): id is number => typeof id === "number" && Number.isInteger(id),
+    );
+    if (!numericIds.length) return true;
+    try {
+      const response = await fetch(`/api/messages/${chat.id}/receipts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messageIds: numericIds, status }),
+      });
+      if (!response.ok) {
+        console.warn(`Message receipt update failed (${response.status})`);
         return false;
       }
+      return true;
+    } catch (error) {
+      console.warn("Message receipt request failed", error);
+      return false;
     }
-
-    // Private encrypted messages live only in Matrix. Send a standard Matrix
-    // read receipt for the newest visible incoming event; the remote sender
-    // reads that receipt from the encrypted room timeline state.
-    if (
-      chat.securityMode === "e2ee" && status === "read" && chat.matrixRoomId &&
-      currentUser.matrixSession
-    ) {
-      const requestedIds = new Set(messageIds.map(String));
-      const incoming = messages
-        .filter((message) =>
-          requestedIds.has(String(message.id)) &&
-          message.senderId !== currentUser.id &&
-          typeof message.id === "string" &&
-          !message.id.startsWith("outbox:"),
-        )
-        .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-      const latest = incoming.at(-1);
-      if (!latest || typeof latest.id !== "string") return true;
-      try {
-        await sendMatrixReadReceipt(currentUser.matrixSession, chat.matrixRoomId, latest.id);
-        return true;
-      } catch (error) {
-        console.warn("Matrix read receipt failed", error);
-        return false;
-      }
-    }
-
-    return true;
-  }, [chat.id, chat.matrixRoomId, chat.securityMode, currentUser.id, currentUser.matrixSession, messages]);
+  }, [chat.id]);
 
   const queueReadReceipts = useCallback((messageIds: Array<number | string>) => {
     const pending = messageIds.filter((id) => !reportedReadRef.current.has(id));
@@ -656,9 +432,9 @@ export default function ChatWindow({
     });
   }, [sendReceipts]);
 
-  // On initial messages load, mark other users' public-chat messages delivered.
+  // On messages load, mark other users' messages delivered.
   useEffect(() => {
-    if (chat.securityMode !== "public" || messages.length === 0) return;
+    if (messages.length === 0) return;
     const pending: number[] = [];
     for (const msg of messages) {
       if (msg.senderId === currentUser.id) continue;
@@ -672,11 +448,10 @@ export default function ChatWindow({
         if (!sent) pending.forEach((id) => reportedDeliveredRef.current.delete(id));
       });
     }
-  }, [chat.securityMode, messages, currentUser.id, sendReceipts]);
+  }, [messages, currentUser.id, sendReceipts]);
 
   // Poll receipts every few seconds so we can upgrade sent→delivered→read.
   useEffect(() => {
-    if (chat.securityMode !== "public") return;
     let cancelled = false;
     const load = async () => {
       try {
@@ -695,12 +470,11 @@ export default function ChatWindow({
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [chat.id, chat.securityMode]);
+  }, [chat.id]);
 
   // Build (or rebuild) the IntersectionObserver once the container exists, and
   // keep a stable instance in a ref so we can observe nodes as they register.
   useEffect(() => {
-    if (chat.securityMode !== "public" && chat.securityMode !== "e2ee") return;
     const container = messagesContainerRef.current;
     if (!container) return;
 
@@ -751,7 +525,7 @@ export default function ChatWindow({
       observer.disconnect();
       readObserverRef.current = null;
     };
-  }, [chat.id, chat.securityMode, queueReadReceipts, messages, currentUser.id]);
+  }, [chat.id, queueReadReceipts, messages, currentUser.id]);
 
   const registerMessageEl = useCallback((id: number | string, el: HTMLElement | null) => {
     if (!el) {
@@ -764,24 +538,18 @@ export default function ChatWindow({
   }, []);
 
   const getMessageStatus = useCallback((msg: ChatMessage): ChatMessage["deliveryStatus"] => {
-    if (msg.deliveryStatus === "sending" || msg.deliveryStatus === "error") return msg.deliveryStatus;
     if (msg.senderId !== currentUser.id) return undefined;
-    // For own messages, look up aggregated receipt state.
     if (typeof msg.id === "number") {
       const r = receipts[msg.id];
       if (r) return r.status;
     }
-    return msg.deliveryStatus || "sent";
+    return "sent";
   }, [currentUser.id, receipts]);
 
   const handleReplyToMessage = useCallback((message: ChatMessage) => {
-    if (
-      chat.securityMode === "e2ee" &&
-      (message.isLegacy || typeof message.id !== "string" || message.id.startsWith("outbox:"))
-    ) return;
     setReplyingTo(message);
     window.setTimeout(() => messageInputRef.current?.focus(), 0);
-  }, [chat.securityMode]);
+  }, []);
 
   const handleMentionMessageAuthor = useCallback((message: ChatMessage) => {
     const member = chat.members.find((candidate) => candidate.id === Number(message.senderId));
@@ -807,31 +575,14 @@ export default function ChatWindow({
     const readByCount = summary?.readByCount ?? message.readByCount;
     const deliveredToCount = summary?.deliveredToCount ?? message.deliveredToCount;
     const recipientCount = summary?.recipientCount ?? message.recipientCount;
-    if (message.deliveryStatus === "read" && readByCount !== undefined && recipientCount !== undefined) {
-      return `Прочитано: ${readByCount} из ${recipientCount}`;
+    if (summary?.status === "read" && readByCount !== undefined && recipientCount !== undefined) {
+      return `Прочитано: ${summary.readByCount} из ${summary.recipientCount}`;
     }
-    if (message.deliveryStatus === "delivered" && deliveredToCount !== undefined && recipientCount !== undefined) {
-      return `Доставлено: ${deliveredToCount} из ${recipientCount}`;
+    if (summary?.status === "delivered" && deliveredToCount !== undefined && recipientCount !== undefined) {
+      return `Доставлено: ${summary.deliveredToCount} из ${summary.recipientCount}`;
     }
-    if (summary?.status === "read") return `Прочитано: ${summary.readByCount} из ${summary.recipientCount}`;
-    if (summary?.status === "delivered") return `Доставлено: ${summary.deliveredToCount} из ${summary.recipientCount}`;
     return undefined;
   }, [currentUser.id, receipts]);
-
-  const prepareEncryptedChat = useCallback(async () => {
-    if (chat.securityMode !== "e2ee" || !chat.matrixRoomId || !currentUser.matrixSession) return;
-
-    if (!chat.isGroup) {
-      await ensureDirectRoomHistoryVisibility(currentUser.matrixSession, chat.matrixRoomId);
-    } else {
-      await ensureEncryptedRoomReady(currentUser.matrixSession, chat.matrixRoomId);
-    }
-  }, [
-    chat.isGroup,
-    chat.matrixRoomId,
-    chat.securityMode,
-    currentUser.matrixSession,
-  ]);
 
   const loadMessages = useCallback(async () => {
     try {
@@ -841,129 +592,10 @@ export default function ChatWindow({
       });
       const data = await res.json();
       if (!res.ok || !Array.isArray(data.messages)) return;
-
-      const legacyMessages: ChatMessage[] = data.messages.map((message: ChatMessage) => ({
-        ...message,
-        isLegacy: chat.securityMode !== "public",
-      }));
-      let visibleMessages = legacyMessages;
-
-      if (chat.securityMode === "e2ee" && chat.matrixRoomId && currentUser.matrixSession) {
-        try {
-          await prepareEncryptedChat();
-          const matrixResult = await getEncryptedRoomMessages(
-            currentUser.matrixSession,
-            chat.matrixRoomId,
-            chat.id,
-          );
-          setMessageReadError(
-            matrixResult.undecryptableCount > 0
-              ? `${matrixResult.undecryptableCount} зашифрованных сообщений пока нельзя расшифровать на этом устройстве. Проверьте подключение или восстановление ключей.`
-              : "",
-          );
-          const liveMessages: ChatMessage[] = matrixResult.messages.map((message) => {
-            const senderId = Number(message.senderUserId);
-            const sender = chat.members.find((member) => member.id === senderId);
-            const isFile = message.msgtype === "m.file";
-            const mimeType = message.mimeType || null;
-            const replySenderId = message.replyTo ? Number(message.replyTo.senderUserId) : Number.NaN;
-            const replySender = Number.isFinite(replySenderId)
-              ? chat.members.find((member) => member.id === replySenderId)
-              : undefined;
-            const replyIsFile = message.replyTo?.msgtype === "m.file";
-            const replyTo: ChatMessageReply | null = message.replyToEventId ? {
-              id: message.replyToEventId,
-              senderId: Number.isFinite(replySenderId) ? replySenderId : "",
-              senderDisplayName: replySender?.displayName || "Исходное сообщение",
-              senderUsername: replySender?.username,
-              content: replyIsFile ? null : message.replyTo?.body || null,
-              messageType: replyIsFile ? "file" : "text",
-              fileName: replyIsFile ? message.replyTo?.body || "Файл" : null,
-            } : null;
-            return {
-              id: message.eventId,
-              chatId: chat.id,
-              senderId,
-              content: isFile ? null : message.body,
-              replyTo,
-              readByCount: message.readByCount,
-              recipientCount: message.recipientCount,
-              mentionUserIds: message.mentionUserIds,
-              messageType: isFile
-                ? mimeType?.startsWith("image/")
-                  ? "image"
-                  : mimeType?.startsWith("video/")
-                    ? "video"
-                    : "file"
-                : "text",
-              telegramFileId: null,
-              fileName: isFile ? message.body : null,
-              fileSize: isFile ? message.fileSize || null : null,
-              mimeType,
-              encryptedAttachment: message.encryptedFile,
-              createdAt: new Date(message.timestamp).toISOString(),
-              senderUsername: sender?.username || message.senderMxid,
-              senderDisplayName: sender?.displayName || "Пользователь",
-              senderAvatarColor: sender?.avatarColor || "#6C5CE7",
-              senderAvatarUrl: sender?.avatarUrl || null,
-              deliveryStatus: message.readByOther ? "read" : "sent",
-              isLegacy: false,
-            };
-          });
-          visibleMessages = [...legacyMessages, ...liveMessages].sort(
-            (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
-          );
-        } catch (err) {
-          console.error("Failed to read encrypted Matrix messages");
-          setMessageReadError("Не удалось загрузить зашифрованные сообщения на этом устройстве.");
-        }
-      } else if (chat.securityMode === "e2ee" && chat.matrixRoomId) {
-        setMessageReadError("На этой вкладке нет Matrix-сессии. Восстановите её в боковой панели; локальные ключи E2EE сохранятся.");
-      } else {
-        setMessageReadError("");
-      }
-
-      if (chat.securityMode === "e2ee" && currentUser.matrixSession) {
-        const queuedItems = getPendingEncryptedMessages(currentUser.id, chat.id);
-        const queuedIds = new Set(queuedItems.map((item) => item.id));
-        const allLocalMessages = localMessagesRef.current;
-        const currentLocalMessages = allLocalMessages.filter((message) => message.chatId === chat.id);
-        const localByOutboxId = new Map(
-          currentLocalMessages
-            .filter((message) => message.outboxId)
-            .map((message) => [message.outboxId as string, message]),
-        );
-        const optimisticMessages = queuedItems.map((item) =>
-          localByOutboxId.get(item.id) || outboxItemToChatMessage(item, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor, avatarUrl: currentUser.avatarUrl }, chat.id),
-        );
-        const liveIds = new Set(visibleMessages.map((message) => String(message.id)));
-        const sentButNotSynced = currentLocalMessages.filter((message) =>
-          message.deliveryStatus === "sent" &&
-          (!message.outboxId || !queuedIds.has(message.outboxId)) &&
-          (!message.matrixEventId || !liveIds.has(message.matrixEventId)),
-        );
-        const nextLocalMessages = [...optimisticMessages, ...sentButNotSynced];
-        const hasLocalChanges = nextLocalMessages.length !== currentLocalMessages.length ||
-          nextLocalMessages.some((message, index) => {
-            const current = currentLocalMessages[index];
-            return !current || current.id !== message.id ||
-              current.deliveryStatus !== message.deliveryStatus ||
-              current.deliveryError !== message.deliveryError;
-          });
-        if (hasLocalChanges) {
-          localMessagesRef.current = [
-            ...allLocalMessages.filter((message) => message.chatId !== chat.id),
-            ...nextLocalMessages,
-          ];
-        }
-        visibleMessages = [...visibleMessages, ...nextLocalMessages].sort(
-          (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
-        );
-      }
-
-      setMessages(visibleMessages);
-      if (visibleMessages.length !== prevMsgCountRef.current) {
-        prevMsgCountRef.current = visibleMessages.length;
+      const nextMessages: ChatMessage[] = data.messages;
+      setMessages(nextMessages);
+      if (nextMessages.length !== prevMsgCountRef.current) {
+        prevMsgCountRef.current = nextMessages.length;
         const wasNearBottom = isNearBottom();
         window.requestAnimationFrame(() => {
           if (initialLoadRef.current || wasNearBottom) scrollToBottom(initialLoadRef.current ? "auto" : "smooth");
@@ -972,21 +604,7 @@ export default function ChatWindow({
     } catch (err) {
       console.error("Failed to load messages:", err);
     }
-  }, [
-    chat.id,
-    chat.matrixRoomId,
-    chat.members,
-    chat.securityMode,
-    currentUser.id,
-    currentUser.username,
-    currentUser.displayName,
-    currentUser.avatarColor,
-    currentUser.avatarUrl,
-    currentUser.matrixSession,
-    isNearBottom,
-    prepareEncryptedChat,
-    scrollToBottom,
-  ]);
+  }, [chat.id, isNearBottom, scrollToBottom]);
 
   useEffect(() => {
     prevMsgCountRef.current = 0;
@@ -998,47 +616,9 @@ export default function ChatWindow({
     document.addEventListener("visibilitychange", pollIfVisible);
     return () => {
       window.clearInterval(interval);
-      document.removeEventListener("visibilitychange", pollIfVisible);
+      window.removeEventListener("visibilitychange", pollIfVisible);
     };
   }, [loadMessages]);
-
-  useEffect(() => {
-    const onOutboxUpdate = (event: Event) => {
-      const update = (event as CustomEvent<MatrixOutboxUpdate>).detail;
-      if (!update) return;
-      const isActiveChat = update.chatId === chat.id;
-
-      updateLocalMessages((current) => {
-        let message = current.find((item) => item.outboxId === update.id);
-        if (!message && update.status !== "sent") {
-          const queued = getPendingEncryptedMessages(currentUser.id, update.chatId)
-            .find((item) => item.id === update.id);
-          if (queued) message = outboxItemToChatMessage(queued, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor, avatarUrl: currentUser.avatarUrl }, update.chatId);
-        }
-        if (!message) return current;
-
-        const updated: ChatMessage = {
-          ...message,
-          id: update.status === "sent" && update.eventId ? update.eventId : message.id,
-          matrixEventId: update.status === "sent" ? update.eventId : message.matrixEventId,
-          deliveryStatus: update.status,
-          deliveryError: update.error,
-        };
-        const found = current.some((item) => item.outboxId === update.id);
-        return found
-          ? current.map((item) => item.outboxId === update.id ? updated : item)
-          : [...current, updated];
-      });
-
-      if (update.status === "sent") {
-        if (isActiveChat) void loadMessages();
-        onMessageSent();
-      }
-    };
-
-    window.addEventListener(MATRIX_OUTBOX_EVENT, onOutboxUpdate);
-    return () => window.removeEventListener(MATRIX_OUTBOX_EVENT, onOutboxUpdate);
-  }, [chat, currentUser, loadMessages, onMessageSent, updateLocalMessages]);
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1050,61 +630,20 @@ export default function ChatWindow({
 
     const msgText = newMessage.trim();
     setSendError("");
-
-    if (chat.securityMode === "e2ee") {
-      if (!chat.matrixRoomId || !currentUser.matrixSession) {
-        setSendError("Matrix E2EE не подключён. Сообщение не отправлено открытым текстом.");
-        return;
-      }
-
-      try {
-        const item = createEncryptedOutboxMessage({
-          appUserId: currentUser.id,
-          chatId: chat.id,
-          roomId: chat.matrixRoomId,
-          isDirect: !chat.isGroup,
-          body: msgText,
-          replyTo: replyingTo ? createMatrixReplyReference(replyingTo, currentUser.matrixSession) : undefined,
-          mentionUserIds: getMatrixMentionUserIds(msgText, chat.members, currentUser.matrixSession),
-        });
-        const optimisticMessage: ChatMessage = {
-          ...outboxItemToChatMessage(item, { id: currentUser.id, username: currentUser.username, displayName: currentUser.displayName, avatarColor: currentUser.avatarColor, avatarUrl: currentUser.avatarUrl }, chat.id),
-          id: `outbox:${item.id}`,
-          deliveryStatus: "sending",
-          deliveryError: undefined,
-        };
-        updateLocalMessages((current) => [...current, optimisticMessage]);
-        setNewMessage("");
-        setReplyingTo(null);
-        setSending(false);
-        scrollToBottom("smooth");
-        void sendQueuedEncryptedMessage(currentUser.matrixSession, item.id).catch(() => undefined);
-      } catch (queueError) {
-        setSendError(queueError instanceof Error
-          ? queueError.message
-          : "Не удалось сохранить сообщение в очереди. Повторите попытку.");
-      }
-      return;
-    }
-
     setNewMessage("");
     setSending(true);
     try {
-      if (chat.securityMode === "public") {
-        const response = await fetch("/api/messages", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chatId: chat.id,
-            content: msgText,
-            replyToMessageId: typeof replyingTo?.id === "number" ? replyingTo.id : null,
-          }),
-        });
-        const result = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(result.error || "Не удалось отправить сообщение");
-      } else {
-        throw new Error("Новые сообщения в legacy-чатах заблокированы до настройки E2EE.");
-      }
+      const response = await fetch("/api/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chatId: chat.id,
+          content: msgText,
+          replyToMessageId: typeof replyingTo?.id === "number" ? replyingTo.id : null,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Не удалось отправить сообщение");
 
       await loadMessages();
       setReplyingTo(null);
@@ -1119,14 +658,6 @@ export default function ChatWindow({
     }
   };
 
-  const handleRetryMessage = (message: ChatMessage) => {
-    if (!message.outboxId || !currentUser.matrixSession) return;
-    updateLocalMessages((current) => current.map((item) => item.outboxId === message.outboxId
-      ? { ...item, deliveryStatus: "sending", deliveryError: undefined }
-      : item));
-    void retryQueuedEncryptedMessage(currentUser.matrixSession, message.outboxId).catch(() => undefined);
-  };
-
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -1139,53 +670,16 @@ export default function ChatWindow({
     setSendError("");
     setUploading(true);
     try {
-      if (chat.securityMode === "public") {
-        const formData = new FormData();
-        formData.append("file", file);
-        formData.append("chatId", String(chat.id));
-        if (typeof replyingTo?.id === "number") {
-          formData.append("replyToMessageId", String(replyingTo.id));
-        }
-
-        const response = await fetch("/api/upload", { method: "POST", body: formData });
-        const uploadResult = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(uploadResult.error || "Не удалось загрузить файл");
-      } else if (chat.securityMode === "e2ee" && chat.matrixRoomId && currentUser.matrixSession) {
-        await prepareEncryptedChat();
-        if (file.size > 45 * 1024 * 1024) {
-          throw new Error("Размер файла для E2EE не должен превышать 45 МБ");
-        }
-
-        // Matrix.org's attachment library encrypts the bytes in the browser
-        // using the Matrix encrypted-attachment format. Only ciphertext and a
-        // random filename are sent to the Telegram upload endpoint.
-        const encrypted = await encryptAttachment(await file.arrayBuffer());
-        const ciphertext = new Blob([encrypted.data], { type: "application/octet-stream" });
-        const formData = new FormData();
-        formData.append("file", ciphertext, `ciphertext-${crypto.randomUUID()}.bin`);
-        formData.append("chatId", String(chat.id));
-        formData.append("encrypted", "true");
-
-        const response = await fetch("/api/upload", { method: "POST", body: formData });
-        const uploadResult = await response.json();
-        if (!response.ok || typeof uploadResult.telegramFileId !== "string") {
-          throw new Error(uploadResult.error || "Не удалось сохранить зашифрованный файл в Telegram");
-        }
-
-        const fileUrl = new URL("/api/file/telegram", window.location.origin);
-        fileUrl.searchParams.set("chatId", String(chat.id));
-        fileUrl.searchParams.set("fileId", uploadResult.telegramFileId);
-        await sendEncryptedAttachment(currentUser.matrixSession, chat.matrixRoomId, {
-          chatId: chat.id,
-          fileName: file.name,
-          mimeType: file.type || "application/octet-stream",
-          fileSize: file.size,
-          encryptedFile: { ...encrypted.info, url: fileUrl.toString() },
-          replyTo: replyingTo ? createMatrixReplyReference(replyingTo, currentUser.matrixSession) : undefined,
-        });
-      } else {
-        throw new Error("Этот чат не готов к безопасной загрузке файлов");
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("chatId", String(chat.id));
+      if (typeof replyingTo?.id === "number") {
+        formData.append("replyToMessageId", String(replyingTo.id));
       }
+
+      const response = await fetch("/api/upload", { method: "POST", body: formData });
+      const uploadResult = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(uploadResult.error || "Не удалось загрузить файл");
 
       await loadMessages();
       setReplyingTo(null);
@@ -1201,10 +695,8 @@ export default function ChatWindow({
   };
 
   const otherMember = chat.isGroup ? undefined : chat.members.find((m) => m.id !== currentUser.id);
-  const canSendMessage =
-    (chat.securityMode === "public" && !isPublicBanActive) ||
-    (chat.securityMode === "e2ee" && Boolean(chat.matrixRoomId && currentUser.matrixSession));
-  const canAttachFile = canSendMessage;
+  const canManageMembers = chat.isGroup
+    && (chat.createdBy === currentUser.id || currentUser.role === "admin");
 
   return (
     <div className="flex h-[100dvh] min-h-0 flex-col overflow-hidden bg-dark-900 md:h-full">
@@ -1237,15 +729,6 @@ export default function ChatWindow({
                 : "был(а) недавно"
               : `${chat.members.length} участников`}
           </div>
-          <div className={`text-[10px] mt-0.5 ${chat.securityMode === "e2ee" ? "text-emerald-400" : "text-amber-400"}`}>
-            {chat.securityMode === "public"
-              ? "Открытый чат · без E2EE"
-              : chat.securityMode === "e2ee"
-                ? currentUser.matrixSession
-                  ? "Matrix E2EE · старая история помечена как legacy"
-                  : "E2EE-комната · Matrix-сессия на этой вкладке недоступна"
-                : "Legacy-чат · новые сообщения заблокированы до E2EE"}
-          </div>
         </div>
         <button
           type="button"
@@ -1265,7 +748,7 @@ export default function ChatWindow({
             </svg>
           )}
         </button>
-        {chat.isGroup && chat.securityMode === "e2ee" && chat.matrixRoomId === invitePermissionRoomId && (
+        {canManageMembers && (
           <button
             onClick={() => setShowAddMembers(true)}
             className="rounded-lg p-2 text-gray-400 hover:bg-dark-600 hover:text-white touch-manipulation"
@@ -1282,21 +765,12 @@ export default function ChatWindow({
 
       {/* Messages */}
       <div ref={messagesContainerRef} className="flex min-h-0 flex-1 flex-col justify-end overflow-y-auto overscroll-contain px-4 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] [-webkit-overflow-scrolling:touch]">
-        {messageReadError && (
-          <div className="mb-3 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
-            {messageReadError} Legacy-история при этом остаётся доступна ниже.
-          </div>
-        )}
         {messages.length === 0 ? (
           <div className="flex min-h-[60dvh] flex-col items-center justify-center text-center">
-            <div className="text-4xl mb-3">🔐</div>
-            <p className="text-gray-500 text-sm">{chat.securityMode === "legacy" ? "История чата сохранена как legacy" : "Начните разговор!"}</p>
+            <div className="text-4xl mb-3">💬</div>
+            <p className="text-gray-500 text-sm">Начните разговор!</p>
             <p className="text-gray-600 text-xs mt-1">
-              {chat.securityMode === "public"
-                ? "Этот общий чат не шифруется"
-                : chat.securityMode === "e2ee"
-                  ? "Новые сообщения шифруются Matrix на устройствах участников"
-                  : "Новые сообщения не отправляются открытым текстом"}
+              {chat.isGeneralChat ? "Общий чат доступен всем участникам" : "Сообщения и файлы видят только участники чата"}
             </p>
           </div>
         ) : (
@@ -1305,12 +779,10 @@ export default function ChatWindow({
               key={msg.id}
               msg={msg}
               isOwn={msg.senderId === currentUser.id}
-              onRetry={handleRetryMessage}
               registerRef={registerMessageEl}
               status={getMessageStatus(msg)}
               statusTitle={getMessageReceiptTitle(msg)}
               members={chat.members}
-              canReply={chat.securityMode === "public" || (!msg.isLegacy && typeof msg.id === "string" && !msg.id.startsWith("outbox:"))}
               onReply={handleReplyToMessage}
               onMention={chat.isGroup ? handleMentionMessageAuthor : undefined}
               onJumpToMessage={jumpToMessage}
@@ -1367,9 +839,9 @@ export default function ChatWindow({
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={uploading || !canAttachFile}
+            disabled={uploading}
             className="p-2.5 text-gray-400 hover:text-purple-400 rounded-xl hover:bg-dark-700 transition-colors disabled:opacity-50"
-            title={isPublicBanActive ? "Загрузка заблокирована на время бана" : canAttachFile ? "Прикрепить файл" : "Новые файлы доступны после настройки Matrix E2EE"}
+            title={isPublicBanActive ? "Загрузка заблокирована на время бана" : "Прикрепить файл"}
           >
             {uploading ? (
               <div className="w-5 h-5 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
@@ -1385,15 +857,15 @@ export default function ChatWindow({
             type="text"
             value={newMessage}
             onChange={(e) => setNewMessage(e.target.value)}
-            disabled={!canSendMessage || sending}
+            disabled={sending}
             className="flex-1 px-4 py-2.5 bg-dark-700 border border-dark-500 rounded-xl text-sm text-white placeholder-gray-500 focus:outline-none focus:border-purple-500 transition-colors disabled:opacity-50"
-            placeholder={isPublicBanActive ? "Отправка заблокирована до окончания бана" : canSendMessage ? "Введите сообщение..." : "Новые сообщения заблокированы до подключения E2EE"}
+            placeholder={isPublicBanActive ? "Отправка заблокирована до окончания бана" : "Введите сообщение..."}
             autoComplete="off"
           />
 
           <button
             type="submit"
-            disabled={!newMessage.trim() || sending || !canSendMessage}
+            disabled={!newMessage.trim() || sending}
             className="p-2.5 bg-purple-500 hover:bg-purple-600 disabled:opacity-30 disabled:hover:bg-purple-500 text-white rounded-xl transition-colors"
           >
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1406,7 +878,6 @@ export default function ChatWindow({
         <AddGroupMembersModal
           chatId={chat.id}
           memberIds={chat.members.map((member) => member.id)}
-          matrixSession={currentUser.matrixSession}
           onClose={() => setShowAddMembers(false)}
           onAdded={onMessageSent}
         />

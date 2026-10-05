@@ -79,7 +79,6 @@ async function createOrRotateAdmin(): Promise<{ username: string; password: stri
           role: "admin",
           bannedUntil: null,
           banReason: null,
-          matrixResetRequired: false,
           displayName: "Telegram Admin",
           lastSeen: new Date(),
         })
@@ -97,7 +96,7 @@ async function createOrRotateAdmin(): Promise<{ username: string; password: stri
     const [generalChat] = await tx
       .select({ id: chats.id })
       .from(chats)
-      .where(and(eq(chats.name, "Общий чат"), eq(chats.securityMode, "public")))
+      .where(and(eq(chats.name, "Общий чат"), eq(chats.isGroup, true)))
       .limit(1);
 
     const [user] = await tx

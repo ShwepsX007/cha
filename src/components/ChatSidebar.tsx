@@ -19,17 +19,12 @@ function formatTime(dateStr: string) {
   return d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" });
 }
 
-function getLastMessagePreview(msg: Chat["lastMessage"], securityMode: Chat["securityMode"]) {
+function getLastMessagePreview(msg: Chat["lastMessage"]) {
   if (!msg) return "";
-  const preview = msg.messageType === "text"
-    ? msg.content || ""
-    : msg.messageType === "image"
-      ? "📷 Фото"
-      : msg.messageType === "video"
-        ? "🎬 Видео"
-        : `📎 ${msg.fileName || "Файл"}`;
-  if (securityMode === "e2ee") return "🔒 Новые сообщения Matrix E2EE";
-  return securityMode === "public" ? preview : `Legacy · ${preview}`;
+  if (msg.messageType === "text") return msg.content || "";
+  if (msg.messageType === "image") return "📷 Фото";
+  if (msg.messageType === "video") return "🎬 Видео";
+  return `📎 ${msg.fileName || "Файл"}`;
 }
 
 export default function ChatSidebar({
@@ -39,13 +34,7 @@ export default function ChatSidebar({
   onSelectChat,
   onLogout,
   onChatsUpdated,
-  matrixState,
-  matrixNotice,
-  onOpenDeviceSecurity,
   onOpenProfileSettings,
-  onRecoverMatrixSession,
-  matrixIdentityResetNeeded,
-  onResetMatrixIdentity,
 }: {
   user: User;
   chats: Chat[];
@@ -53,14 +42,7 @@ export default function ChatSidebar({
   onSelectChat: (chatId: number) => void;
   onLogout: () => void;
   onChatsUpdated: () => void;
-  matrixState: "checking" | "connected" | "not_configured" | "unavailable";
-  matrixNotice?: string;
-  onOpenDeviceSecurity: () => void;
   onOpenProfileSettings: () => void;
-  onRecoverMatrixSession: () => void;
-  /** True only when the local crypto store itself is unreadable. */
-  matrixIdentityResetNeeded?: boolean;
-  onResetMatrixIdentity?: () => void;
 }) {
   const [showNewChat, setShowNewChat] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -74,61 +56,11 @@ export default function ChatSidebar({
       {/* Header */}
       <div className="p-4 border-b border-dark-600">
         <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 min-w-0">
             <Avatar src={user.avatarUrl} name={user.displayName} color={user.avatarColor} size={44} cacheKey={user.avatarUpdatedAt} />
-            <div>
-              <div className="font-semibold text-sm">{user.displayName}</div>
-              <div className="text-xs text-gray-500">@{user.username}</div>
-              <div
-                className={`mt-1 text-[10px] leading-tight ${
-                  matrixState === "connected" ? "text-amber-400" : "text-gray-500"
-                }`}
-                title={
-                  matrixState === "unavailable"
-                    ? user.matrixSession
-                      ? "Matrix-сессия есть, но синхронизация не прошла. Проверьте подключение или восстановите сессию. Не очищайте данные сайта: там хранятся ключи устройства."
-                      : "Нет действующей Matrix-сессии для этого устройства. Нажмите «Восстановить Matrix-сессию» и введите пароль один раз; локальные ключи устройства сохранятся."
-                    : matrixState === "not_configured"
-                      ? "На сервере не настроен Matrix; личные чаты E2EE недоступны."
-                      : "E2EE пока не включено для отправки новых личных сообщений"
-                }
-              >
-                {matrixState === "connected"
-                  ? "Matrix подключён · E2EE активно в личных чатах"
-                  : matrixState === "checking"
-                    ? "Проверка Matrix…"
-                    : matrixState === "not_configured"
-                      ? "E2EE не настроено на сервере"
-                      : !user.matrixSession
-                        ? "Нет Matrix-сессии · восстановить"
-                        : "Matrix не синхронизируется · восстановить"}
-              </div>
-              {matrixState === "unavailable" && (
-                <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <button
-                    type="button"
-                    onClick={onRecoverMatrixSession}
-                    className="text-[10px] font-medium text-purple-300 hover:text-purple-200"
-                  >
-                    Восстановить Matrix-сессию
-                  </button>
-                  {matrixIdentityResetNeeded && onResetMatrixIdentity && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (window.confirm(
-                          "Сбросить Matrix-идентичность этого устройства? Будут отозваны все устройства Synapse и удалены локальные E2EE-ключи; старые сообщения станут нечитаемыми без recovery key. Применяется, только если хранилище ключей действительно повреждено.",
-                        )) {
-                          onResetMatrixIdentity();
-                        }
-                      }}
-                      className="text-[10px] font-medium text-red-300 underline decoration-dotted hover:text-red-200"
-                    >
-                      Сбросить Matrix-идентичность
-                    </button>
-                  )}
-                </span>
-              )}
+            <div className="min-w-0">
+              <div className="font-semibold text-sm truncate">{user.displayName}</div>
+              <div className="text-xs text-gray-500 truncate">@{user.username}</div>
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
@@ -140,20 +72,8 @@ export default function ChatSidebar({
               aria-label="Настройки профиля"
             >
               <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c1.756-.426 1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
-            </button>
-            <button
-              type="button"
-              onClick={onOpenDeviceSecurity}
-              disabled={!user.matrixSession}
-              className="rounded-lg p-2 text-gray-500 transition-colors hover:bg-dark-600 hover:text-purple-300 disabled:cursor-not-allowed disabled:opacity-40"
-              title="Ключи и устройства Matrix"
-              aria-label="Ключи и устройства Matrix"
-            >
-              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
               </svg>
             </button>
             {user.role === "admin" && (
@@ -182,11 +102,6 @@ export default function ChatSidebar({
             </button>
           </div>
         </div>
-        {matrixNotice && (
-          <div role="status" className="mb-3 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-200">
-            {matrixNotice}
-          </div>
-        )}
 
         {/* Search */}
         <div className="relative">
@@ -258,7 +173,7 @@ export default function ChatSidebar({
                     </span>
                   </div>
                   <div className="text-xs text-gray-500 truncate mt-0.5">
-                    {getLastMessagePreview(chat.lastMessage, chat.securityMode)}
+                    {getLastMessagePreview(chat.lastMessage)}
                   </div>
                 </div>
               </button>
@@ -270,7 +185,6 @@ export default function ChatSidebar({
       {/* New Chat Modal */}
       {showNewChat && (
         <NewChatModal
-          currentUser={user}
           onClose={() => setShowNewChat(false)}
           onChatCreated={(chatId) => {
             setShowNewChat(false);

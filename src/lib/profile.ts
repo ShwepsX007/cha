@@ -14,7 +14,6 @@ export interface Profile {
   role: "user" | "admin";
   bannedUntil: string | null;
   banReason: string | null;
-  matrixResetRequired: boolean;
 }
 
 const DISPLAY_NAME_INVALID = /[<>]|[\u0000-\u001f\u007f]|&lt;|&gt;|&amp;/i;
@@ -43,7 +42,6 @@ export async function getAuthenticatedUser(userId: number) {
       role: users.role,
       bannedUntil: users.bannedUntil,
       banReason: users.banReason,
-      matrixResetRequired: users.matrixResetRequired,
     })
     .from(users)
     .where(eq(users.id, userId));

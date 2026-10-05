@@ -1,3 +1,6 @@
+> **АРХИВ (2026-10-05):** Matrix/E2EE удалён из приложения — личные чаты
+> теперь обычные чаты в PostgreSQL. Документ оставлен как история решений.
+
 # Matrix E2EE rollout
 
 ## Current status — production homeserver configured; app fix needs rollout

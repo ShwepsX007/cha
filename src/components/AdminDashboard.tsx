@@ -11,7 +11,6 @@ type AdminUser = {
   role: "user" | "admin";
   bannedUntil: string | null;
   banReason: string | null;
-  matrixResetRequired: boolean;
   createdAt: string;
   lastSeen: string | null;
 };
@@ -20,7 +19,6 @@ type AdminChat = {
   id: number;
   name: string | null;
   isGroup: boolean;
-  securityMode: string;
   createdAt: string;
 };
 
@@ -28,7 +26,6 @@ type AdminMessage = {
   id: number;
   chatId: number;
   chatName: string | null;
-  securityMode: string;
   senderId: number;
   senderUsername: string;
   senderDisplayName: string;
@@ -51,7 +48,6 @@ type AuditEntry = {
 
 type SystemStatus = {
   counts: { users: number; chats: number; messages: number; auditLogs: number };
-  matrixStatus: "ok" | "not_configured" | "unavailable";
 };
 
 type Tab = "users" | "moderation" | "system" | "audit";
@@ -85,12 +81,6 @@ function isBanActive(user: AdminUser): boolean {
   return Boolean(user.bannedUntil && new Date(user.bannedUntil).getTime() > Date.now());
 }
 
-function matrixStatusLabel(status: SystemStatus["matrixStatus"]): string {
-  if (status === "ok") return "Подключён";
-  if (status === "not_configured") return "Не настроен";
-  return "Недоступен";
-}
-
 export default function AdminDashboard({ admin }: { admin: { id: number; username: string; displayName: string } }) {
   const [tab, setTab] = useState<Tab>("users");
   const [notice, setNotice] = useState("");
@@ -112,7 +102,6 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
 
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [wipeConfirmation, setWipeConfirmation] = useState("");
-  const [massMatrixConfirmation, setMassMatrixConfirmation] = useState("");
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
 
   useEffect(() => {
@@ -233,14 +222,14 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
 
   const deleteUser = async (user: AdminUser) => {
     if (user.id === admin.id) return;
-    if (!window.confirm(`Удалить аккаунт @${user.username}? Аккаунт Synapse будет деактивирован, а данные PostgreSQL пользователя удалены каскадно.`)) return;
+    if (!window.confirm(`Удалить аккаунт @${user.username}? Его сообщения, чаты и файлы в PostgreSQL будут удалены каскадно.`)) return;
     clearFeedback();
     setBusy(true);
     try {
       const response = await fetch(`/api/admin/users/${user.id}`, { method: "DELETE" });
       const data = await readJson(response);
       if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "Не удалось удалить пользователя");
-      setNotice(data.matrixAccountDeactivated ? "Пользователь удалён, Matrix-аккаунт деактивирован." : "Пользователь удалён. Matrix не настроен; деактивация Synapse не выполнялась.");
+      setNotice("Пользователь удалён.");
       await refreshUsers();
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : "Не удалось удалить пользователя");
@@ -295,7 +284,6 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
       if (!response.ok && response.status !== 202) throw new Error(typeof data.error === "string" ? data.error : "Системное действие не выполнено");
       setNotice(typeof data.warning === "string" ? data.warning : "Системное действие выполнено.");
       setWipeConfirmation("");
-      setMassMatrixConfirmation("");
       const statusResponse = await fetch("/api/admin/system", { cache: "no-store" });
       const statusData = await readJson(statusResponse);
       if (statusResponse.ok) setSystemStatus(statusData as unknown as SystemStatus);
@@ -371,7 +359,6 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
                             {user.role === "admin" ? "Администратор" : "Пользователь"}
                           </span>
                           {banActive && <span className="rounded-full bg-red-500/15 px-2 py-0.5 text-[10px] font-semibold text-red-300">Бан активен</span>}
-                          {user.matrixResetRequired && <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-200">Matrix reset ожидает входа</span>}
                         </div>
                         <p className="mt-0.5 truncate text-sm text-gray-400">@{user.username} · ID {user.id}</p>
                         <p className="mt-1 text-xs text-gray-500">Создан: {dateLabel(user.createdAt)} · Был(а): {dateLabel(user.lastSeen)}</p>
@@ -389,13 +376,6 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
                         <option value="user">Пользователь</option>
                         <option value="admin">Администратор</option>
                       </select>
-                      <button
-                        type="button"
-                        disabled={busy || user.id === admin.id}
-                        onClick={() => void runUserAction(user.id, "matrix_reset")}
-                        className="rounded-lg border border-amber-500/30 px-3 py-2 text-xs text-amber-200 transition hover:bg-amber-500/10 disabled:opacity-40"
-                        title="Отозвать Matrix devices и потребовать свежую сессию при следующем входе"
-                      >Сброс Matrix</button>
                       <button
                         type="button"
                         disabled={busy || user.id === admin.id}
@@ -458,14 +438,14 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
         {tab === "moderation" && (
           <section className="space-y-4">
             <div className="rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4 text-xs leading-relaxed text-amber-100/80">
-              Здесь доступны только записи и метаданные PostgreSQL. Содержимое приватных E2EE-комнат хранится в Matrix/Synapse и не отображается и не удаляется этой модерацией. Telegram-файлы также хранятся отдельно.
+              Модерация работает с записями PostgreSQL: все чаты (общие, личные и группы) хранятся здесь же. Telegram-файлы вложений хранятся отдельно.
             </div>
             <div className="flex flex-wrap items-end gap-3 rounded-2xl border border-dark-600 bg-dark-800 p-4">
               <label className="min-w-52 flex-1 text-xs text-gray-400">
                 Чат
                 <select value={selectedChat} onChange={(event) => setSelectedChat(event.target.value)} className="mt-1.5 w-full rounded-lg border border-dark-500 bg-dark-900 px-3 py-2.5 text-sm text-gray-200">
                   <option value="">Все чаты</option>
-                  {chats.map((chat) => <option key={chat.id} value={chat.id}>{chat.name || `Чат #${chat.id}`} · {chat.securityMode}</option>)}
+                  {chats.map((chat) => <option key={chat.id} value={chat.id}>{chat.name || `Чат #${chat.id}`}</option>)}
                 </select>
               </label>
               <label className="w-48 text-xs text-gray-400">
@@ -477,7 +457,7 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
                 disabled={busy || !selectedChat}
                 onClick={() => {
                   const chat = chats.find((item) => item.id === Number(selectedChat));
-                  if (chat && window.confirm(`Удалить все записи PostgreSQL из «${chat.name || `чата #${chat.id}`}»? История в Matrix не затрагивается.`)) {
+                  if (chat && window.confirm(`Удалить все сообщения из «${chat.name || `чата #${chat.id}`}»?`)) {
                     void moderationAction("clear_chat", { chatId: chat.id });
                   }
                 }}
@@ -525,7 +505,7 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
                         <span className="font-semibold text-purple-200">{message.senderDisplayName} · @{message.senderUsername}</span>
                         <span className="text-gray-600">ID {message.senderId}</span>
-                        <span className="text-gray-500">{message.chatName || `Чат #${message.chatId}`} · {message.securityMode}</span>
+                        <span className="text-gray-500">{message.chatName || `Чат #${message.chatId}`}</span>
                         <time className="text-gray-600">{dateLabel(message.createdAt)}</time>
                       </div>
                       <p className="mt-1 break-words text-sm text-gray-200">{message.content || message.fileName || `[${message.messageType}]`}</p>
@@ -553,36 +533,11 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
                 </div>
               ))}
             </div>
-            <div className="rounded-2xl border border-dark-600 bg-dark-800 p-5">
-              <h2 className="font-semibold">Matrix / Synapse</h2>
-              <p className="mt-2 text-sm text-gray-400">Статус: <span className="text-gray-200">{systemStatus ? matrixStatusLabel(systemStatus.matrixStatus) : "Проверка…"}</span></p>
-              <p className="mt-2 text-xs leading-relaxed text-gray-500">Matrix admin token остаётся только на сервере и не передаётся в браузер.</p>
-              <label htmlFor="mass-matrix-confirmation" className="mt-3 block text-xs text-amber-200/80">
-                Отозвать устройства Matrix у всех: введите фразу <b>МАССОВЫЙ СБРОС</b>. Пока пользователь не введёт
-                пароль заново, его Matrix-сессия не будет создана.
-              </label>
-              <div className="mt-2 flex flex-col gap-3 sm:flex-row">
-                <input
-                  id="mass-matrix-confirmation"
-                  value={massMatrixConfirmation}
-                  onChange={(event) => setMassMatrixConfirmation(event.target.value)}
-                  placeholder="МАССОВЫЙ СБРОС"
-                  className="flex-1 rounded-xl border border-dark-500 bg-dark-700 px-4 py-3 text-sm text-white outline-none focus:border-amber-400"
-                />
-                <button
-                  type="button"
-                  disabled={busy || massMatrixConfirmation.trim() !== "МАССОВЫЙ СБРОС"}
-                  onClick={() => void runSystemAction("mass_matrix_reset", massMatrixConfirmation.trim())}
-                  className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-semibold text-amber-100 hover:bg-amber-500/20 disabled:opacity-50"
-                >Массовый Matrix-сброс</button>
-              </div>
-            </div>
-
             <div className="rounded-2xl border border-red-500/30 bg-red-950/20 p-5 sm:p-6">
               <p className="text-xs font-bold uppercase tracking-[0.18em] text-red-300">Опасная зона</p>
               <h2 className="mt-2 text-xl font-bold">Nuclear wipe</h2>
               <p className="mt-2 max-w-3xl text-sm leading-relaxed text-gray-300">
-                Удалит чаты, сообщения и все аккаунты, кроме текущего администратора. Другие Synapse-аккаунты будут деактивированы. Журнал аудита сохранится. История E2EE-комнат в Matrix/Synapse не удаляется этой операцией.
+                Удалит чаты, сообщения и все аккаунты, кроме текущего администратора. Журнал аудита сохранится.
               </p>
               <label htmlFor="wipe-confirmation" className="mt-5 block text-xs font-semibold text-red-200">Для подтверждения введите ровно: УДАЛИТЬ ВСЁ</label>
               <div className="mt-2 flex flex-col gap-3 sm:flex-row">
