@@ -68,6 +68,13 @@ async function main() {
   check("POST /api/auth/matrix-refresh without a session is 401",
     matrixRefreshAnonymous.response.status === 401, `HTTP ${matrixRefreshAnonymous.response.status}`);
 
+  const privatePingAnonymous = await json("/api/messages/private-ping", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chatId: 1, eventId: "$smoke" }),
+  });
+  check("POST /api/messages/private-ping without a session is 401", privatePingAnonymous.response.status === 401);
+
   const pushStatusPublic = await json("/api/push/status");
   check("push status without a session is 401", pushStatusPublic.response.status === 401);
 

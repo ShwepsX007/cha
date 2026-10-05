@@ -4,7 +4,7 @@ import { db } from "@/db";
 import { chatMembers, chats, matrixPushEvents } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { verifyEncryptedMessageEvent } from "@/lib/matrix/server";
-import { notifyChatMessage } from "@/lib/notifications";
+import { notifyPrivateChatMessage } from "@/lib/notifications";
 
 export const dynamic = "force-dynamic";
 
@@ -77,15 +77,13 @@ export async function POST(req: NextRequest) {
 
     // E2EE content is intentionally never sent to Web Push. The title/body are
     // generic; only the chat ID is included to open the correct conversation.
-    await notifyChatMessage({
+    const result = await notifyPrivateChatMessage({
       chatId,
       senderId: appUser.userId,
       senderName: "Secret Chat",
-      textPreview: "Новое сообщение в приватном чате",
-      url: `/?chatId=${chatId}`,
     });
 
-    return NextResponse.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });
+    return NextResponse.json({ ok: true, ...result }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     console.error("Encrypted message push dispatch failed:", error instanceof Error ? error.name : "UnknownError");
     return NextResponse.json({ error: "Не удалось отправить уведомление" }, { status: 500 });

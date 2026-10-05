@@ -1327,12 +1327,26 @@ function formatMatrixReplyBody(body: string, reply: MatrixReplyReference): strin
   return `${fallback}\n\n${body}`;
 }
 
+function logPrivatePushResult(result: unknown, chatId: number): void {
+  if (!result || typeof result !== "object") return;
+  const data = result as Record<string, unknown>;
+  if (typeof data.sent !== "number" || data.sent > 0) return;
+  const safeNumber = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : null;
+  console.warn("Private chat push accepted without a successful delivery", {
+    chatId,
+    configured: data.configured === true,
+    recipients: safeNumber(data.recipients),
+    mutedRecipients: safeNumber(data.mutedRecipients),
+    failed: safeNumber(data.failed),
+  });
+}
+
 async function relayEncryptedMessagePush(
   session: MatrixSession,
   chatId: number,
   roomId: string,
   eventId: string,
-): Promise<void> {
+): Promise<boolean> {
   // A push relay failure must never fail a send that already succeeded - the
   // encrypted message is on the homeserver. But it used to be a single
   // fire-and-forget request, so any 401/403 from an access token that a reload
@@ -1358,7 +1372,11 @@ async function relayEncryptedMessagePush(
         }),
         cache: "no-store",
       });
-      if (response.ok) return;
+      if (response.ok) {
+        const result: unknown = await response.json().catch(() => null);
+        logPrivatePushResult(result, chatId);
+        return true;
+      }
 
       const statusCode = response.status;
       if ((statusCode === 401 || statusCode === 403) && !attemptedRefresh) {
@@ -1380,6 +1398,47 @@ async function relayEncryptedMessagePush(
     }
 
     if (attempt < 2) await delay(1_000 * (attempt + 1));
+  }
+  return false;
+}
+
+async function notifyPrivateMessagePush(
+  session: MatrixSession,
+  chatId: number,
+  roomId: string,
+  eventId: string,
+): Promise<void> {
+  // Prefer the relay that proves the event with Synapse. If that check fails
+  // (for example, because the sender's Matrix token just expired or the room
+  // metadata changed), use the authenticated membership-only ping as a fallback
+  // so a successfully sent E2EE message can still notify its recipient.
+  if (await relayEncryptedMessagePush(session, chatId, roomId, eventId)) return;
+
+  try {
+    const response = await fetch("/api/messages/private-ping", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chatId, eventId }),
+      cache: "no-store",
+    });
+    if (response.ok) {
+      const result: unknown = await response.json().catch(() => null);
+      logPrivatePushResult(result, chatId);
+      return;
+    }
+    if (response.status === 429) {
+      console.warn("Private chat push fallback was throttled", { chatId });
+      return;
+    }
+    console.warn("Private chat push fallback failed", {
+      statusCode: response.status,
+      chatId,
+    });
+  } catch {
+    console.warn("Private chat push fallback failed", {
+      reason: "network",
+      chatId,
+    });
   }
 }
 
@@ -1469,7 +1528,7 @@ async function runEncryptedOutboxMessage(
           item.replyTo,
           item.mentionUserIds,
         );
-        await relayEncryptedMessagePush(session, item.chatId, item.roomId, eventId);
+        await notifyPrivateMessagePush(session, item.chatId, item.roomId, eventId);
         try {
           removeEncryptedOutboxMessage(appUserId, item.id);
         } catch {
@@ -1615,7 +1674,7 @@ export async function sendEncryptedAttachment(
     ...(input.replyTo ? { "m.relates_to": { "m.in_reply_to": { event_id: input.replyTo.eventId } } } : {}),
     ...(input.mentionUserIds?.length ? { "m.mentions": { user_ids: input.mentionUserIds } } : {}),
   } satisfies RoomMessageEventContent);
-  await relayEncryptedMessagePush(session, input.chatId, roomId, response.event_id);
+  await notifyPrivateMessagePush(session, input.chatId, roomId, response.event_id);
 }
 
 export async function joinRoomIfInvited(
