@@ -55,6 +55,13 @@ async function main() {
   const chatsUnauthorized = await json("/api/chats");
   check("GET /api/chats without a session is 401", chatsUnauthorized.response.status === 401);
 
+  const passwordChangeUnauthorized = await json("/api/profile/password", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ newPassword: "smoke-password-2", confirmPassword: "smoke-password-2" }),
+  });
+  check("password change without a session is 401", passwordChangeUnauthorized.response.status === 401);
+
   if (!allowWrites) {
     console.log("\nSkipping write checks (set SMOKE_ALLOW_WRITES=1 to enable).");
   } else {
@@ -68,6 +75,33 @@ async function main() {
       body: JSON.stringify({ username: a, password: "smoke-password-1", displayName: `Smoke A ${suffix}` }),
     });
     check("register user A", regA.response.ok, `HTTP ${regA.response.status} ${JSON.stringify(regA.body)}`);
+
+    const newPassword = "smoke-password-2";
+    const passwordChange = await json("/api/profile/password", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ newPassword, confirmPassword: newPassword }),
+    }, regA.cookie);
+    check("change password without entering the old password",
+      passwordChange.response.ok && passwordChange.body?.success === true,
+      `HTTP ${passwordChange.response.status} ${JSON.stringify(passwordChange.body)}`);
+
+    const newPasswordLogin = await json("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: a, password: newPassword }),
+    });
+    check("new password works for login", newPasswordLogin.response.ok && newPasswordLogin.body?.user?.username === a,
+      `HTTP ${newPasswordLogin.response.status}`);
+
+    const oldPasswordLogin = await json("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: a, password: "smoke-password-1" }),
+    });
+    check("old password no longer works", oldPasswordLogin.response.status === 401,
+      `HTTP ${oldPasswordLogin.response.status}`);
+
     const regB = await json("/api/auth/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
