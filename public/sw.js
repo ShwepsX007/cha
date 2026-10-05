@@ -24,6 +24,10 @@ self.addEventListener("push", (event) => {
       const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       const chatIsVisible = windows.some((client) => {
         if (client.visibilityState !== "visible" || !data.chatId) return false;
+        // "Visible" is not "being looked at": a second monitor or an unfocused
+        // window is still visible, and suppressing there reads as "notifications
+        // are broken". Only a focused tab showing this exact chat suppresses.
+        if (typeof client.focused === "boolean" && !client.focused) return false;
         try {
           const url = new URL(client.url);
           return url.origin === self.location.origin && url.searchParams.get("chatId") === String(data.chatId);

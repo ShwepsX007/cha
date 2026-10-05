@@ -62,6 +62,15 @@ async function main() {
   });
   check("password change without a session is 401", passwordChangeUnauthorized.response.status === 401);
 
+  // Silent Matrix session recovery must never be callable anonymously, and must
+  // not accept a body without a refresh token/device ID.
+  const matrixRefreshAnonymous = await json("/api/auth/matrix-refresh", { method: "POST" });
+  check("POST /api/auth/matrix-refresh without a session is 401",
+    matrixRefreshAnonymous.response.status === 401, `HTTP ${matrixRefreshAnonymous.response.status}`);
+
+  const pushStatusPublic = await json("/api/push/status");
+  check("push status without a session is 401", pushStatusPublic.response.status === 401);
+
   if (!allowWrites) {
     console.log("\nSkipping write checks (set SMOKE_ALLOW_WRITES=1 to enable).");
   } else {
@@ -111,6 +120,14 @@ async function main() {
     const pushStatus = await json("/api/push/status", {}, regA.cookie);
     check("authenticated push status reports subscriptions", pushStatus.response.ok &&
       Number.isInteger(pushStatus.body?.subscriptionCount), `HTTP ${pushStatus.response.status}`);
+    const matrixRefreshBadBody = await json("/api/auth/matrix-refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId: "SMOKEDEVICE" }),
+    }, regA.cookie);
+    check("matrix-refresh rejects a body without a refresh token",
+      matrixRefreshBadBody.response.status === 400, `HTTP ${matrixRefreshBadBody.response.status}`);
+
     const pushTest = await json("/api/push/test", { method: "POST" }, regA.cookie);
     check("push test endpoint gives a clear unconfigured/unsubscribed result",
       pushTest.response.status === 409 || pushTest.response.status === 503,

@@ -58,6 +58,25 @@ export async function POST(req: NextRequest) {
       password: input.password,
       deviceId: input.deviceId,
     });
+
+    // A reset flag means "this device must be re-created". Once the homeserver
+    // has accepted a brand-new device for this user, the flag is satisfied by
+    // definition. Clearing it here (instead of relying on the client to make a
+    // second round-trip that used to be swallowed by a catch block) is what
+    // stops a failed reset from disabling Matrix on every page reload.
+    if (user.matrixResetRequired && matrix.availability === "ready" && matrix.session) {
+      try {
+        await db
+          .update(users)
+          .set({ matrixResetRequired: false })
+          .where(eq(users.id, user.id));
+      } catch (resetError) {
+        // The session itself is valid; a database hiccup while clearing the flag
+        // must not turn a successful Matrix login into an error response.
+        console.error("Matrix reset flag could not be cleared:", resetError instanceof Error ? resetError.name : "UnknownError");
+      }
+    }
+
     return NextResponse.json(
       { matrixAvailability: matrix.availability, matrixSession: matrix.session },
       { headers: { "Cache-Control": "no-store" } },

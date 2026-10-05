@@ -62,27 +62,27 @@ export async function getPushPermissionState(): Promise<NotificationPermission |
 
 export async function subscribeToPush(): Promise<{ ok: boolean; error?: string; publicKey?: string | null; denied?: boolean; iosHint?: boolean }> {
   if (!arePushNotificationsSupported()) {
-    return { ok: false, error: "Браузер не поддерживает push-уведомления" };
+    return {
+      ok: false,
+      error: typeof window !== "undefined" && window.isSecureContext === false
+        ? "Push требует HTTPS: откройте приложение по https:// (или localhost)."
+        : "Браузер не поддерживает push-уведомления",
+    };
   }
+
   try {
-    const configRes = await fetch("/api/push/subscribe", { cache: "no-store" });
-    const config = await configRes.json().catch(() => ({}));
-    if (!configRes.ok || !config.configured || !config.publicKey) {
-      return { ok: false, error: config.error || "Push-уведомления не настроены на сервере (задайте VAPID-ключи в .env)" };
-    }
-
-    // ready may remain pending forever if registration failed; use a bounded
-    // wait and give the user an actionable error instead of a stuck button.
-    const registration = await waitForActiveServiceWorker();
-    if (!registration) {
-      return { ok: false, error: "Service Worker не активировался. Проверьте HTTPS и доступность /sw.js, затем обновите страницу." };
-    }
-
-    // If user already denied permission, report it clearly.
+    // 1) Permission FIRST, while the button click is still the active user
+    //    gesture. Chrome only shows the prompt with a transient user
+    //    activation (~5s) and otherwise leaves the promise pending forever, so
+    //    awaiting the config and the service worker *before* asking used to
+    //    make the button look dead.
     if (Notification.permission === "denied") {
-      return { ok: false, denied: true, error: "Уведомления заблокированы в настройках браузера. Разрешите их в адресной строке и повторите." };
+      return {
+        ok: false,
+        denied: true,
+        error: "Уведомления заблокированы в настройках браузера. Разрешите их в адресной строке и повторите.",
+      };
     }
-
     let permission: NotificationPermission = Notification.permission;
     if (permission === "default") {
       try {
@@ -90,12 +90,30 @@ export async function subscribeToPush(): Promise<{ ok: boolean; error?: string; 
       } catch {
         permission = Notification.permission;
       }
-    }
-    if (permission !== "granted") {
-      if (permission === "denied") {
-        return { ok: false, denied: true, error: "Уведомления заблокированы в настройках браузера." };
+      if (permission !== "granted") {
+        return permission === "denied"
+          ? { ok: false, denied: true, error: "Разрешение на уведомления не выдано." }
+          : { ok: false, error: "Разрешение на уведомления не выдано." };
       }
-      return { ok: false, error: "Разрешение на уведомления не выдано." };
+    }
+
+    // 2) Now the server config and the service worker.
+    const configRes = await fetch("/api/push/subscribe", { cache: "no-store" });
+    const config = await configRes.json().catch(() => ({}));
+    if (!configRes.ok || !config.configured || !config.publicKey) {
+      const missing = Array.isArray(config.missingEnv) ? (config.missingEnv as string[]).join(", ") : "";
+      return {
+        ok: false,
+        error: config.error
+          || `Push-уведомления не настроены на сервере${missing ? ` (не задано: ${missing})` : " (задайте VAPID-ключи и VAPID_EMAIL в .env)"}`,
+      };
+    }
+
+    // ready may remain pending forever if registration failed; use a bounded
+    // wait and give the user an actionable error instead of a stuck button.
+    const registration = await waitForActiveServiceWorker();
+    if (!registration) {
+      return { ok: false, error: "Service Worker не активировался. Проверьте HTTPS и доступность /sw.js, затем обновите страницу." };
     }
 
     const { isIOS, isStandalone } = isIosSafari();

@@ -1,6 +1,7 @@
 import { db } from "@/db";
 import { sql } from "drizzle-orm";
-import { getMatrixHealthStatus } from "@/lib/matrix/server";
+import { getMatrixHealthStatus, isMatrixConfigured, matrixRefreshTokensEnabled } from "@/lib/matrix/server";
+import { isPushConfigured, missingPushEnv } from "@/lib/push";
 
 export const dynamic = "force-dynamic";
 
@@ -27,17 +28,13 @@ const REQUIRED_TABLES = [
 export async function GET() {
   const config = {
     jwtSecret: Boolean(process.env.JWT_SECRET),
-    matrix: Boolean(
-      process.env.MATRIX_INTERNAL_URL &&
-        process.env.MATRIX_PUBLIC_URL &&
-        process.env.MATRIX_SERVER_NAME &&
-        process.env.MATRIX_ADMIN_ACCESS_TOKEN,
-    ),
+    matrix: isMatrixConfigured(),
     telegram: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID),
-    push: Boolean(
-      process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY && process.env.VAPID_EMAIL,
-    ),
+    // Same predicate the sending code uses, so the probe cannot lie about push.
+    push: isPushConfigured(),
+    matrixRefreshTokens: matrixRefreshTokensEnabled(),
   };
+  const pushMissing = missingPushEnv();
 
   try {
     await db.execute(sql`select 1`);
@@ -72,6 +69,7 @@ export async function GET() {
       database: "ok",
       schema,
       ...(missingTables.length > 0 ? { missingTables, hint: "Run: npm run db:setup" } : {}),
+      ...(pushMissing.length > 0 ? { pushMissingEnv: pushMissing } : {}),
       matrix,
       config,
     },

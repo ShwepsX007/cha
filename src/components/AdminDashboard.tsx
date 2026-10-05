@@ -112,6 +112,7 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
 
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [wipeConfirmation, setWipeConfirmation] = useState("");
+  const [massMatrixConfirmation, setMassMatrixConfirmation] = useState("");
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
 
   useEffect(() => {
@@ -294,6 +295,7 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
       if (!response.ok && response.status !== 202) throw new Error(typeof data.error === "string" ? data.error : "Системное действие не выполнено");
       setNotice(typeof data.warning === "string" ? data.warning : "Системное действие выполнено.");
       setWipeConfirmation("");
+      setMassMatrixConfirmation("");
       const statusResponse = await fetch("/api/admin/system", { cache: "no-store" });
       const statusData = await readJson(statusResponse);
       if (statusResponse.ok) setSystemStatus(statusData as unknown as SystemStatus);
@@ -555,16 +557,25 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
               <h2 className="font-semibold">Matrix / Synapse</h2>
               <p className="mt-2 text-sm text-gray-400">Статус: <span className="text-gray-200">{systemStatus ? matrixStatusLabel(systemStatus.matrixStatus) : "Проверка…"}</span></p>
               <p className="mt-2 text-xs leading-relaxed text-gray-500">Matrix admin token остаётся только на сервере и не передаётся в браузер.</p>
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => {
-                  if (window.confirm("Отозвать устройства Matrix всех пользователей? Для каждого аккаунта будет установлен флаг нового входа.")) {
-                    void runSystemAction("mass_matrix_reset");
-                  }
-                }}
-                className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-semibold text-amber-100 hover:bg-amber-500/20 disabled:opacity-50"
-              >Массовый Matrix-сброс</button>
+              <label htmlFor="mass-matrix-confirmation" className="mt-3 block text-xs text-amber-200/80">
+                Отозвать устройства Matrix у всех: введите фразу <b>МАССОВЫЙ СБРОС</b>. Пока пользователь не введёт
+                пароль заново, его Matrix-сессия не будет создана.
+              </label>
+              <div className="mt-2 flex flex-col gap-3 sm:flex-row">
+                <input
+                  id="mass-matrix-confirmation"
+                  value={massMatrixConfirmation}
+                  onChange={(event) => setMassMatrixConfirmation(event.target.value)}
+                  placeholder="МАССОВЫЙ СБРОС"
+                  className="flex-1 rounded-xl border border-dark-500 bg-dark-700 px-4 py-3 text-sm text-white outline-none focus:border-amber-400"
+                />
+                <button
+                  type="button"
+                  disabled={busy || massMatrixConfirmation.trim() !== "МАССОВЫЙ СБРОС"}
+                  onClick={() => void runSystemAction("mass_matrix_reset", massMatrixConfirmation.trim())}
+                  className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-semibold text-amber-100 hover:bg-amber-500/20 disabled:opacity-50"
+                >Массовый Matrix-сброс</button>
+              </div>
             </div>
 
             <div className="rounded-2xl border border-red-500/30 bg-red-950/20 p-5 sm:p-6">

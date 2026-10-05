@@ -41,6 +41,15 @@ export async function POST(request: NextRequest) {
   const input = body as { action?: unknown; confirmation?: unknown };
 
   if (input.action === "mass_matrix_reset") {
+    // Flagging every account also means every user's Matrix session is refused
+    // until they log in again with a reachable homeserver, so it needs the same
+    // explicit confirmation as the destructive wipe.
+    if (input.confirmation !== "МАССОВЫЙ СБРОС") {
+      return NextResponse.json(
+        { error: "Для подтверждения введите точную фразу: МАССОВЫЙ СБРОС" },
+        { status: 400 },
+      );
+    }
     try {
       const accounts = await db.select({ id: users.id }).from(users);
       await db.update(users).set({ matrixResetRequired: true });

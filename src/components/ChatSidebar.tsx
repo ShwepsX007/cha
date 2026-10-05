@@ -44,6 +44,8 @@ export default function ChatSidebar({
   onOpenDeviceSecurity,
   onOpenProfileSettings,
   onRecoverMatrixSession,
+  matrixIdentityResetNeeded,
+  onResetMatrixIdentity,
 }: {
   user: User;
   chats: Chat[];
@@ -56,6 +58,9 @@ export default function ChatSidebar({
   onOpenDeviceSecurity: () => void;
   onOpenProfileSettings: () => void;
   onRecoverMatrixSession: () => void;
+  /** True only when the local crypto store itself is unreadable. */
+  matrixIdentityResetNeeded?: boolean;
+  onResetMatrixIdentity?: () => void;
 }) {
   const [showNewChat, setShowNewChat] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -82,7 +87,7 @@ export default function ChatSidebar({
                   matrixState === "unavailable"
                     ? user.matrixSession
                       ? "Matrix-сессия есть, но синхронизация не прошла. Проверьте подключение или восстановите сессию. Не очищайте данные сайта: там хранятся ключи устройства."
-                      : "В этой вкладке нет Matrix-сессии. Нажмите «Восстановить Matrix-сессию»; локальные ключи устройства сохранятся."
+                      : "Нет действующей Matrix-сессии для этого устройства. Нажмите «Восстановить Matrix-сессию» и введите пароль один раз; локальные ключи устройства сохранятся."
                     : matrixState === "not_configured"
                       ? "На сервере не настроен Matrix; личные чаты E2EE недоступны."
                       : "E2EE пока не включено для отправки новых личных сообщений"
@@ -99,13 +104,30 @@ export default function ChatSidebar({
                         : "Matrix не синхронизируется · восстановить"}
               </div>
               {matrixState === "unavailable" && (
-                <button
-                  type="button"
-                  onClick={onRecoverMatrixSession}
-                  className="mt-1 text-[10px] font-medium text-purple-300 hover:text-purple-200"
-                >
-                  Восстановить Matrix-сессию
-                </button>
+                <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <button
+                    type="button"
+                    onClick={onRecoverMatrixSession}
+                    className="text-[10px] font-medium text-purple-300 hover:text-purple-200"
+                  >
+                    Восстановить Matrix-сессию
+                  </button>
+                  {matrixIdentityResetNeeded && onResetMatrixIdentity && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (window.confirm(
+                          "Сбросить Matrix-идентичность этого устройства? Будут отозваны все устройства Synapse и удалены локальные E2EE-ключи; старые сообщения станут нечитаемыми без recovery key. Применяется, только если хранилище ключей действительно повреждено.",
+                        )) {
+                          onResetMatrixIdentity();
+                        }
+                      }}
+                      className="text-[10px] font-medium text-red-300 underline decoration-dotted hover:text-red-200"
+                    >
+                      Сбросить Matrix-идентичность
+                    </button>
+                  )}
+                </span>
               )}
             </div>
           </div>

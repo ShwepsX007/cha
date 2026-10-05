@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
-import { getVapidPublicKey, isPushConfigured, savePushSubscription } from "@/lib/push";
+import { getVapidPublicKey, isPushConfigured, missingPushEnv, savePushSubscription } from "@/lib/push";
 
 export const dynamic = "force-dynamic";
 
@@ -9,10 +9,12 @@ function isValidBase64(s: unknown): s is string {
 }
 
 export async function GET() {
+  const configured = isPushConfigured();
   return NextResponse.json({
-    configured: isPushConfigured(),
-    publicKey: getVapidPublicKey(),
-  });
+    configured,
+    publicKey: configured ? getVapidPublicKey() : null,
+    ...(!configured ? { missingEnv: missingPushEnv() } : {}),
+  }, { headers: { "Cache-Control": "no-store" } });
 }
 
 export async function POST(req: NextRequest) {
@@ -20,7 +22,10 @@ export async function POST(req: NextRequest) {
     const payload = await getCurrentUser();
     if (!payload) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     if (!isPushConfigured()) {
-      return NextResponse.json({ error: "Push is not configured on the server" }, { status: 503 });
+      return NextResponse.json(
+        { error: "Push is not configured on the server", missingEnv: missingPushEnv() },
+        { status: 503 },
+      );
     }
     const body = await req.json().catch(() => ({}));
     const endpoint = typeof body.endpoint === "string" ? body.endpoint.trim() : "";

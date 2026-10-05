@@ -3,24 +3,56 @@ import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { pushSubscriptions } from "@/db/schema";
 
+/**
+ * Per-delivery deadline. A VPS that cannot reach FCM/Mozilla push would
+ * otherwise keep `POST /api/messages` awaiting forever, which looks like "the
+ * message never sends" rather than "push is broken".
+ */
+const PUSH_SEND_TIMEOUT_MS = 10_000;
+
+function envValue(name: string): string {
+  // Trailing spaces/CR from a hand-edited .env silently break base64 decoding
+  // on the client, so every VAPID value is trimmed here.
+  return process.env[name]?.trim() ?? "";
+}
+
+/** Which VAPID variables are missing - surfaced by /api/push/status and /api/health. */
+export function missingPushEnv(): string[] {
+  const missing: string[] = [];
+  if (!getVapidPublicKey()) missing.push("VAPID_PUBLIC_KEY");
+  if (!envValue("VAPID_PRIVATE_KEY")) missing.push("VAPID_PRIVATE_KEY");
+  if (!vapidSubject()) missing.push("VAPID_EMAIL");
+  return missing;
+}
+
 export function isPushConfigured(): boolean {
-  return Boolean(
-    (process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY)
-    && process.env.VAPID_PRIVATE_KEY
-    && process.env.VAPID_EMAIL,
-  );
+  return missingPushEnv().length === 0;
 }
 
-export function getVapidPublicKey(): string | null {
-  return process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY || null;
+export function getVapidPublicKey(): string {
+  return envValue("VAPID_PUBLIC_KEY") || envValue("NEXT_PUBLIC_VAPID_PUBLIC_KEY");
 }
 
-function configureWebPush() {
-  const email = process.env.VAPID_EMAIL || "mailto:admin@example.com";
-  const pub = process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY || "";
-  const priv = process.env.VAPID_PRIVATE_KEY || "";
-  if (!pub || !priv) return false;
-  webpush.setVapidDetails(email, pub, priv);
+/**
+ * `web-push` rejects anything that is not an `https:` or `mailto:` URL, and the
+ * error it throws escapes before any notification is sent - which is how a bare
+ * `VAPID_EMAIL=admin@example.com` disables push while the logs show nothing but
+ * `errorName: Error`.
+ */
+export function vapidSubject(): string {
+  const configured = envValue("VAPID_EMAIL");
+  if (!configured) return "";
+  if (/^(https?|mailto):/i.test(configured)) return configured;
+  if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(configured)) return `mailto:${configured}`;
+  return "";
+}
+
+function configureWebPush(): boolean {
+  const subject = vapidSubject();
+  const publicKey = getVapidPublicKey();
+  const privateKey = envValue("VAPID_PRIVATE_KEY");
+  if (!subject || !publicKey || !privateKey) return false;
+  webpush.setVapidDetails(subject, publicKey, privateKey);
   return true;
 }
 
@@ -42,20 +74,43 @@ export interface PushSendResult {
   failed: number;
   removed: number;
   failureStatusCodes: number[];
+  missingEnv?: string[];
 }
 
-const emptyPushResult = (configured: boolean): PushSendResult => ({
-  configured,
+const emptyPushResult = (): PushSendResult => ({
+  configured: false,
   subscriptions: 0,
   sent: 0,
   failed: 0,
   removed: 0,
   failureStatusCodes: [],
+  missingEnv: missingPushEnv(),
 });
 
+async function sendWithTimeout(
+  subscription: { endpoint: string; keys: { p256dh: string; auth: string } },
+  payload: string,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // `Promise.race` subscribes to the delivery promise immediately, so a provider
+  // error that arrives after the deadline cannot become an unhandled rejection.
+  const guard = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), PUSH_SEND_TIMEOUT_MS);
+  });
+  try {
+    const outcome = await Promise.race([
+      webpush.sendNotification(subscription, payload, { TTL: 60 * 15 }).then(() => "sent" as const),
+      guard,
+    ]);
+    if (outcome === "timeout") throw new Error("Push provider did not answer in time");
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export async function sendPushToUser(userId: number, payload: PushPayload): Promise<PushSendResult> {
-  if (!isPushConfigured()) return emptyPushResult(false);
-  if (!configureWebPush()) return emptyPushResult(false);
+  if (!isPushConfigured()) return emptyPushResult();
+  if (!configureWebPush()) return emptyPushResult();
 
   const subs = await db
     .select()
@@ -71,10 +126,9 @@ export async function sendPushToUser(userId: number, payload: PushPayload): Prom
   await Promise.all(
     subs.map(async (sub) => {
       try {
-        await webpush.sendNotification(
+        await sendWithTimeout(
           { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
           json,
-          { TTL: 60 * 15 },
         );
         sent += 1;
       } catch (err: unknown) {
@@ -89,6 +143,9 @@ export async function sendPushToUser(userId: number, payload: PushPayload): Prom
           userId,
           statusCode: typeof status === "number" ? status : null,
           errorName: err instanceof Error ? err.name : "UnknownError",
+          errorMessage: err instanceof Error && !("statusCode" in (err as object))
+            ? err.message.slice(0, 200)
+            : undefined,
         });
         // 404 / 410 = subscription expired or was revoked.
         if (status === 404 || status === 410) toDelete.push(sub.id);

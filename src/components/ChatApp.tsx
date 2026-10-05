@@ -15,6 +15,7 @@ import {
   drainEncryptedOutbox,
   getAutomaticRecoveryNotice,
   getMatrixClient,
+  isFatalMatrixCryptoError,
   joinRoomIfInvited,
   MATRIX_RECOVERY_EVENT,
   restartMatrixClient,
@@ -24,7 +25,13 @@ import {
 } from "@/lib/matrix/client";
 import type { IEncryptedFile } from "matrix-encrypt-attachment";
 import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
-import { getMatrixDeviceId } from "@/lib/matrix/device-id";
+import { recoverMatrixSession } from "@/lib/matrix/recover-session";
+import {
+  clearMatrixSession,
+  loadMatrixSession,
+  refreshMatrixSessionFromServer,
+  subscribeToMatrixSessionChanges,
+} from "@/lib/matrix/session-store";
 
 export interface User {
   id: number;
@@ -122,6 +129,9 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
   const [showDeviceSecurity, setShowDeviceSecurity] = useState(Boolean(user.initialRecoveryKey));
   const [showProfileSettings, setShowProfileSettings] = useState(false);
   const [showMatrixRecovery, setShowMatrixRecovery] = useState(false);
+  // Set only when the *local* crypto store itself is unusable; it unlocks the
+  // manual "reset Matrix identity" action instead of running it automatically.
+  const [matrixIdentityResetNeeded, setMatrixIdentityResetNeeded] = useState(false);
   const [initialRecoveryKey, setInitialRecoveryKey] = useState(user.initialRecoveryKey || null);
   const [initialRecoveryKeySaved, setInitialRecoveryKeySaved] = useState(Boolean(user.initialRecoveryKeySaved));
   const [currentUserState, setCurrentUserState] = useState<User>(user);
@@ -155,65 +165,65 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
     } catch {
       console.error("Matrix logout failed");
     }
-    sessionStorage.removeItem("chata_matrix_session");
-    sessionStorage.removeItem("chata_matrix_availability");
+    clearMatrixSession();
     await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
     onLogout();
   }, [onLogout]);
 
-  const handleFatalMatrixReset = useCallback(async () => {
+  /**
+   * Destroys the E2EE identity of this app account on purpose: it is the last
+   * resort when the local crypto store is genuinely unreadable. It used to run
+   * automatically from a broad error pattern, which turned ordinary reloads into
+   * a permanent Matrix outage (revoked devices + deleted keys + a sticky reset
+   * flag). It is now only reachable from the sidebar button.
+   */
+  const handleResetMatrixIdentity = useCallback(async () => {
     try {
       await stopMatrixClient(true);
       await clearLocalMatrixCryptoStores(currentUserState.id);
       await fetch("/api/auth/matrix-reset", { method: "POST", cache: "no-store" }).catch(() => undefined);
     } catch {
-      console.error("Fatal matrix reset failed");
+      console.error("Matrix identity reset failed");
     }
-    sessionStorage.removeItem("chata_matrix_session");
-    sessionStorage.removeItem("chata_matrix_availability");
-    await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
-    onLogout();
-  }, [onLogout, currentUserState.id]);
+    clearMatrixSession(currentUserState.id);
+    setMatrixIdentityResetNeeded(false);
+    setCurrentUserState((current) => ({ ...current, matrixSession: null, matrixResetRequired: true }));
+    setMatrixState("unavailable");
+    setShowMatrixRecovery(true);
+  }, [currentUserState.id]);
 
   const handleRecoverMatrixSession = useCallback(async (password: string) => {
-    const deviceId = getMatrixDeviceId(currentUserState.username);
     // Stop the old SDK instance before re-authenticating this same device so
     // Rust crypto can reopen its existing IndexedDB without losing keys.
     await stopMatrixClient(false);
-    const response = await fetch("/api/auth/matrix-session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password, deviceId }),
-      cache: "no-store",
+    const recovered = await recoverMatrixSession({
+      username: currentUserState.username,
+      appUserId: currentUserState.id,
+      password,
+      resetRequired: Boolean(currentUserState.matrixResetRequired),
     });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || "Не удалось восстановить Matrix-сессию");
-    if (data.matrixAvailability !== "ready" || !data.matrixSession) {
-      throw new Error("Matrix пока недоступен. Повторите попытку позже.");
-    }
 
-    const matrixSession = data.matrixSession as MatrixSession;
-    sessionStorage.setItem("chata_matrix_session", JSON.stringify(matrixSession));
-    sessionStorage.setItem("chata_matrix_availability", "ready");
     setCurrentUserState((current) => ({
       ...current,
-      matrixSession,
+      matrixSession: recovered.session,
       matrixAvailability: "ready",
+      matrixResetRequired: false,
       matrixNotice: undefined,
     }));
     setMatrixState("checking");
     try {
-      await waitForMatrixSync(await getMatrixClient(matrixSession));
+      await waitForMatrixSync(await getMatrixClient(recovered.session));
       setMatrixState("connected");
       setAutomaticRecoveryNotice({
         status: "restored",
-        message: "Matrix-сессия восстановлена на прежнем устройстве. Локальные ключи E2EE сохранены.",
+        message: recovered.notice
+          || "Matrix-сессия восстановлена на прежнем устройстве. Локальные ключи E2EE сохранены.",
       });
     } catch (error) {
       setMatrixState("unavailable");
       throw new Error(error instanceof Error ? error.message : "Matrix пока не синхронизируется");
     }
-  }, [currentUserState.username]);
+  }, [currentUserState.username, currentUserState.id, currentUserState.matrixResetRequired]);
 
   const loadChats = useCallback(async () => {
     try {
@@ -238,6 +248,26 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
     return () => window.removeEventListener(MATRIX_RECOVERY_EVENT, onRecoveryUpdate);
   }, [currentUserState.matrixSession]);
 
+  // Other tabs rotate the single-use refresh token; adopt their result so this
+  // tab keeps a valid session (and a valid token for the E2EE push relay).
+  useEffect(() => {
+    return subscribeToMatrixSessionChanges(() => {
+      const next = loadMatrixSession(user.id);
+      if (!next) return;
+      setCurrentUserState((current) => current.id === user.id && current.matrixSession?.accessToken !== next.accessToken
+        ? { ...current, matrixSession: next, matrixAvailability: "ready" }
+        : current);
+    });
+  }, [user.id]);
+
+  // A revoked device still leaves a valid app session: open the one-field
+  // recovery dialog instead of pushing the user back to the login screen.
+  useEffect(() => {
+    if (currentUserState.matrixResetRequired && !currentUserState.matrixSession) {
+      setShowMatrixRecovery(true);
+    }
+  }, [currentUserState.matrixResetRequired, currentUserState.matrixSession]);
+
   useEffect(() => {
     if (!currentUserState.matrixSession) return;
     const session = currentUserState.matrixSession;
@@ -247,6 +277,9 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
     let recoveryAttempts = 0;
     let recoveryInFlight = false;
     let refreshInFlight = false;
+    // A rotation that the homeserver immediately rejects must not loop: two
+    // silent attempts, then the user is asked for the password exactly once.
+    let refreshAttempts = 0;
 
     const clearRecoveryTimer = () => {
       if (recoveryTimer !== null) {
@@ -286,46 +319,64 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
       }, waitMs);
     };
 
-    const handleUnknownToken = async (client: Awaited<ReturnType<typeof getMatrixClient>>) => {
+    const handleUnknownToken = async () => {
       if (refreshInFlight || cancelled) return;
-      if (!session.refreshToken) {
+      if (refreshAttempts >= 2) {
+        setMatrixState("unavailable");
         setAutomaticRecoveryNotice({
           status: "needs-recovery",
-          message: "Matrix-сессия истекла, а сервер не выдал refresh token. Нажмите «Восстановить Matrix-сессию»; выходить из аккаунта не нужно.",
+          message: "Matrix отказывается обновлять токен этого устройства. Введите пароль аккаунта в «Восстановить Matrix-сессию» — ключи E2EE останутся на месте.",
         });
+        setShowMatrixRecovery(true);
         return;
       }
-
       refreshInFlight = true;
+      refreshAttempts += 1;
       setMatrixState("checking");
       setAutomaticRecoveryNotice({ status: "restoring", message: "Обновляем Matrix-сессию…" });
       try {
-        const tokens = await client.refreshToken(session.refreshToken);
+        // Rotating through the app server (not the browser's own /refresh call)
+        // keeps one authoritative copy of the single-use refresh token: it is
+        // written to storage before the client restarts and broadcast to tabs.
+        const nextSession = await refreshMatrixSessionFromServer(session);
         if (cancelled) return;
-        client.setAccessToken(tokens.access_token);
-        const nextSession: MatrixSession = {
-          ...session,
-          accessToken: tokens.access_token,
-          refreshToken: tokens.refresh_token,
-          expiresAt: Date.now() + tokens.expires_in_ms,
-        };
-        try {
-          sessionStorage.setItem("chata_matrix_session", JSON.stringify(nextSession));
-          sessionStorage.setItem("chata_matrix_availability", "ready");
-        } catch {
-          // Keep this tab working even if browser storage is full or disabled.
+        if (!nextSession) {
+          setMatrixState("unavailable");
+          setAutomaticRecoveryNotice({
+            status: "needs-recovery",
+            message: "Matrix-сессия истекла, а сервер не выдал refresh token. Нажмите «Восстановить Matrix-сессию»; выходить из аккаунта не нужно, ключи сохранятся.",
+          });
+          setShowMatrixRecovery(true);
+          return;
         }
         setCurrentUserState((current) => current.id === user.id
           ? { ...current, matrixSession: nextSession, matrixAvailability: "ready", matrixNotice: undefined }
           : current);
-        setAutomaticRecoveryNotice({ status: "restored", message: "Matrix-сессия автоматически обновлена." });
-      } catch {
+        // The SDK stops its sync loop on M_UNKNOWN_TOKEN, so the new token needs
+        // an explicit restart; reusing the client keeps the crypto store open.
+        try {
+          await restartMatrixClient(nextSession);
+          if (cancelled) return;
+          setMatrixState("connected");
+          setAutomaticRecoveryNotice({ status: "restored", message: "Matrix-сессия автоматически обновлена." });
+        } catch {
+          if (cancelled) return;
+          setMatrixState("unavailable");
+          setAutomaticRecoveryNotice({
+            status: "needs-recovery",
+            message: "Токен обновлён, но синхронизация Matrix ещё не восстановилась. Обновите страницу или нажмите «Восстановить Matrix-сессию».",
+          });
+        }
+      } catch (error) {
         if (!cancelled) {
           setMatrixState("unavailable");
           setAutomaticRecoveryNotice({
             status: "needs-recovery",
-            message: "Не удалось обновить Matrix-сессию. Нажмите «Восстановить Matrix-сессию»; локальные ключи сохранятся.",
+            message: error instanceof Error
+              ? `${error.message} Нажмите «Восстановить Matrix-сессию»; локальные ключи сохранятся.`
+              : "Не удалось обновить Matrix-сессию. Нажмите «Восстановить Matrix-сессию»; локальные ключи сохранятся.",
           });
+          setShowMatrixRecovery(true);
         }
       } finally {
         refreshInFlight = false;
@@ -345,20 +396,26 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
           ? (error as { errcode?: unknown }).errcode
           : undefined;
         if (errcode === "M_UNKNOWN_TOKEN") {
-          if (matrixClient) void handleUnknownToken(matrixClient);
+          void handleUnknownToken();
+        } else if (isFatalMatrixCryptoError(error)) {
+          // Surface it and let the user decide; never wipe keys by itself.
+          const detail = error instanceof Error ? error.message : "crypto store error";
+          setMatrixIdentityResetNeeded(true);
+          setAutomaticRecoveryNotice({
+            status: "needs-recovery",
+            message: `Локальное хранилище ключей Matrix недоступно (${detail}). Закройте другие вкладки `
+              + "с приложением и нажмите «Восстановить Matrix-сессию». Полный сброс идентичности нужен "
+              + "только если ключи действительно повреждены.",
+          });
         } else {
-          const errorMessage = error instanceof Error ? error.message : "";
-          if (/unknown device|corrupted|indexeddb|crypto store|decryption|key error|invalid session/i.test(errorMessage)) {
-            void handleFatalMatrixReset();
-          } else {
-            scheduleRestart();
-          }
+          scheduleRestart();
         }
         return;
       }
       if (state === SyncState.Prepared || state === SyncState.Syncing || state === SyncState.Catchup) {
         clearRecoveryTimer();
         recoveryAttempts = 0;
+        refreshAttempts = 0;
         setMatrixState("connected");
       }
       if (
@@ -380,14 +437,22 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
         setMatrixState("connected");
         void drainEncryptedOutbox(session).catch(() => undefined);
       })
-      .catch((error) => {
+      .catch(async (error) => {
         const errorType = error instanceof Error ? error.name : "Unknown Matrix sync error";
-        const fatalCryptoError = error instanceof Error && /unknown device|corrupted|indexeddb|crypto store|decryption|key error|invalid session/i.test(error.message);
         console.error("Matrix client unavailable:", errorType);
         if (cancelled) return;
         setMatrixState("unavailable");
-        if (fatalCryptoError) {
-          void handleFatalMatrixReset();
+        if (isFatalMatrixCryptoError(error)) {
+          setMatrixIdentityResetNeeded(true);
+        } else if (matrixClient?.getSyncState() === SyncState.Error) {
+          // Most common case after a reload: the stored access token is no
+          // longer accepted. Refresh it silently instead of waiting for a human.
+          const stateData = matrixClient.getSyncStateData() as { error?: { errcode?: string } } | undefined;
+          if (stateData?.error?.errcode === "M_UNKNOWN_TOKEN") {
+            await handleUnknownToken();
+            return;
+          }
+          onSync(SyncState.Error, null, stateData || undefined);
         } else if (matrixClient) {
           const currentState = matrixClient.getSyncState();
           if (currentState === SyncState.Error || currentState === SyncState.Stopped) {
@@ -401,7 +466,7 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
       clearRecoveryTimer();
       if (matrixClient) matrixClient.removeListener(ClientEvent.Sync, onSync);
     };
-  }, [handleFatalMatrixReset, currentUserState.matrixSession, user.id]);
+  }, [currentUserState.matrixSession, user.id]);
 
   useEffect(() => {
     if (!currentUserState.matrixSession) return;
@@ -481,6 +546,8 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
           onOpenDeviceSecurity={() => setShowDeviceSecurity(true)}
           onOpenProfileSettings={() => setShowProfileSettings(true)}
           onRecoverMatrixSession={() => setShowMatrixRecovery(true)}
+          matrixIdentityResetNeeded={matrixIdentityResetNeeded}
+          onResetMatrixIdentity={handleResetMatrixIdentity}
         />
       </div>
 
