@@ -1,10 +1,32 @@
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim() || "";
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID?.trim() || "";
+
+export const MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024;
 
 const BASE_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 export function isTelegramConfigured() {
   return Boolean(BOT_TOKEN && CHAT_ID);
+}
+
+function createFormData(field: "photo" | "audio" | "video" | "document", buffer: Buffer, fileName: string, mimeType: string) {
+  const formData = new FormData();
+  formData.append("chat_id", CHAT_ID);
+  const blob = new Blob([new Uint8Array(buffer)], { type: mimeType });
+  formData.append(field, blob, fileName);
+  return formData;
+}
+
+async function tgFetch(method: string, formData: FormData): Promise<any> {
+  const res = await fetch(`${BASE_URL}/${method}`, { method: "POST", body: formData });
+  return res.json();
+}
+
+function sanitizeName(name: string, fallbackPrefix: string): string {
+  const safe = String(name || "").replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, "_").trim();
+  if (!safe) return `${fallbackPrefix}_${Date.now()}`;
+  return safe;
 }
 
 export async function uploadFileToTelegram(
@@ -14,33 +36,43 @@ export async function uploadFileToTelegram(
 ): Promise<{ fileId: string; fileSize: number } | null> {
   if (!isTelegramConfigured()) return null;
 
-  const formData = new FormData();
-  formData.append("chat_id", CHAT_ID);
+  const safeName = sanitizeName(fileName, "file");
+  const mime = String(mimeType || "application/octet-stream").toLowerCase();
 
-  const uint8 = new Uint8Array(fileBuffer);
-  const blob = new Blob([uint8], { type: mimeType });
+  // Telegram audio endpoint handles mp3/ogg/audio mimes with proper metadata.
+  if (mime.startsWith("audio/") || mime === "application/ogg") {
+    const fd = createFormData("audio", fileBuffer, safeName, mime);
+    const data = await tgFetch("sendAudio", fd);
+    if (data.ok && data.result.audio?.file_id) {
+      return { fileId: data.result.audio.file_id, fileSize: data.result.audio.file_size || fileBuffer.length };
+    }
+  }
 
-  if (mimeType.startsWith("image/")) {
-    formData.append("photo", blob, fileName);
-    const res = await fetch(`${BASE_URL}/sendPhoto`, {
-      method: "POST",
-      body: formData,
-    });
-    const data = await res.json();
+  // Video endpoint for mp4/webm etc. Falls back to document if Telegram rejects.
+  if (mime.startsWith("video/")) {
+    const fd = createFormData("video", fileBuffer, safeName, mime);
+    const data = await tgFetch("sendVideo", fd);
+    if (data.ok && data.result.video?.file_id) {
+      return { fileId: data.result.video.file_id, fileSize: data.result.video.file_size || fileBuffer.length };
+    }
+  }
+
+  // Photo endpoint only accepts images. Use its own fresh FormData so a failed
+  // photo request cannot leak a duplicate field into the document fallback.
+  if (mime.startsWith("image/")) {
+    const fd = createFormData("photo", fileBuffer, safeName, mime);
+    const data = await tgFetch("sendPhoto", fd);
     if (data.ok && data.result.photo) {
       const largest = data.result.photo[data.result.photo.length - 1];
       return { fileId: largest.file_id, fileSize: largest.file_size || fileBuffer.length };
     }
   }
 
-  // For videos, documents, and everything else
-  formData.append("document", blob, fileName);
-  const res = await fetch(`${BASE_URL}/sendDocument`, {
-    method: "POST",
-    body: formData,
-  });
-  const data = await res.json();
-  if (data.ok && data.result.document) {
+  // Everything else: pdf/docx/zip/mp3-fallback etc. sendDocument is the
+  // universal endpoint Telegram uses for arbitrary attachments.
+  const docFd = createFormData("document", fileBuffer, safeName, mime);
+  const data = await tgFetch("sendDocument", docFd);
+  if (data.ok && data.result.document?.file_id) {
     return {
       fileId: data.result.document.file_id,
       fileSize: data.result.document.file_size || fileBuffer.length,
@@ -50,20 +82,36 @@ export async function uploadFileToTelegram(
   return null;
 }
 
-export async function getFileFromTelegram(fileId: string): Promise<{
+export interface TelegramFileResult {
   url: string;
   buffer: Buffer;
-} | null> {
+  mimeType?: string;
+  fileName?: string;
+  fileSize?: number;
+}
+
+export async function getFileFromTelegram(fileId: string): Promise<TelegramFileResult | null> {
   if (!isTelegramConfigured()) return null;
 
-  const res = await fetch(`${BASE_URL}/getFile?file_id=${fileId}`);
+  const getFileUrl = new URL(`${BASE_URL}/getFile`);
+  getFileUrl.searchParams.set("file_id", fileId);
+  const res = await fetch(getFileUrl);
   const data = await res.json();
 
-  if (!data.ok || !data.result.file_path) return null;
+  if (!data.ok || !data.result?.file_path) return null;
+  if (typeof data.result.file_size === "number" && data.result.file_size > MAX_TELEGRAM_DOWNLOAD_BYTES) {
+    console.error("Telegram file too large for Bot API download:", data.result.file_size);
+    return null;
+  }
 
   const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${data.result.file_path}`;
   const fileRes = await fetch(fileUrl);
+  if (!fileRes.ok) return null;
   const buffer = Buffer.from(await fileRes.arrayBuffer());
 
-  return { url: fileUrl, buffer };
+  return {
+    url: fileUrl,
+    buffer,
+    fileSize: data.result.file_size,
+  };
 }

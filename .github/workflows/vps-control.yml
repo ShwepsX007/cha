@@ -1,0 +1,151 @@
+name: VPS control
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Operation to run on the production VPS
+        type: choice
+        required: true
+        default: status
+        options:
+          - status
+          - health
+          - smoke
+          - deploy
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chata-production
+  cancel-in-progress: false
+
+jobs:
+  manage:
+    if: github.ref == 'refs/heads/main'
+    name: ${{ inputs.operation }} on production VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Check out the main-branch source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate production connection settings
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          APP_PORT: ${{ vars.APP_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_HOST:?Set production environment variable DEPLOY_HOST}"
+          : "${DEPLOY_USER:?Set production environment variable DEPLOY_USER}"
+          : "${DEPLOY_PORT:?Set production environment variable DEPLOY_PORT}"
+          : "${APP_PORT:?Set production environment variable APP_PORT}"
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "DEPLOY_HOST must be a DNS name or IPv4 address." >&2; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || { echo "DEPLOY_USER is not a valid Unix account name." >&2; exit 1; }
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$DEPLOY_PORT >= 1 && 10#$DEPLOY_PORT <= 65535 )) || { echo "DEPLOY_PORT must be between 1 and 65535." >&2; exit 1; }
+          [[ "$APP_PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$APP_PORT >= 1 && 10#$APP_PORT <= 65535 )) || { echo "APP_PORT must be between 1 and 65535." >&2; exit 1; }
+
+      - name: Configure and verify SSH
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_SSH_KEY:?Add DEPLOY_SSH_KEY to the production environment secrets}"
+          : "${DEPLOY_KNOWN_HOSTS:?Add verified DEPLOY_KNOWN_HOSTS to the production environment secrets}"
+
+          install -m 700 -d "$HOME/.ssh"
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/chata-vps-key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/chata-vps-key" "$HOME/.ssh/known_hosts"
+          printf 'Host chata-vps\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile %s\n  BatchMode yes\n  ConnectTimeout 15\n' \
+            "$DEPLOY_HOST" "$DEPLOY_USER" "$DEPLOY_PORT" \
+            "$RUNNER_TEMP/chata-vps-key" "$HOME/.ssh/known_hosts" > "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
+          ssh -F "$HOME/.ssh/config" chata-vps true
+
+      - name: Run selected VPS operation
+        env:
+          OPERATION: ${{ inputs.operation }}
+          APP_PORT: ${{ vars.APP_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_cmd=(ssh -F "$HOME/.ssh/config" chata-vps)
+
+          case "$OPERATION" in
+            status)
+              "${ssh_cmd[@]}" "set -eu
+                echo '--- PM2 ---'
+                pm2 status --no-color
+                echo '--- Runtime ---'
+                node --version
+                npm --version
+                echo '--- Disk ---'
+                df -h /srv/chata
+                echo '--- Application health ---'
+                curl --fail --silent --show-error --max-time 15 http://127.0.0.1:${APP_PORT}/api/health
+                echo"
+              ;;
+            health)
+              "${ssh_cmd[@]}" "curl --fail --silent --show-error --max-time 15 http://127.0.0.1:${APP_PORT}/api/health"
+              echo
+              ;;
+            smoke)
+              "${ssh_cmd[@]}" "cd /srv/chata && BASE_URL=http://127.0.0.1:${APP_PORT} npm run smoke"
+              ;;
+            deploy)
+              ssh -F "$HOME/.ssh/config" chata-vps 'install -d -m 0750 /srv/chata'
+              rsync --archive --compress --delete --delete-delay \
+                --include='/.env.example' \
+                --exclude='/.env*' \
+                --exclude='/.data/' \
+                --exclude='/logs/' \
+                --exclude='/node_modules/' \
+                --exclude='/.next/' \
+                --exclude='/.git/' \
+                --exclude='/.tmp-pg/' \
+                --exclude='/public/avatars/' \
+                --rsh="ssh -F $HOME/.ssh/config" \
+                ./ chata-vps:/srv/chata/
+
+              # Deployment output is retained with mode 0600 on the VPS if a
+              # command fails; raw server logs are deliberately not copied to
+              # Actions logs because this repository is public.
+              ssh -F "$HOME/.ssh/config" chata-vps "APP_PORT=${APP_PORT} bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd /srv/chata
+          test -f .env || { echo "Production .env is missing in /srv/chata." >&2; exit 1; }
+          command -v node >/dev/null
+          command -v npm >/dev/null
+          command -v pm2 >/dev/null
+          umask 077
+          log_file="$HOME/chata-deploy-$(date +%Y%m%d%H%M%S).log"
+          if PORT="$APP_PORT" npm run deploy >"$log_file" 2>&1; then
+            rm -f "$log_file"
+            echo "Deploy script completed successfully."
+          else
+            result=$?
+            echo "Deploy failed. A private log was retained on the VPS at $log_file." >&2
+            exit "$result"
+          fi
+          REMOTE
+              "${ssh_cmd[@]}" "cd /srv/chata && BASE_URL=http://127.0.0.1:${APP_PORT} npm run smoke"
+              ;;
+            *)
+              echo "Unsupported VPS operation." >&2
+              exit 2
+              ;;
+          esac

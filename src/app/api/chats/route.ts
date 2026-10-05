@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { chats, chatMembers, users, messages } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
+import { verifyEncryptedRoom } from "@/lib/matrix/server";
+import { ensureGeneralChatMembership, GENERAL_CHAT_NAME } from "@/lib/chats";
 import { eq, and, desc, inArray, sql } from "drizzle-orm";
 
 export async function GET() {
@@ -11,23 +13,35 @@ export async function GET() {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // Get chat IDs where user is a member
-    const memberRows = await db
-      .select({ chatId: chatMembers.chatId })
-      .from(chatMembers)
-      .where(eq(chatMembers.userId, payload.userId));
+    const loadMemberships = async () => {
+      const rows = await db
+        .select({ chatId: chatMembers.chatId })
+        .from(chatMembers)
+        .where(eq(chatMembers.userId, payload.userId));
+      const ids = rows.map((r) => r.chatId);
+      const list = ids.length
+        ? await db.select().from(chats).where(inArray(chats.id, ids))
+        : [];
+      return { ids, list };
+    };
 
-    const chatIds = memberRows.map((r) => r.chatId);
+    let { ids: chatIds, list: chatList } = await loadMemberships();
+
+    // Accounts that lost their membership (deleted chat, admin wipe, manual
+    // cleanup in the database) used to be stuck with an empty chat list
+    // forever: only registration could join the public chat. Restore it.
+    const hasGeneralChat = chatList.some(
+      (chat) => chat.isGroup && chat.securityMode === "public" && chat.name === GENERAL_CHAT_NAME,
+    );
+    if (!hasGeneralChat) {
+      await ensureGeneralChatMembership(payload.userId);
+      ({ ids: chatIds, list: chatList } = await loadMemberships());
+    }
+
     if (chatIds.length === 0) {
       return NextResponse.json({ chats: [] });
     }
 
-    const chatList = await db
-      .select()
-      .from(chats)
-      .where(inArray(chats.id, chatIds));
-
-    // For each chat, get members and last message
     const result = await Promise.all(
       chatList.map(async (chat) => {
         const members = await db
@@ -36,6 +50,8 @@ export async function GET() {
             username: users.username,
             displayName: users.displayName,
             avatarColor: users.avatarColor,
+            avatarUrl: users.avatarUrl,
+            avatarUpdatedAt: users.avatarUpdatedAt,
             lastSeen: users.lastSeen,
           })
           .from(chatMembers)
@@ -49,21 +65,32 @@ export async function GET() {
             messageType: messages.messageType,
             fileName: messages.fileName,
             senderId: messages.senderId,
+            senderDisplayName: users.displayName,
+            senderAvatarColor: users.avatarColor,
+            senderAvatarUrl: users.avatarUrl,
             createdAt: messages.createdAt,
           })
           .from(messages)
+          .innerJoin(users, eq(messages.senderId, users.id))
           .where(eq(messages.chatId, chat.id))
           .orderBy(desc(messages.createdAt))
           .limit(1);
 
-        // For private chats, use the other user's name
         let chatName = chat.name;
+        let notificationsMuted = false;
         if (!chat.isGroup) {
           const otherUser = members.find((m) => m.id !== payload.userId);
           chatName = otherUser?.displayName || "Чат";
         }
+        // Find current user's own mute setting for this chat.
+        const myMember = await db
+          .select({ notificationsMuted: chatMembers.notificationsMuted })
+          .from(chatMembers)
+          .where(and(eq(chatMembers.chatId, chat.id), eq(chatMembers.userId, payload.userId)))
+          .limit(1);
+        notificationsMuted = myMember[0]?.notificationsMuted || false;
 
-        const unreadCount = await db
+        const messageCount = await db
           .select({ count: sql<number>`count(*)` })
           .from(messages)
           .where(eq(messages.chatId, chat.id));
@@ -72,13 +99,13 @@ export async function GET() {
           ...chat,
           name: chatName,
           members,
+          notificationsMuted,
           lastMessage: lastMessage || null,
-          messageCount: Number(unreadCount[0]?.count || 0),
+          messageCount: Number(messageCount[0]?.count || 0),
         };
-      })
+      }),
     );
 
-    // Sort by last message time
     result.sort((a, b) => {
       const aTime = a.lastMessage?.createdAt?.getTime() || 0;
       const bTime = b.lastMessage?.createdAt?.getTime() || 0;
@@ -99,64 +126,128 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const { targetUserId, name, isGroup } = await req.json();
+    const body = await req.json();
+    const isGroup = body.isGroup === true;
+    const rawMemberIds: unknown[] = isGroup
+      ? Array.isArray(body.memberUserIds) ? body.memberUserIds : []
+      : [body.targetUserId];
+    const memberUserIds = [...new Set(rawMemberIds.map(Number))];
+    const matrixRoomId = typeof body.matrixRoomId === "string" ? body.matrixRoomId : "";
+    const matrixAccessToken = typeof body.matrixAccessToken === "string" ? body.matrixAccessToken : "";
+    const name = typeof body.name === "string" ? body.name.trim().slice(0, 100) : "";
 
-    if (!isGroup && targetUserId) {
-      // Check if private chat already exists between these two users
-      const myChats = await db
+    if (
+      memberUserIds.length === 0 ||
+      (isGroup && memberUserIds.length < 2) ||
+      memberUserIds.some((id) => !Number.isInteger(id) || id <= 0 || id === payload.userId)
+    ) {
+      return NextResponse.json(
+        { error: isGroup ? "Выберите как минимум двух участников группы" : "A valid other user is required" },
+        { status: 400 },
+      );
+    }
+
+    const targetUsers = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(inArray(users.id, memberUserIds));
+    if (targetUsers.length !== memberUserIds.length) {
+      return NextResponse.json({ error: "One or more users were not found" }, { status: 404 });
+    }
+
+    let existingChat: typeof chats.$inferSelect | undefined;
+    if (!isGroup) {
+      const myRows = await db
         .select({ chatId: chatMembers.chatId })
         .from(chatMembers)
         .where(eq(chatMembers.userId, payload.userId));
-      
-      const myChatIds = myChats.map((r) => r.chatId);
-      
+      const myChatIds = myRows.map((row) => row.chatId);
+
       if (myChatIds.length > 0) {
-        const theirChats = await db
+        const sharedRows = await db
           .select({ chatId: chatMembers.chatId })
           .from(chatMembers)
           .where(
             and(
-              eq(chatMembers.userId, targetUserId),
-              inArray(chatMembers.chatId, myChatIds)
-            )
+              eq(chatMembers.userId, memberUserIds[0]),
+              inArray(chatMembers.chatId, myChatIds),
+            ),
           );
-
-        for (const tc of theirChats) {
-          const [existingChat] = await db
+        for (const shared of sharedRows) {
+          const [candidate] = await db
             .select()
             .from(chats)
-            .where(and(eq(chats.id, tc.chatId), eq(chats.isGroup, false)));
-          if (existingChat) {
-            return NextResponse.json({ chat: existingChat, existing: true });
+            .where(and(eq(chats.id, shared.chatId), eq(chats.isGroup, false)));
+          if (candidate) {
+            existingChat = candidate;
+            break;
           }
         }
       }
     }
 
-    const [chat] = await db
-      .insert(chats)
-      .values({
-        name: name || null,
-        isGroup: isGroup || false,
-        createdBy: payload.userId,
-      })
-      .returning();
+    if (existingChat?.securityMode === "e2ee" && existingChat.matrixRoomId) {
+      return NextResponse.json({ chat: existingChat, existing: true });
+    }
 
-    // Add creator as member
-    await db.insert(chatMembers).values({
-      chatId: chat.id,
-      userId: payload.userId,
-    });
-
-    // Add target user for private chat
-    if (targetUserId) {
-      await db.insert(chatMembers).values({
-        chatId: chat.id,
-        userId: targetUserId,
+    // Do not create a plaintext private room. The first request tells the
+    // browser to create a Matrix room; the second request verifies and links it.
+    if (!matrixRoomId || !matrixAccessToken) {
+      return NextResponse.json({
+        chat: existingChat || null,
+        existing: Boolean(existingChat),
+        requiresEncryptedRoom: true,
       });
     }
 
-    return NextResponse.json({ chat });
+    try {
+      await verifyEncryptedRoom({
+        roomId: matrixRoomId,
+        accessToken: matrixAccessToken,
+        appUserIds: [payload.userId, ...memberUserIds],
+        authenticatedAppUserId: payload.userId,
+        creatorAppUserId: payload.userId,
+        expectedHistoryVisibility: isGroup ? "joined" : "invited",
+      });
+    } catch (error) {
+      console.warn("Rejected unverified Matrix room for app chat:", error);
+      return NextResponse.json(
+        { error: "Не удалось подтвердить, что комната Matrix приватная и зашифрованная" },
+        { status: 400 },
+      );
+    }
+
+    if (existingChat) {
+      const [chat] = await db
+        .update(chats)
+        .set({
+          securityMode: "e2ee",
+          matrixRoomId,
+          e2eeEnabledAt: new Date(),
+        })
+        .where(eq(chats.id, existingChat.id))
+        .returning();
+      return NextResponse.json({ chat, existing: true, upgraded: true });
+    }
+
+    const [chat] = await db
+      .insert(chats)
+      .values({
+        name: isGroup ? (name || "Приватная группа") : null,
+        isGroup,
+        createdBy: payload.userId,
+        securityMode: "e2ee",
+        matrixRoomId,
+        e2eeEnabledAt: new Date(),
+      })
+      .returning();
+
+    await db.insert(chatMembers).values([
+      { chatId: chat.id, userId: payload.userId },
+      ...memberUserIds.map((userId) => ({ chatId: chat.id, userId })),
+    ]);
+
+    return NextResponse.json({ chat, existing: false });
   } catch (error) {
     console.error("Create chat error:", error);
     return NextResponse.json({ error: "Server error" }, { status: 500 });

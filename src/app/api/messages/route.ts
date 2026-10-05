@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { messages, users, chatMembers } from "@/db/schema";
+import { messages, users, chatMembers, chats } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { eq, and, asc } from "drizzle-orm";
+import { getActivePublicChatBan } from "@/lib/moderation";
+import { messagePreview, notifyChatMessage } from "@/lib/notifications";
 
 export async function GET(req: NextRequest) {
   try {
@@ -28,6 +30,13 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: "Not a member" }, { status: 403 });
     }
 
+    // Do not treat a background tab's polling as active presence: that would
+    // suppress push notifications indefinitely while the app is merely open
+    // in another tab. Older clients without the header retain the old behavior.
+    if (req.headers.get("x-chat-visible") !== "0") {
+      await db.update(users).set({ lastSeen: new Date() }).where(eq(users.id, payload.userId));
+    }
+
     const msgs = await db
       .select({
         id: messages.id,
@@ -43,6 +52,7 @@ export async function GET(req: NextRequest) {
         senderUsername: users.username,
         senderDisplayName: users.displayName,
         senderAvatarColor: users.avatarColor,
+        senderAvatarUrl: users.avatarUrl,
       })
       .from(messages)
       .innerJoin(users, eq(messages.senderId, users.id))
@@ -68,7 +78,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "chatId and content required" }, { status: 400 });
     }
 
-    // Check membership
     const [membership] = await db
       .select()
       .from(chatMembers)
@@ -80,6 +89,30 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Not a member" }, { status: 403 });
     }
 
+    const [chat] = await db
+      .select({ securityMode: chats.securityMode })
+      .from(chats)
+      .where(eq(chats.id, chatId));
+
+    if (!chat || chat.securityMode !== "public") {
+      return NextResponse.json(
+        { error: "Private messages must use the encrypted Matrix room", code: "E2EE_REQUIRED" },
+        { status: 409 },
+      );
+    }
+
+    const activeBan = await getActivePublicChatBan(payload.userId);
+    if (activeBan) {
+      return NextResponse.json(
+        {
+          error: `Отправка в общий чат заблокирована до ${activeBan.bannedUntil.toISOString()}`,
+          bannedUntil: activeBan.bannedUntil.toISOString(),
+          banReason: activeBan.banReason,
+        },
+        { status: 403 },
+      );
+    }
+
     const [msg] = await db
       .insert(messages)
       .values({
@@ -89,6 +122,20 @@ export async function POST(req: NextRequest) {
         messageType: "text",
       })
       .returning();
+
+    const [sender] = await db
+      .select({ displayName: users.displayName })
+      .from(users)
+      .where(eq(users.id, payload.userId));
+
+    // Fire-and-forget push to offline members.
+    void notifyChatMessage({
+      chatId,
+      senderId: payload.userId,
+      senderName: sender?.displayName || "Пользователь",
+      textPreview: messagePreview("text", content.trim(), null),
+      messageId: msg.id,
+    });
 
     return NextResponse.json({ message: msg });
   } catch (error) {
