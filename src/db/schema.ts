@@ -16,14 +16,9 @@ export const users = pgTable("users", {
   username: varchar("username", { length: 50 }).notNull().unique(),
   displayName: varchar("display_name", { length: 50 }).notNull(),
   passwordHash: text("password_hash").notNull(),
-  // Ciphertext only: the recovery key is encrypted in the browser with a
-  // PBKDF2-derived key before either value reaches the application server.
-  matrixRecoveryKeyEncrypted: text("matrix_recovery_key_encrypted"),
-  matrixRecoveryKeySalt: text("matrix_recovery_key_salt"),
   role: varchar("role", { length: 20 }).notNull().default("user"),
   bannedUntil: timestamp("banned_until", { withTimezone: true }),
   banReason: text("ban_reason"),
-  matrixResetRequired: boolean("matrix_reset_required").notNull().default(false),
   avatarColor: varchar("avatar_color", { length: 7 }).notNull().default("#6C5CE7"),
   avatarUrl: text("avatar_url"),
   avatarUpdatedAt: timestamp("avatar_updated_at", { withTimezone: true }),
@@ -45,12 +40,13 @@ export const chats = pgTable("chats", {
   id: serial("id").primaryKey(),
   name: varchar("name", { length: 100 }),
   isGroup: boolean("is_group").notNull().default(false),
+  // Public chats live in the DB, not in the name: admins can rename them
+  // freely, and membership/“join everything public” is driven by this flag
+  // (drizzle/0012 backfilled it from the historical "Общий чат" name).
+  isGeneral: boolean("is_general").notNull().default(false),
+  avatarUrl: text("avatar_url"),
+  avatarUpdatedAt: timestamp("avatar_updated_at", { withTimezone: true }),
   createdBy: integer("created_by").references(() => users.id, { onDelete: "set null" }),
-  // Legacy is deliberately the default: historical rooms must not be
-  // mistaken for encrypted until a verified Matrix room is linked.
-  securityMode: varchar("security_mode", { length: 20 }).notNull().default("legacy"),
-  matrixRoomId: text("matrix_room_id"),
-  e2eeEnabledAt: timestamp("e2ee_enabled_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
@@ -82,10 +78,12 @@ export const messages = pgTable("messages", {
   ),
   // Telegram file storage
   telegramFileId: text("telegram_file_id"),
+  // Bot-API message id of the uploaded attachment in the storage chat; lets
+  // deletions remove the Telegram copy too (null for rows predating it).
+  telegramMessageId: bigint("telegram_message_id", { mode: "number" }),
   fileName: varchar("file_name", { length: 500 }),
   fileSize: bigint("file_size", { mode: "number" }),
   mimeType: varchar("mime_type", { length: 200 }),
-  deliveryStatus: varchar("delivery_status", { length: 20 }).notNull().default("sent"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
@@ -112,13 +110,11 @@ export const pushSubscriptions = pgTable("push_subscriptions", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
-// Idempotency records for client-relayed E2EE push notifications. Only Matrix
-// event IDs and app chat IDs are stored; message plaintext never reaches this
-// table (or the push service) for encrypted rooms.
-export const matrixPushEvents = pgTable("matrix_push_events", {
-  eventId: text("event_id").primaryKey(),
-  chatId: integer("chat_id")
-    .references(() => chats.id, { onDelete: "cascade" })
-    .notNull(),
+/**
+ * Single-use registry for registration captcha tokens (drizzle/0011). Rows
+ * are garbage-collected by the app; the table is intentionally bare.
+ */
+export const captchaNonces = pgTable("captcha_nonces", {
+  nonce: text("nonce").primaryKey(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });

@@ -32,7 +32,6 @@ export async function GET(request: NextRequest) {
         role: users.role,
         bannedUntil: users.bannedUntil,
         banReason: users.banReason,
-        matrixResetRequired: users.matrixResetRequired,
         createdAt: users.createdAt,
         lastSeen: users.lastSeen,
       })

@@ -19,17 +19,12 @@ function formatTime(dateStr: string) {
   return d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" });
 }
 
-function getLastMessagePreview(msg: Chat["lastMessage"], securityMode: Chat["securityMode"]) {
+function getLastMessagePreview(msg: Chat["lastMessage"]) {
   if (!msg) return "";
-  const preview = msg.messageType === "text"
-    ? msg.content || ""
-    : msg.messageType === "image"
-      ? "📷 Фото"
-      : msg.messageType === "video"
-        ? "🎬 Видео"
-        : `📎 ${msg.fileName || "Файл"}`;
-  if (securityMode === "e2ee") return "🔒 Новые сообщения Matrix E2EE";
-  return securityMode === "public" ? preview : `Legacy · ${preview}`;
+  if (msg.messageType === "text") return msg.content || "";
+  if (msg.messageType === "image") return "📷 Фото";
+  if (msg.messageType === "video") return "🎬 Видео";
+  return `📎 ${msg.fileName || "Файл"}`;
 }
 
 export default function ChatSidebar({
@@ -39,13 +34,7 @@ export default function ChatSidebar({
   onSelectChat,
   onLogout,
   onChatsUpdated,
-  matrixState,
-  matrixNotice,
-  onOpenDeviceSecurity,
   onOpenProfileSettings,
-  onRecoverMatrixSession,
-  matrixIdentityResetNeeded,
-  onResetMatrixIdentity,
 }: {
   user: User;
   chats: Chat[];
@@ -53,17 +42,30 @@ export default function ChatSidebar({
   onSelectChat: (chatId: number) => void;
   onLogout: () => void;
   onChatsUpdated: () => void;
-  matrixState: "checking" | "connected" | "not_configured" | "unavailable";
-  matrixNotice?: string;
-  onOpenDeviceSecurity: () => void;
   onOpenProfileSettings: () => void;
-  onRecoverMatrixSession: () => void;
-  /** True only when the local crypto store itself is unreadable. */
-  matrixIdentityResetNeeded?: boolean;
-  onResetMatrixIdentity?: () => void;
 }) {
   const [showNewChat, setShowNewChat] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [deletingChatId, setDeletingChatId] = useState<number | null>(null);
+
+  // Deleting is only offered for chats the user created (checked again on the
+  // server); the general chat has no button at all.
+  const deleteChat = async (chat: Chat) => {
+    if (deletingChatId !== null) return;
+    const what = chat.isGroup ? "группу" : "чат";
+    if (!window.confirm(`Удалить ${what} «${chat.name}» со всеми сообщениями и файлами? Это необратимо и для остальных участников.`)) return;
+    setDeletingChatId(chat.id);
+    try {
+      const response = await fetch(`/api/chats/${chat.id}`, { method: "DELETE" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : "Не удалось удалить чат");
+      onChatsUpdated();
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : "Не удалось удалить чат");
+    } finally {
+      setDeletingChatId(null);
+    }
+  };
 
   const filteredChats = chats.filter((c) =>
     c.name?.toLowerCase().includes(searchQuery.toLowerCase())
@@ -74,61 +76,11 @@ export default function ChatSidebar({
       {/* Header */}
       <div className="p-4 border-b border-dark-600">
         <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 min-w-0">
             <Avatar src={user.avatarUrl} name={user.displayName} color={user.avatarColor} size={44} cacheKey={user.avatarUpdatedAt} />
-            <div>
-              <div className="font-semibold text-sm">{user.displayName}</div>
-              <div className="text-xs text-gray-500">@{user.username}</div>
-              <div
-                className={`mt-1 text-[10px] leading-tight ${
-                  matrixState === "connected" ? "text-amber-400" : "text-gray-500"
-                }`}
-                title={
-                  matrixState === "unavailable"
-                    ? user.matrixSession
-                      ? "Matrix-сессия есть, но синхронизация не прошла. Проверьте подключение или восстановите сессию. Не очищайте данные сайта: там хранятся ключи устройства."
-                      : "Нет действующей Matrix-сессии для этого устройства. Нажмите «Восстановить Matrix-сессию» и введите пароль один раз; локальные ключи устройства сохранятся."
-                    : matrixState === "not_configured"
-                      ? "На сервере не настроен Matrix; личные чаты E2EE недоступны."
-                      : "E2EE пока не включено для отправки новых личных сообщений"
-                }
-              >
-                {matrixState === "connected"
-                  ? "Matrix подключён · E2EE активно в личных чатах"
-                  : matrixState === "checking"
-                    ? "Проверка Matrix…"
-                    : matrixState === "not_configured"
-                      ? "E2EE не настроено на сервере"
-                      : !user.matrixSession
-                        ? "Нет Matrix-сессии · восстановить"
-                        : "Matrix не синхронизируется · восстановить"}
-              </div>
-              {matrixState === "unavailable" && (
-                <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <button
-                    type="button"
-                    onClick={onRecoverMatrixSession}
-                    className="text-[10px] font-medium text-purple-300 hover:text-purple-200"
-                  >
-                    Восстановить Matrix-сессию
-                  </button>
-                  {matrixIdentityResetNeeded && onResetMatrixIdentity && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (window.confirm(
-                          "Сбросить Matrix-идентичность этого устройства? Будут отозваны все устройства Synapse и удалены локальные E2EE-ключи; старые сообщения станут нечитаемыми без recovery key. Применяется, только если хранилище ключей действительно повреждено.",
-                        )) {
-                          onResetMatrixIdentity();
-                        }
-                      }}
-                      className="text-[10px] font-medium text-red-300 underline decoration-dotted hover:text-red-200"
-                    >
-                      Сбросить Matrix-идентичность
-                    </button>
-                  )}
-                </span>
-              )}
+            <div className="min-w-0">
+              <div className="font-semibold text-sm truncate">{user.displayName}</div>
+              <div className="text-xs text-gray-500 truncate">@{user.username}</div>
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
@@ -140,20 +92,8 @@ export default function ChatSidebar({
               aria-label="Настройки профиля"
             >
               <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c1.756-.426 1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
-            </button>
-            <button
-              type="button"
-              onClick={onOpenDeviceSecurity}
-              disabled={!user.matrixSession}
-              className="rounded-lg p-2 text-gray-500 transition-colors hover:bg-dark-600 hover:text-purple-300 disabled:cursor-not-allowed disabled:opacity-40"
-              title="Ключи и устройства Matrix"
-              aria-label="Ключи и устройства Matrix"
-            >
-              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
               </svg>
             </button>
             {user.role === "admin" && (
@@ -182,11 +122,6 @@ export default function ChatSidebar({
             </button>
           </div>
         </div>
-        {matrixNotice && (
-          <div role="status" className="mb-3 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-200">
-            {matrixNotice}
-          </div>
-        )}
 
         {/* Search */}
         <div className="relative">
@@ -225,20 +160,30 @@ export default function ChatSidebar({
         ) : (
           filteredChats.map((chat) => {
             const otherMember = chat.members.find((m) => m.id !== user.id);
+            const canDelete = !chat.isGeneralChat
+              && (chat.createdBy === user.id || user.role === "admin");
             return (
-              <button
+              <div
                 key={chat.id}
-                onClick={() => onSelectChat(chat.id)}
-                className={`w-full flex items-center gap-3 px-4 py-3 hover:bg-dark-700 transition-colors text-left ${
+                className={`group/chat relative w-full flex items-center gap-3 px-4 py-3 hover:bg-dark-700 transition-colors cursor-pointer ${
                   selectedChatId === chat.id ? "bg-dark-700 border-l-2 border-purple-500" : ""
                 }`}
+                onClick={() => onSelectChat(chat.id)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onSelectChat(chat.id);
+                  }
+                }}
               >
                 <Avatar
-                  src={chat.isGroup ? null : otherMember?.avatarUrl || null}
+                  src={chat.isGroup ? chat.avatarUrl || null : otherMember?.avatarUrl || chat.avatarUrl || null}
                   name={chat.name || "?"}
                   color={otherMember?.avatarColor || "#6C5CE7"}
                   size={44}
-                  cacheKey={chat.isGroup ? null : otherMember?.avatarUpdatedAt || null}
+                  cacheKey={chat.isGroup ? chat.avatarUpdatedAt || null : otherMember?.avatarUpdatedAt || chat.avatarUpdatedAt || null}
                 />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center justify-between gap-2">
@@ -258,10 +203,31 @@ export default function ChatSidebar({
                     </span>
                   </div>
                   <div className="text-xs text-gray-500 truncate mt-0.5">
-                    {getLastMessagePreview(chat.lastMessage, chat.securityMode)}
+                    {getLastMessagePreview(chat.lastMessage)}
                   </div>
                 </div>
-              </button>
+                {canDelete && (
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void deleteChat(chat);
+                    }}
+                    disabled={deletingChatId === chat.id}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-1.5 text-gray-500 opacity-0 transition group-hover/chat:opacity-100 hover:bg-red-500/15 hover:text-red-300 focus:opacity-100 disabled:opacity-40"
+                    title={chat.isGroup ? "Удалить группу и все сообщения" : "Удалить чат и все сообщения"}
+                    aria-label={`Удалить чат ${chat.name ?? chat.id}`}
+                  >
+                    {deletingChatId === chat.id ? (
+                      <span className="block h-4 w-4 animate-spin rounded-full border-2 border-red-300 border-t-transparent" />
+                    ) : (
+                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                      </svg>
+                    )}
+                  </button>
+                )}
+              </div>
             );
           })
         )}
@@ -270,7 +236,6 @@ export default function ChatSidebar({
       {/* New Chat Modal */}
       {showNewChat && (
         <NewChatModal
-          currentUser={user}
           onClose={() => setShowNewChat(false)}
           onChatCreated={(chatId) => {
             setShowNewChat(false);

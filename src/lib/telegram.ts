@@ -29,11 +29,18 @@ function sanitizeName(name: string, fallbackPrefix: string): string {
   return safe;
 }
 
+export interface TelegramUploadResult {
+  fileId: string;
+  fileSize: number;
+  /** Bot-API message id inside the storage chat; lets us delete the file later. */
+  messageId: number | null;
+}
+
 export async function uploadFileToTelegram(
   fileBuffer: Buffer,
   fileName: string,
   mimeType: string
-): Promise<{ fileId: string; fileSize: number } | null> {
+): Promise<TelegramUploadResult | null> {
   if (!isTelegramConfigured()) return null;
 
   const safeName = sanitizeName(fileName, "file");
@@ -44,7 +51,11 @@ export async function uploadFileToTelegram(
     const fd = createFormData("audio", fileBuffer, safeName, mime);
     const data = await tgFetch("sendAudio", fd);
     if (data.ok && data.result.audio?.file_id) {
-      return { fileId: data.result.audio.file_id, fileSize: data.result.audio.file_size || fileBuffer.length };
+      return {
+        fileId: data.result.audio.file_id,
+        fileSize: data.result.audio.file_size || fileBuffer.length,
+        messageId: typeof data.result.message_id === "number" ? data.result.message_id : null,
+      };
     }
   }
 
@@ -53,7 +64,11 @@ export async function uploadFileToTelegram(
     const fd = createFormData("video", fileBuffer, safeName, mime);
     const data = await tgFetch("sendVideo", fd);
     if (data.ok && data.result.video?.file_id) {
-      return { fileId: data.result.video.file_id, fileSize: data.result.video.file_size || fileBuffer.length };
+      return {
+        fileId: data.result.video.file_id,
+        fileSize: data.result.video.file_size || fileBuffer.length,
+        messageId: typeof data.result.message_id === "number" ? data.result.message_id : null,
+      };
     }
   }
 
@@ -64,7 +79,11 @@ export async function uploadFileToTelegram(
     const data = await tgFetch("sendPhoto", fd);
     if (data.ok && data.result.photo) {
       const largest = data.result.photo[data.result.photo.length - 1];
-      return { fileId: largest.file_id, fileSize: largest.file_size || fileBuffer.length };
+      return {
+        fileId: largest.file_id,
+        fileSize: largest.file_size || fileBuffer.length,
+        messageId: typeof data.result.message_id === "number" ? data.result.message_id : null,
+      };
     }
   }
 
@@ -76,10 +95,31 @@ export async function uploadFileToTelegram(
     return {
       fileId: data.result.document.file_id,
       fileSize: data.result.document.file_size || fileBuffer.length,
+      messageId: typeof data.result.message_id === "number" ? data.result.message_id : null,
     };
   }
 
   return null;
+}
+
+/**
+ * Removes the bot's storage message (and with it the attachment). Only works
+ * for files uploaded while the API bot was configured the same way; every
+ * failure is tolerated because the PostgreSQL row is the source of truth.
+ */
+export async function deleteTelegramMessage(messageId: number): Promise<boolean> {
+  if (!isTelegramConfigured() || !Number.isSafeInteger(messageId) || messageId <= 0) return false;
+  try {
+    const res = await fetch(`${BASE_URL}/deleteMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: CHAT_ID, message_id: messageId }),
+    });
+    const data = await res.json().catch(() => null);
+    return Boolean(data?.ok);
+  } catch {
+    return false;
+  }
 }
 
 export interface TelegramFileResult {

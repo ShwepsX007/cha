@@ -10,6 +10,15 @@ import { pushSubscriptions } from "@/db/schema";
  */
 const PUSH_SEND_TIMEOUT_MS = 10_000;
 
+/**
+ * How long the push service (FCM/Mozilla autopush) keeps an undeliverable
+ * message. The short value this used to have (15 minutes) is why nothing
+ * arrived "while the browser was closed for lunch": by the time the device
+ * came back the message had expired. 24 hours covers an evening offline and an
+ * overnight shutdown; providers cap retention at their own limits anyway.
+ */
+const PUSH_TTL_SECONDS = 60 * 60 * 24;
+
 function envValue(name: string): string {
   // Trailing spaces/CR from a hand-edited .env silently break base64 decoding
   // on the client, so every VAPID value is trimmed here.
@@ -99,7 +108,10 @@ async function sendWithTimeout(
   });
   try {
     const outcome = await Promise.race([
-      webpush.sendNotification(subscription, payload, { TTL: 60 * 15 }).then(() => "sent" as const),
+      webpush.sendNotification(subscription, payload, {
+        TTL: PUSH_TTL_SECONDS,
+        urgency: "high",
+      }).then(() => "sent" as const),
       guard,
     ]);
     if (outcome === "timeout") throw new Error("Push provider did not answer in time");

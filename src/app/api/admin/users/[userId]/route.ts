@@ -3,7 +3,6 @@ import { eq, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { users } from "@/db/schema";
 import { requireAdmin, writeAdminAuditLog } from "@/lib/admin";
-import { deactivateMatrixIdentityForAppUser, resetMatrixDevicesForAppUser } from "@/lib/matrix/server";
 
 export const dynamic = "force-dynamic";
 
@@ -99,39 +98,6 @@ export async function PATCH(
       return NextResponse.json({ success: true, role: input.role });
     }
 
-    if (input.action === "matrix_reset") {
-      await db.update(users).set({ matrixResetRequired: true }).where(eq(users.id, userId));
-      try {
-        const matrix = await resetMatrixDevicesForAppUser(userId);
-        await writeAdminAuditLog({
-          adminId: auth.admin.id,
-          action: "user.matrix_reset",
-          targetType: "user",
-          targetId: String(userId),
-          details: { username: target.username, matrixConfigured: matrix.configured, revokedDevices: matrix.revokedDevices },
-        });
-        return NextResponse.json({
-          success: true,
-          resetRequired: true,
-          matrixDevicesRevoked: matrix.revokedDevices,
-          warning: matrix.configured ? null : "Matrix не настроен; флаг сброса установлен, устройства Synapse не отозваны.",
-        }, { status: matrix.configured ? 200 : 202 });
-      } catch {
-        await writeAdminAuditLog({
-          adminId: auth.admin.id,
-          action: "user.matrix_reset_failed",
-          targetType: "user",
-          targetId: String(userId),
-          details: { username: target.username, resetFlagKept: true },
-        });
-        return NextResponse.json({
-          success: false,
-          resetRequired: true,
-          error: "Флаг Matrix-сброса установлен, но Synapse не подтвердил отзыв старых устройств.",
-        }, { status: 202 });
-      }
-    }
-
     return NextResponse.json({ error: "Неизвестное действие" }, { status: 400 });
   } catch {
     return NextResponse.json({ error: "Не удалось выполнить действие администратора" }, { status: 500 });
@@ -160,17 +126,16 @@ export async function DELETE(
   }
 
   try {
-    const matrix = await deactivateMatrixIdentityForAppUser(userId);
     await db.delete(users).where(eq(users.id, userId));
     await writeAdminAuditLog({
       adminId: auth.admin.id,
       action: "user.delete",
       targetType: "user",
       targetId: String(userId),
-      details: { username: target.username, displayName: target.displayName, matrixConfigured: matrix.configured },
+      details: { username: target.username, displayName: target.displayName },
     });
-    return NextResponse.json({ success: true, matrixAccountDeactivated: matrix.configured });
+    return NextResponse.json({ success: true });
   } catch {
-    return NextResponse.json({ error: "Не удалось удалить пользователя. Если Synapse недоступен, запись PostgreSQL сохранена." }, { status: 502 });
+    return NextResponse.json({ error: "Не удалось удалить пользователя." }, { status: 500 });
   }
 }

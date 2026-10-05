@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# One-command production deploy: dependencies -> schema -> build -> reload.
+# One-command production deploy.
+#
+#   bash scripts/deploy.sh
 #
 # The order matters. Restarting pm2 without `npm run build` keeps serving the
 # previous .next output, which is how a server ends up "running but broken"
 # after a git pull. And skipping `db:setup` makes every API request fail while
 # `next start` still logs "Ready".
-#
-# Usage:  bash scripts/deploy.sh
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

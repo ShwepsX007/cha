@@ -149,15 +149,7 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
     setAvatarUrl(data.user.avatarUrl || null);
     setAvatarVersion((v) => v + 1);
     setDisplayName(data.user.displayName);
-    onProfileUpdated({
-      ...user,
-      ...data.user,
-      matrixAvailability: user.matrixAvailability,
-      matrixSession: user.matrixSession,
-      initialRecoveryKey: user.initialRecoveryKey,
-      initialRecoveryKeySaved: user.initialRecoveryKeySaved,
-      matrixNotice: user.matrixNotice,
-    });
+    onProfileUpdated(data.user);
   };
 
   const saveDisplayName = async (event: React.FormEvent) => {
@@ -218,7 +210,7 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
       if (!response.ok) throw new Error(data.error || "Не удалось сменить пароль");
       setNewPassword("");
       setConfirmPassword("");
-      setPasswordNotice("Пароль изменён. Для Matrix-сессий он синхронизируется на сервере.");
+      setPasswordNotice("Пароль изменён.");
     } catch (error) {
       setPasswordError(error instanceof Error ? error.message : "Не удалось сменить пароль");
     } finally {
@@ -368,9 +360,6 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
               <button type="submit" disabled={savingPassword} className="rounded-xl bg-purple-500 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-purple-600 disabled:opacity-50">
                 {savingPassword ? "Меняем…" : "Сменить пароль"}
               </button>
-              <p className="text-xs leading-relaxed text-gray-500">
-                После смены пароля приложение синхронизирует его с Matrix/Synapse, чтобы E2EE-логин не ломался. Если Matrix недоступен, при следующем входе может потребоваться кнопка «Сбросить Matrix».
-              </p>
             </form>
           )}
 
@@ -381,7 +370,7 @@ export default function ProfileSettingsModal({ user, onClose, onProfileUpdated }
                   <div>
                     <p className="text-sm font-medium text-white">Push-уведомления о сообщениях</p>
                     <p className="mt-1 text-xs leading-relaxed text-gray-400">
-                      Push этого приложения отправляет уведомления только для общего чата. Нужны HTTPS, разрешение браузера и сохранённая подписка на этом устройстве. Push не отправляется отправителю, в заглушённый чат или если получатель был активен последнюю минуту. Для приватных Matrix-чатов push пока не реализован; на iOS добавьте приложение на главный экран.
+                      Push приходит для всех чатов: общих, личных и групп. Нужны HTTPS, разрешение браузера и подписка на этом устройстве (она обновляется автоматически при каждом входе). Уведомление не отправляется самому отправителю и в заглушённый чат; если нужный чат открыт в фокусированном окне, уведомление не показывается. На iOS добавьте приложение на главный экран.
                     </p>
                   </div>
                 </div>

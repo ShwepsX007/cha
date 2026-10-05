@@ -22,8 +22,8 @@ const REQUIRED_TABLES = [
   "messages",
   "message_receipts",
   "push_subscriptions",
-  "matrix_push_events",
   "admin_audit_logs",
+  "captcha_nonces",
 ];
 
 const checkOnly = process.argv.includes("--check");

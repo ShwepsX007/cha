@@ -1,32 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { initializeMatrixCryptoAfterLogin } from "@/lib/matrix/client";
-import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
-import { getMatrixDeviceId } from "@/lib/matrix/device-id";
-import { recoverMatrixSession } from "@/lib/matrix/recover-session";
-import {
-  normalizeMatrixSession,
-  saveMatrixAvailability,
-  saveMatrixSession,
-} from "@/lib/matrix/session-store";
-
-interface User {
-  id: number;
-  username: string;
-  displayName: string;
-  avatarColor?: string;
-  avatarUrl?: string | null;
-  role?: "user" | "admin";
-  bannedUntil?: string | null;
-  banReason?: string | null;
-  matrixResetRequired?: boolean;
-  matrixAvailability?: MatrixAvailability;
-  matrixSession?: MatrixSession | null;
-  initialRecoveryKey?: string | null;
-  initialRecoveryKeySaved?: boolean;
-  matrixNotice?: string;
-}
+import type { User } from "@/app/page";
+import CaptchaField, { type CaptchaChallenge } from "./CaptchaField";
 
 export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void }) {
   const [isLogin, setIsLogin] = useState(true);
@@ -36,6 +12,9 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [captcha, setCaptcha] = useState<CaptchaChallenge | null>(null);
+  const [captchaAnswer, setCaptchaAnswer] = useState("");
+  const [captchaRefresh, setCaptchaRefresh] = useState(0);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -44,10 +23,15 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
 
     try {
       const endpoint = isLogin ? "/api/auth/login" : "/api/auth/register";
-      const matrixDeviceId = getMatrixDeviceId(username);
       const body = isLogin
-        ? { username, password, matrixDeviceId }
-        : { username, password, displayName: displayName || username, matrixDeviceId };
+        ? { username, password }
+        : {
+            username,
+            password,
+            displayName: displayName || username,
+            captchaToken: captcha?.token ?? "",
+            captchaAnswer,
+          };
 
       const res = await fetch(endpoint, {
         method: "POST",
@@ -58,75 +42,21 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
       const data = await res.json();
       if (!res.ok) {
         setError(data.error || "Произошла ошибка");
+        // Captcha tokens are single-use: any failed registration consumed the
+        // challenge (or was refused because of it), so always show a new one.
+        if (!isLogin) {
+          setCaptchaAnswer("");
+          setCaptchaRefresh((n) => n + 1);
+        }
         return;
       }
 
-      let matrixSession: MatrixSession | null = normalizeMatrixSession(data.matrixSession);
-      let matrixAvailability: MatrixAvailability = matrixSession
-        ? (data.matrixAvailability || "ready")
-        : (data.matrixAvailability || "unavailable");
-      let matrixResetRequired = Boolean(data.matrixResetRequired || data.user?.matrixResetRequired);
-      let initialRecoveryKey: string | null = null;
-      let initialRecoveryKeySaved = false;
-      let matrixNotice = "";
-
-      if (matrixResetRequired) {
-        // The device was revoked on the homeserver. Re-authenticate the device
-        // this browser already owns (that keeps the local E2EE keys usable) and
-        // only fall back to a brand-new device when the server insists.
-        try {
-          const recovered = await recoverMatrixSession({
-            username,
-            appUserId: data.user.id,
-            password,
-            resetRequired: true,
-          });
-          matrixSession = recovered.session;
-          matrixAvailability = "ready";
-          matrixResetRequired = false;
-          matrixNotice = recovered.notice || "";
-        } catch (resetError) {
-          matrixSession = null;
-          matrixAvailability = "unavailable";
-          matrixNotice = resetError instanceof Error
-            ? `Не удалось завершить восстановление Matrix: ${resetError.message}`
-            : "Не удалось завершить восстановление Matrix. Общий чат доступен, приватные чаты - после восстановления.";
-          console.error("Matrix reset completion failed");
-        }
-      }
-
-      if (matrixSession && matrixAvailability === "ready") {
-        try {
-          const initialization = await initializeMatrixCryptoAfterLogin(matrixSession, password);
-          initialRecoveryKey = initialization.recoveryKey || null;
-          initialRecoveryKeySaved = initialization.recoveryKeySaved || false;
-          matrixNotice = initialization.notice || matrixNotice;
-        } catch (matrixError) {
-          matrixNotice = matrixError instanceof Error
-            ? matrixError.message
-            : "Matrix не синхронизирован. Приватные сообщения пока не отправляются.";
-          console.error("Matrix crypto initialization failed");
-        }
-      } else if (matrixAvailability === "unavailable" && !matrixNotice) {
-        matrixNotice = "Matrix недоступен. Общий чат остаётся доступен, приватные сообщения не отправляются.";
-      }
-
-      const authenticatedUser: User = {
-        ...data.user,
-        matrixAvailability,
-        matrixSession,
-        matrixResetRequired,
-        initialRecoveryKey,
-        initialRecoveryKeySaved,
-        matrixNotice,
-      };
-
-      saveMatrixSession(authenticatedUser.id, authenticatedUser.matrixSession ?? null);
-      saveMatrixAvailability(authenticatedUser.matrixAvailability || "unavailable");
       setPassword("");
-      onAuth(authenticatedUser);
+      setCaptchaAnswer("");
+      onAuth(data.user);
     } catch {
       setError("Ошибка соединения");
+      if (!isLogin) setCaptchaRefresh((n) => n + 1);
     } finally {
       setLoading(false);
     }
@@ -139,11 +69,11 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-20 h-20 bg-dark-700 rounded-2xl mb-4 border border-dark-500">
             <svg className="w-10 h-10 text-purple-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
             </svg>
           </div>
-          <h1 className="text-2xl font-bold text-white">Secret Chat</h1>
-          <p className="text-gray-500 mt-1">Приватный мессенджер</p>
+          <h1 className="text-2xl font-bold text-white">Chata</h1>
+          <p className="text-gray-500 mt-1">Мессенджер: общий чат, личные чаты и группы</p>
         </div>
 
         {/* Form */}
@@ -210,6 +140,16 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
               </div>
             </div>
 
+            {!isLogin && (
+              <CaptchaField
+                value={captchaAnswer}
+                onChange={setCaptchaAnswer}
+                onChallengeChange={setCaptcha}
+                refreshSignal={captchaRefresh}
+                disabled={loading}
+              />
+            )}
+
             {error && (
               <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-sm">
                 {error}
@@ -221,7 +161,7 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
               disabled={loading}
               className="w-full py-3 bg-purple-500 hover:bg-purple-600 disabled:opacity-50 text-white font-medium rounded-xl transition-colors"
             >
-              {loading ? "Подключаем Matrix и шифрование…" : isLogin ? "Войти" : "Зарегистрироваться"}
+              {loading ? "Подключаемся…" : isLogin ? "Войти" : "Зарегистрироваться"}
             </button>
           </form>
 

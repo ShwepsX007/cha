@@ -79,7 +79,6 @@ async function createOrRotateAdmin(): Promise<{ username: string; password: stri
           role: "admin",
           bannedUntil: null,
           banReason: null,
-          matrixResetRequired: false,
           displayName: "Telegram Admin",
           lastSeen: new Date(),
         })
@@ -94,10 +93,13 @@ async function createOrRotateAdmin(): Promise<{ username: string; password: stri
       return { username: ADMIN_USERNAME, password, isNewUser: false };
     }
 
+    // Look up the public chat by its flag, not by name: admins can rename it
+    // in the panel. If it does not exist yet, the first app sync (GET
+    // /api/chats) creates it and joins every member anyway.
     const [generalChat] = await tx
       .select({ id: chats.id })
       .from(chats)
-      .where(and(eq(chats.name, "Общий чат"), eq(chats.securityMode, "public")))
+      .where(eq(chats.isGeneral, true))
       .limit(1);
 
     const [user] = await tx

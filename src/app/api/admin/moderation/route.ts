@@ -21,7 +21,6 @@ export async function GET(request: NextRequest) {
         id: chats.id,
         name: chats.name,
         isGroup: chats.isGroup,
-        securityMode: chats.securityMode,
         createdAt: chats.createdAt,
       })
       .from(chats)
@@ -37,7 +36,6 @@ export async function GET(request: NextRequest) {
         id: messages.id,
         chatId: messages.chatId,
         chatName: chats.name,
-        securityMode: chats.securityMode,
         senderId: messages.senderId,
         senderUsername: users.username,
         senderDisplayName: users.displayName,
@@ -77,7 +75,7 @@ export async function POST(request: NextRequest) {
       if (!Number.isSafeInteger(chatId) || chatId <= 0) {
         return NextResponse.json({ error: "Некорректный ID чата" }, { status: 400 });
       }
-      const [chat] = await db.select({ id: chats.id, name: chats.name, securityMode: chats.securityMode })
+      const [chat] = await db.select({ id: chats.id, name: chats.name })
         .from(chats).where(eq(chats.id, chatId));
       if (!chat) return NextResponse.json({ error: "Чат не найден" }, { status: 404 });
 
@@ -87,7 +85,7 @@ export async function POST(request: NextRequest) {
         action: "moderation.clear_chat",
         targetType: "chat",
         targetId: String(chatId),
-        details: { name: chat.name, securityMode: chat.securityMode, deletedMessages: deleted.length },
+        details: { name: chat.name, deletedMessages: deleted.length },
       });
       return NextResponse.json({ success: true, deletedMessages: deleted.length });
     }

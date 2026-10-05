@@ -5,7 +5,6 @@ import { db } from "@/db";
 import { users } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { getAuthenticatedUser } from "@/lib/profile";
-import { synchronizeMatrixAppUserPassword } from "@/lib/matrix/server";
 
 export const dynamic = "force-dynamic";
 
@@ -33,19 +32,7 @@ export async function PATCH(req: NextRequest) {
     const passwordHash = await bcrypt.hash(newPassword, 10);
     await db.update(users).set({ passwordHash }).where(eq(users.id, user.id));
 
-    let matrixSynced = false;
-    try {
-      const matrixResult = await synchronizeMatrixAppUserPassword(user.id, user.displayName, newPassword);
-      matrixSynced = matrixResult.configured;
-    } catch {
-      console.error("Matrix password synchronization failed");
-    }
-
-    return NextResponse.json({
-      success: true,
-      matrixSynced,
-      warning: matrixSynced ? undefined : "Matrix не настроен или не смог синхронизировать пароль; приватные чаты могут потребовать сброса Matrix после входа.",
-    });
+    return NextResponse.json({ success: true });
   } catch {
     return NextResponse.json({ error: "Не удалось сменить пароль" }, { status: 500 });
   }

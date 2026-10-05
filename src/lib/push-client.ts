@@ -60,6 +60,76 @@ export async function getPushPermissionState(): Promise<NotificationPermission |
   return Notification.permission;
 }
 
+/**
+ * Get a browser push subscription bound to `publicKey`. If an existing
+ * subscription was created with a different (older) VAPID key it is replaced,
+ * because deliveries to it would be rejected by the push service.
+ */
+async function ensureBrowserSubscription(
+  registration: ServiceWorkerRegistration,
+  publicKey: string,
+): Promise<PushSubscription | null> {
+  const applicationKey = urlBase64ToUint8Array(publicKey);
+  let subscription = await registration.pushManager.getSubscription();
+  if (subscription) {
+    const existingKey = subscription.options.applicationServerKey;
+    const keysMatch = existingKey instanceof ArrayBuffer
+      && existingKey.byteLength === applicationKey.byteLength
+      && new Uint8Array(existingKey).every((b, i) => b === applicationKey[i]);
+    if (!keysMatch) {
+      await subscription.unsubscribe().catch(() => undefined);
+      subscription = null;
+    }
+  }
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: applicationKey as BufferSource,
+    });
+  }
+  return subscription;
+}
+
+/** Send the current subscription to the app server (upserts by endpoint). */
+async function reportSubscription(subscription: PushSubscription): Promise<boolean> {
+  const p256dhKey = subscription.getKey("p256dh");
+  const authKey = subscription.getKey("auth");
+  if (!p256dhKey || !authKey) return false;
+  const p256dh = btoa(String.fromCharCode(...new Uint8Array(p256dhKey)));
+  const auth = btoa(String.fromCharCode(...new Uint8Array(authKey)));
+  const res = await fetch("/api/push/subscribe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ endpoint: subscription.endpoint, p256dh, auth }),
+  });
+  return res.ok;
+}
+
+/**
+ * Silent push re-registration on app load. Browsers rotate push endpoints over
+ * time and the server prunes rows that answer `410 Gone`, so a subscription
+ * saved once is not guaranteed to still exist months later. While the user has
+ * granted the notification permission, refresh the browser↔server pairing on
+ * every start - no prompts, no UI, no failures thrown.
+ */
+export async function ensurePushSubscription(): Promise<boolean> {
+  if (!arePushNotificationsSupported()) return false;
+  try {
+    if (Notification.permission !== "granted") return false;
+    const registration = await waitForActiveServiceWorker(8_000);
+    if (!registration) return false;
+    const configRes = await fetch("/api/push/subscribe", { cache: "no-store" });
+    if (!configRes.ok) return false;
+    const config = await configRes.json().catch(() => ({}));
+    if (!config.configured || typeof config.publicKey !== "string" || !config.publicKey) return false;
+    const subscription = await ensureBrowserSubscription(registration, config.publicKey);
+    if (!subscription) return false;
+    return await reportSubscription(subscription);
+  } catch {
+    return false;
+  }
+}
+
 export async function subscribeToPush(): Promise<{ ok: boolean; error?: string; publicKey?: string | null; denied?: boolean; iosHint?: boolean }> {
   if (!arePushNotificationsSupported()) {
     return {
@@ -123,41 +193,10 @@ export async function subscribeToPush(): Promise<{ ok: boolean; error?: string; 
     }
 
     // Check existing subscription: if it exists with our key, reuse; else re-subscribe.
-    const applicationKey = urlBase64ToUint8Array(config.publicKey);
-    let subscription = await registration.pushManager.getSubscription();
-    if (subscription) {
-      const existingKey = subscription.options.applicationServerKey;
-      const keysMatch = existingKey instanceof ArrayBuffer
-        && existingKey.byteLength === applicationKey.byteLength
-        && new Uint8Array(existingKey).every((b, i) => b === applicationKey[i]);
-      if (!keysMatch) {
-        await subscription.unsubscribe().catch(() => undefined);
-        subscription = null;
-      }
-    }
-
-    if (!subscription) {
-      subscription = await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: applicationKey as BufferSource,
-      });
-    }
-
-    const p256dhKey = subscription.getKey("p256dh");
-    const authKey = subscription.getKey("auth");
-    if (!p256dhKey || !authKey) return { ok: false, error: "Не удалось получить ключи подписки" };
-
-    const p256dh = btoa(String.fromCharCode(...new Uint8Array(p256dhKey)));
-    const auth = btoa(String.fromCharCode(...new Uint8Array(authKey)));
-
-    const res = await fetch("/api/push/subscribe", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ endpoint: subscription.endpoint, p256dh, auth }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      return { ok: false, error: data.error || "Не удалось сохранить подписку" };
+    const subscription = await ensureBrowserSubscription(registration, config.publicKey);
+    if (!subscription) return { ok: false, error: "Не удалось получить ключи подписки" };
+    if (!(await reportSubscription(subscription))) {
+      return { ok: false, error: "Не удалось сохранить подписку" };
     }
     return {
       ok: true,

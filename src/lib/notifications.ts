@@ -12,6 +12,23 @@ interface NotifyChatMessageParams {
   url?: string;
 }
 
+export interface ChatPushFanOutResult {
+  configured: boolean;
+  recipients: number;
+  mutedRecipients: number;
+  sent: number;
+  failed: number;
+}
+
+interface FanOutParams {
+  chatId: number;
+  senderId: number;
+  title: string;
+  body: string;
+  url: string;
+  messageId?: number;
+}
+
 /**
  * Best-effort fan-out of a push notification to every chat member except the
  * sender and muted members. Foreground suppression belongs in the service
@@ -19,39 +36,47 @@ interface NotifyChatMessageParams {
  * `lastSeen` is too coarse and used to drop pushes for up to a minute after a
  * user backgrounds or closes the app. Failures are swallowed.
  */
-export async function notifyChatMessage({
+async function fanOutToChatMembers({
   chatId,
   senderId,
-  textPreview,
-  messageId,
-  senderName,
+  title,
+  body,
   url,
-}: NotifyChatMessageParams) {
-  try {
-    const recipients = await db
-      .select({
-        id: users.id,
-        muted: chatMembers.notificationsMuted,
-      })
-      .from(chatMembers)
-      .innerJoin(users, eq(users.id, chatMembers.userId))
-      .where(
-        and(
-          eq(chatMembers.chatId, chatId),
-          ne(chatMembers.userId, senderId),
-        ),
-      );
+  messageId,
+}: FanOutParams): Promise<ChatPushFanOutResult> {
+  const recipients = await db
+    .select({
+      id: users.id,
+      muted: chatMembers.notificationsMuted,
+    })
+    .from(chatMembers)
+    .innerJoin(users, eq(users.id, chatMembers.userId))
+    .where(
+      and(
+        eq(chatMembers.chatId, chatId),
+        ne(chatMembers.userId, senderId),
+      ),
+    );
 
-    await Promise.all(
-      recipients.map(async (recipient) => {
-        if (recipient.muted) return;
+  const eligibleRecipients = recipients.filter((recipient) => !recipient.muted);
+  const mutedRecipients = recipients.length - eligibleRecipients.length;
+  let sent = 0;
+  let failed = 0;
+  let configured = false;
+
+  await Promise.all(
+    eligibleRecipients.map(async (recipient) => {
+      try {
         const result = await sendPushToUser(recipient.id, {
-          title: senderName,
-          body: textPreview.length > 100 ? `${textPreview.slice(0, 100)}…` : textPreview,
+          title,
+          body,
           chatId,
-          url: url || `/?chatId=${chatId}`,
+          url,
           messageId,
         });
+        configured = configured || result.configured;
+        sent += result.sent;
+        failed += result.failed;
         if (result.configured && result.sent === 0) {
           console.warn("No push delivery for chat message", {
             chatId,
@@ -60,8 +85,37 @@ export async function notifyChatMessage({
             failed: result.failed,
           });
         }
-      }),
-    );
+      } catch (err) {
+        failed += 1;
+        console.error("Push recipient dispatch failed", {
+          chatId,
+          recipientId: recipient.id,
+          errorName: err instanceof Error ? err.name : "UnknownError",
+        });
+      }
+    }),
+  );
+
+  return { configured, recipients: eligibleRecipients.length, mutedRecipients, sent, failed };
+}
+
+export async function notifyChatMessage({
+  chatId,
+  senderId,
+  textPreview,
+  messageId,
+  senderName,
+  url,
+}: NotifyChatMessageParams): Promise<void> {
+  try {
+    await fanOutToChatMembers({
+      chatId,
+      senderId,
+      title: senderName,
+      body: textPreview.length > 100 ? `${textPreview.slice(0, 100)}…` : textPreview,
+      url: url || `/?chatId=${chatId}`,
+      messageId,
+    });
   } catch (err) {
     console.error("Push notification dispatch failed:", err);
   }

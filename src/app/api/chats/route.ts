@@ -2,8 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { chats, chatMembers, users, messages } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
-import { verifyEncryptedRoom } from "@/lib/matrix/server";
-import { ensureGeneralChatMembership, GENERAL_CHAT_NAME } from "@/lib/chats";
+import { ensureGeneralChatMembership, isGeneralChat } from "@/lib/chats";
 import { eq, and, desc, inArray, sql } from "drizzle-orm";
 
 export async function GET() {
@@ -27,13 +26,14 @@ export async function GET() {
 
     let { ids: chatIds, list: chatList } = await loadMemberships();
 
-    // Accounts that lost their membership (deleted chat, admin wipe, manual
-    // cleanup in the database) used to be stuck with an empty chat list
-    // forever: only registration could join the public chat. Restore it.
-    const hasGeneralChat = chatList.some(
-      (chat) => chat.isGroup && chat.securityMode === "public" && chat.name === GENERAL_CHAT_NAME,
-    );
-    if (!hasGeneralChat) {
+    // Accounts that lost a membership (deleted chat, admin wipe, manual
+    // cleanup in the database) and every user who has not yet been joined to
+    // a newly created public chat are fixed up here. Membership follows the
+    // is_general flag, so renaming a general chat never orphans anyone.
+    const generalIds = (
+      await db.select({ id: chats.id }).from(chats).where(eq(chats.isGeneral, true))
+    ).map((row) => row.id);
+    if (generalIds.length === 0 || generalIds.some((id) => !chatIds.includes(id))) {
       await ensureGeneralChatMembership(payload.userId);
       ({ ids: chatIds, list: chatList } = await loadMemberships());
     }
@@ -98,6 +98,9 @@ export async function GET() {
         return {
           ...chat,
           name: chatName,
+          // The flagged chats carry the public-chat moderation rules; the
+          // client must not re-derive that from the display name alone.
+          isGeneralChat: isGeneralChat(chat),
           members,
           notificationsMuted,
           lastMessage: lastMessage || null,
@@ -132,8 +135,6 @@ export async function POST(req: NextRequest) {
       ? Array.isArray(body.memberUserIds) ? body.memberUserIds : []
       : [body.targetUserId];
     const memberUserIds = [...new Set(rawMemberIds.map(Number))];
-    const matrixRoomId = typeof body.matrixRoomId === "string" ? body.matrixRoomId : "";
-    const matrixAccessToken = typeof body.matrixAccessToken === "string" ? body.matrixAccessToken : "";
     const name = typeof body.name === "string" ? body.name.trim().slice(0, 100) : "";
 
     if (
@@ -155,7 +156,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "One or more users were not found" }, { status: 404 });
     }
 
-    let existingChat: typeof chats.$inferSelect | undefined;
+    // Direct chats are unique per pair: reuse the existing one instead of
+    // creating a second window into the same conversation.
     if (!isGroup) {
       const myRows = await db
         .select({ chatId: chatMembers.chatId })
@@ -179,66 +181,18 @@ export async function POST(req: NextRequest) {
             .from(chats)
             .where(and(eq(chats.id, shared.chatId), eq(chats.isGroup, false)));
           if (candidate) {
-            existingChat = candidate;
-            break;
+            return NextResponse.json({ chat: candidate, existing: true });
           }
         }
       }
     }
 
-    if (existingChat?.securityMode === "e2ee" && existingChat.matrixRoomId) {
-      return NextResponse.json({ chat: existingChat, existing: true });
-    }
-
-    // Do not create a plaintext private room. The first request tells the
-    // browser to create a Matrix room; the second request verifies and links it.
-    if (!matrixRoomId || !matrixAccessToken) {
-      return NextResponse.json({
-        chat: existingChat || null,
-        existing: Boolean(existingChat),
-        requiresEncryptedRoom: true,
-      });
-    }
-
-    try {
-      await verifyEncryptedRoom({
-        roomId: matrixRoomId,
-        accessToken: matrixAccessToken,
-        appUserIds: [payload.userId, ...memberUserIds],
-        authenticatedAppUserId: payload.userId,
-        creatorAppUserId: payload.userId,
-        expectedHistoryVisibility: isGroup ? "joined" : "invited",
-      });
-    } catch (error) {
-      console.warn("Rejected unverified Matrix room for app chat:", error);
-      return NextResponse.json(
-        { error: "Не удалось подтвердить, что комната Matrix приватная и зашифрованная" },
-        { status: 400 },
-      );
-    }
-
-    if (existingChat) {
-      const [chat] = await db
-        .update(chats)
-        .set({
-          securityMode: "e2ee",
-          matrixRoomId,
-          e2eeEnabledAt: new Date(),
-        })
-        .where(eq(chats.id, existingChat.id))
-        .returning();
-      return NextResponse.json({ chat, existing: true, upgraded: true });
-    }
-
     const [chat] = await db
       .insert(chats)
       .values({
-        name: isGroup ? (name || "Приватная группа") : null,
+        name: isGroup ? (name || "Группа") : null,
         isGroup,
         createdBy: payload.userId,
-        securityMode: "e2ee",
-        matrixRoomId,
-        e2eeEnabledAt: new Date(),
       })
       .returning();
 

@@ -4,7 +4,9 @@ import { messages, users, chatMembers, chats } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
 import { eq, and, asc, inArray } from "drizzle-orm";
 import { getActivePublicChatBan } from "@/lib/moderation";
+import { isGeneralChat } from "@/lib/chats";
 import { messagePreview, notifyChatMessage } from "@/lib/notifications";
+import { deleteMessagePermanently } from "@/lib/chat-delete";
 
 export async function GET(req: NextRequest) {
   try {
@@ -122,15 +124,12 @@ export async function POST(req: NextRequest) {
     }
 
     const [chat] = await db
-      .select({ securityMode: chats.securityMode })
+      .select({ name: chats.name, isGroup: chats.isGroup, isGeneral: chats.isGeneral })
       .from(chats)
       .where(eq(chats.id, chatId));
 
-    if (!chat || chat.securityMode !== "public") {
-      return NextResponse.json(
-        { error: "Private messages must use the encrypted Matrix room", code: "E2EE_REQUIRED" },
-        { status: 409 },
-      );
+    if (!chat) {
+      return NextResponse.json({ error: "Chat not found" }, { status: 404 });
     }
 
     let replyToMessageId: number | null = null;
@@ -148,16 +147,20 @@ export async function POST(req: NextRequest) {
       replyToMessageId = target.id;
     }
 
-    const activeBan = await getActivePublicChatBan(payload.userId);
-    if (activeBan) {
-      return NextResponse.json(
-        {
-          error: `Отправка в общий чат заблокирована до ${activeBan.bannedUntil.toISOString()}`,
-          bannedUntil: activeBan.bannedUntil.toISOString(),
-          banReason: activeBan.banReason,
-        },
-        { status: 403 },
-      );
+    // The "public chat ban" is moderation for the open general chat; it must
+    // not silence DMs or private groups, which never relied on it.
+    if (isGeneralChat(chat)) {
+      const activeBan = await getActivePublicChatBan(payload.userId);
+      if (activeBan) {
+        return NextResponse.json(
+          {
+            error: `Отправка в общий чат заблокирована до ${activeBan.bannedUntil.toISOString()}`,
+            bannedUntil: activeBan.bannedUntil.toISOString(),
+            banReason: activeBan.banReason,
+          },
+          { status: 403 },
+        );
+      }
     }
 
     const [msg] = await db
@@ -190,5 +193,57 @@ export async function POST(req: NextRequest) {
   } catch (error) {
     console.error("Send message error:", error);
     return NextResponse.json({ error: "Server error" }, { status: 500 });
+  }
+}
+
+/**
+ * Delete one's own message for everybody: DELETE /api/messages?messageId=N.
+ * (A dedicated /api/messages/[messageId] folder is impossible: sibling
+ * [chatId]/receipts pins the dynamic segment name.) Hard delete — the
+ * Telegram attachment is removed best-effort, receipts cascade, replies keep
+ * their text and lose the jump (FK is ON DELETE SET NULL). Admins moderate
+ * foreign messages through the admin panel; this endpoint is author-only.
+ */
+export async function DELETE(req: NextRequest) {
+  try {
+    const payload = await getCurrentUser();
+    if (!payload) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const rawId = req.nextUrl.searchParams.get("messageId") ?? "";
+    if (!/^\d+$/.test(rawId)) {
+      return NextResponse.json({ error: "Некорректный ID сообщения" }, { status: 400 });
+    }
+    const messageId = Number(rawId);
+
+    const [message] = await db
+      .select({ id: messages.id, senderId: messages.senderId, chatId: messages.chatId })
+      .from(messages)
+      .where(eq(messages.id, messageId));
+
+    // Two tabs / a deleted chat / an admin moderation action may have removed
+    // it first: report success (idempotently) instead of a scary error.
+    if (!message) return NextResponse.json({ success: true, deleted: false, alreadyGone: true });
+
+    if (message.senderId !== payload.userId) {
+      return NextResponse.json({ error: "Удалить сообщение может только его автор" }, { status: 403 });
+    }
+
+    // The author must still be a member: once removed from the chat, their old
+    // messages are out of reach and only admin moderation can clean them up.
+    const [membership] = await db
+      .select({ id: chatMembers.id })
+      .from(chatMembers)
+      .where(and(eq(chatMembers.chatId, message.chatId), eq(chatMembers.userId, payload.userId)));
+    if (!membership) {
+      return NextResponse.json({ error: "Вы больше не участник этого чата" }, { status: 403 });
+    }
+
+    const deleted = await deleteMessagePermanently(message.id);
+    return NextResponse.json({ success: true, deleted });
+  } catch (error) {
+    console.error("Delete message error:", error);
+    return NextResponse.json({ error: "Не удалось удалить сообщение" }, { status: 500 });
   }
 }

@@ -4,29 +4,54 @@ import { users } from "@/db/schema";
 import { eq, sql } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import { createToken } from "@/lib/auth";
-import { createMatrixSession, type MatrixLoginResult } from "@/lib/matrix/server";
 import { ensureGeneralChatMembership } from "@/lib/chats";
+import {
+  CAPTCHA_MIN_AGE_MS,
+  clientIpFromHeaders,
+  consumeCaptchaNonce,
+  peekRateBucket,
+  pruneExpiredCaptchaNonces,
+  rateBucketRetryAfterMs,
+  recordRateEvent,
+  verifyCaptchaToken,
+} from "@/lib/captcha";
 
 // Reserved for the Telegram bootstrap bot: anyone who registers this name
 // before the bot runs would appear in the admin panel as the bot account.
 const RESERVED_USERNAMES = new Set(["telegram_admin"]);
+
+/** Owner's rule: at most 3 successful registrations per hour from one IP.
+ *  REGISTER_MAX_PER_IP=0 disables the quota (smoke tests re-running on the
+ *  server all come from 127.0.0.1 and would otherwise lock themselves out). */
+const REGISTER_WINDOW_MS = 60 * 60 * 1000;
+const REGISTER_MAX_PER_IP = (() => {
+  const parsed = Number.parseInt(process.env.REGISTER_MAX_PER_IP ?? "", 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3;
+})();
 
 const AVATAR_COLORS = [
   "#6C5CE7", "#A29BFE", "#00B894", "#00CEC9", "#0984E3",
   "#E17055", "#FDCB6E", "#E84393", "#55A3F5", "#FF7675",
 ];
 
+function captchaFailed(detail: string) {
+  return NextResponse.json(
+    { error: `Капча не пройдена: ${detail}. Введите новое значение с картинки.`, captchaRequired: true },
+    { status: 400 },
+  );
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const { username, password, displayName, matrixDeviceId } = await req.json();
+    const { username, password, displayName, captchaToken, captchaAnswer } = await req.json();
 
-    if (!username || !password) {
+    if (typeof username !== "string" || typeof password !== "string" || !username || !password) {
       return NextResponse.json({ error: "Логин и пароль обязательны" }, { status: 400 });
     }
 
-    if (username.length < 3 || password.length < 4) {
+    if (username.length < 3 || username.length > 50 || password.length < 4) {
       return NextResponse.json(
-        { error: "Логин минимум 3 символа, пароль минимум 4" },
+        { error: "Логин от 3 до 50 символов, пароль минимум 4" },
         { status: 400 }
       );
     }
@@ -35,6 +60,34 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         { error: "Этот логин зарезервирован для Telegram-админа" },
         { status: 409 },
+      );
+    }
+
+    // ---- Bot protection: signed single-use captcha + per-IP quota -------
+    // Checked before any user-existence lookup so the endpoint cannot be used
+    // to enumerate usernames by a client that has not solved the captcha.
+    const payload = verifyCaptchaToken(captchaToken);
+    if (!payload) return captchaFailed("значение просрочено или подделано");
+    if (Date.now() - payload.issuedAt < CAPTCHA_MIN_AGE_MS) {
+      await consumeCaptchaNonce(payload.nonce);
+      return captchaFailed("ответ отправлен слишком быстро");
+    }
+    const answer = typeof captchaAnswer === "string" ? captchaAnswer.trim().toUpperCase() : "";
+    if (!answer || answer !== payload.code.toUpperCase()) {
+      await consumeCaptchaNonce(payload.nonce);
+      return captchaFailed("ответ не совпадает");
+    }
+    // Valid answer: burn the token so the same request cannot be replayed,
+    // then look at the per-IP quota (successful registrations only).
+    const spent = await consumeCaptchaNonce(payload.nonce);
+    if (!spent) return captchaFailed("эта капча уже использована");
+
+    const ip = clientIpFromHeaders(req.headers);
+    if (REGISTER_MAX_PER_IP > 0 && peekRateBucket("register-success", ip, REGISTER_WINDOW_MS) >= REGISTER_MAX_PER_IP) {
+      const retryMinutes = Math.max(1, Math.ceil(rateBucketRetryAfterMs("register-success", ip, REGISTER_WINDOW_MS) / 60_000));
+      return NextResponse.json(
+        { error: `С этого IP зарегистрировано максимум ${REGISTER_MAX_PER_IP} аккаунтов в час. Следующая попытка — примерно через ${retryMinutes} мин.` },
+        { status: 429 },
       );
     }
 
@@ -59,7 +112,10 @@ export async function POST(req: NextRequest) {
         .insert(users)
         .values({
           username,
-          displayName: displayName || username,
+          displayName:
+            typeof displayName === "string" && displayName.trim()
+              ? displayName.trim().slice(0, 50)
+              : username,
           passwordHash,
           avatarColor,
           role: existingAdmin ? "user" : "admin",
@@ -71,20 +127,6 @@ export async function POST(req: NextRequest) {
     // checks membership for this exact user — the previous code looked at any
     // member row of the chat and could insert duplicate memberships.
     await ensureGeneralChatMembership(user.id);
-
-    let matrix: MatrixLoginResult = { availability: "unavailable", session: null };
-    try {
-      matrix = await createMatrixSession({
-        appUserId: user.id,
-        username: user.username,
-        displayName: user.displayName,
-        password,
-        deviceId: matrixDeviceId,
-      });
-    } catch (error) {
-      // Registration remains available for the public chat if Matrix is offline.
-      console.error("Matrix session unavailable:", error);
-    }
 
     const token = await createToken(user.id, user.username);
 
@@ -99,11 +141,7 @@ export async function POST(req: NextRequest) {
         role: user.role,
         bannedUntil: user.bannedUntil,
         banReason: user.banReason,
-        matrixResetRequired: user.matrixResetRequired,
       },
-      matrixAvailability: matrix.availability,
-      matrixSession: matrix.session,
-      matrixResetRequired: false,
     });
     response.cookies.set("auth_token", token, {
       httpOnly: true,
@@ -112,6 +150,11 @@ export async function POST(req: NextRequest) {
       path: "/",
       maxAge: 60 * 60 * 24 * 7,
     });
+
+    // The quota counts accounts that were really created, so a user mistyping
+    // their password/username cannot lock their own IP out.
+    recordRateEvent("register-success", ip, REGISTER_WINDOW_MS);
+    void pruneExpiredCaptchaNonces();
 
     return response;
   } catch (error) {
