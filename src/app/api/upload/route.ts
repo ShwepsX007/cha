@@ -39,7 +39,7 @@ export async function POST(req: NextRequest) {
     }
 
     const [chat] = await db
-      .select({ name: chats.name, isGroup: chats.isGroup })
+      .select({ name: chats.name, isGroup: chats.isGroup, isGeneral: chats.isGeneral })
       .from(chats)
       .where(eq(chats.id, chatId));
     if (!chat) {

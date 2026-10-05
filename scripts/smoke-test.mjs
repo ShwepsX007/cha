@@ -97,6 +97,13 @@ async function main() {
   const usersUnauthorized = await json("/api/users?q=an");
   check("GET /api/users without a session is 401", usersUnauthorized.response.status === 401);
 
+  const adminChatsUnauthorized = await json("/api/admin/chats");
+  check("GET /api/admin/chats without a session is 401", adminChatsUnauthorized.response.status === 401);
+  const adminChatDeleteUnauthorized = await json("/api/admin/chats?chatId=1", { method: "DELETE" });
+  check("DELETE /api/admin/chats without a session is 401", adminChatDeleteUnauthorized.response.status === 401);
+  const adminAvatarUnauthorized = await json("/api/admin/chats/avatar", { method: "POST" });
+  check("chat avatar upload without a session is 401", adminAvatarUnauthorized.response.status === 401);
+
   const captchaChallenge = await json("/api/auth/captcha", { method: "POST" });
   check("captcha challenge issues a token + SVG image",
     captchaChallenge.response.ok &&

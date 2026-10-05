@@ -179,11 +179,11 @@ export default function ChatSidebar({
                 }}
               >
                 <Avatar
-                  src={chat.isGroup ? null : otherMember?.avatarUrl || null}
+                  src={chat.isGroup ? chat.avatarUrl || null : otherMember?.avatarUrl || chat.avatarUrl || null}
                   name={chat.name || "?"}
                   color={otherMember?.avatarColor || "#6C5CE7"}
                   size={44}
-                  cacheKey={chat.isGroup ? null : otherMember?.avatarUpdatedAt || null}
+                  cacheKey={chat.isGroup ? chat.avatarUpdatedAt || null : otherMember?.avatarUpdatedAt || chat.avatarUpdatedAt || null}
                 />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center justify-between gap-2">

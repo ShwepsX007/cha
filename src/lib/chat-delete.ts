@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { chats, messages } from "@/db/schema";
-import { GENERAL_CHAT_NAME, isGeneralChat } from "@/lib/chats";
+import { isGeneralChat } from "@/lib/chats";
 import { deleteTelegramMessage } from "@/lib/telegram";
 
 /** Hard cap on Telegram-side cleanup per request: the bot API must not turn
@@ -40,13 +40,14 @@ export async function deleteMessagePermanently(messageId: number): Promise<boole
 }
 
 /**
- * Delete the same message twice from two tabs: the second delete is a no-op
- * instead of an error page — callers treat false as "already gone".
+ * Gate for user-initiated chat deletion: public (general) chats belong to the
+ * project and survive renames via the is_general flag, so regular members —
+ * even the creator — cannot delete one; admins act through the admin panel.
  */
-export function chatDeleteGuard(chat: { name: string | null; isGroup: boolean } | null): string | null {
+export function chatDeleteGuard(chat: { isGeneral?: boolean | null } | null): string | null {
   if (!chat) return "Чат не найден";
   if (isGeneralChat(chat)) {
-    return `«${GENERAL_CHAT_NAME}» — публичный чат проекта, его может удалить только администратор`;
+    return "Публичный чат может удалить только администратор (из панели управления)";
   }
   return null;
 }

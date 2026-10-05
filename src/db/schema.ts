@@ -40,6 +40,12 @@ export const chats = pgTable("chats", {
   id: serial("id").primaryKey(),
   name: varchar("name", { length: 100 }),
   isGroup: boolean("is_group").notNull().default(false),
+  // Public chats live in the DB, not in the name: admins can rename them
+  // freely, and membership/“join everything public” is driven by this flag
+  // (drizzle/0012 backfilled it from the historical "Общий чат" name).
+  isGeneral: boolean("is_general").notNull().default(false),
+  avatarUrl: text("avatar_url"),
+  avatarUpdatedAt: timestamp("avatar_updated_at", { withTimezone: true }),
   createdBy: integer("created_by").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });

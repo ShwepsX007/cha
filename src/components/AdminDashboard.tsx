@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import Avatar from "./Avatar";
 
 type AdminUser = {
   id: number;
@@ -26,7 +27,9 @@ type AdminChatRow = {
   id: number;
   name: string | null;
   isGroup: boolean;
-  isGeneralChat: boolean;
+  isGeneral: boolean;
+  avatarUrl: string | null;
+  avatarUpdatedAt: string | null;
   createdAt: string;
   createdBy: number | null;
   creatorUsername: string | null;
@@ -112,6 +115,11 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
   const [adminChatQuery, setAdminChatQuery] = useState("");
   const [adminChatLoading, setAdminChatLoading] = useState(false);
   const [adminChatBusy, setAdminChatBusy] = useState<number | null>(null);
+  const [editingChatId, setEditingChatId] = useState<number | null>(null);
+  const [editingChatName, setEditingChatName] = useState("");
+  const [newChatName, setNewChatName] = useState("");
+  const [newChatFile, setNewChatFile] = useState<File | null>(null);
+  const [creatingChat, setCreatingChat] = useState(false);
   const [messages, setMessages] = useState<AdminMessage[]>([]);
   const [selectedChat, setSelectedChat] = useState("");
   const [selectedSender, setSelectedSender] = useState("");
@@ -205,9 +213,115 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
     };
   }, [tab, adminChatQuery]);
 
+  const startChatRename = (chat: AdminChatRow) => {
+    setEditingChatId(chat.id);
+    setEditingChatName(chat.name || "");
+  };
+
+  const saveChatRename = async (chat: AdminChatRow) => {
+    const name = editingChatName.trim();
+    if (!name) {
+      setError("Название чата не может быть пустым");
+      return;
+    }
+    clearFeedback();
+    setAdminChatBusy(chat.id);
+    try {
+      const response = await fetch("/api/admin/chats", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chatId: chat.id, name }),
+      });
+      const data = await readJson(response);
+      if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "Не удалось переименовать чат");
+      setNotice(`Чат переименован в «${name}».`);
+      setEditingChatId(null);
+      await refreshAdminChats();
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "Не удалось переименовать чат");
+    } finally {
+      setAdminChatBusy(null);
+    }
+  };
+
+  const uploadChatAvatar = async (chat: AdminChatRow, file: File | null | undefined) => {
+    if (!file) return;
+    clearFeedback();
+    setAdminChatBusy(chat.id);
+    try {
+      const form = new FormData();
+      form.append("chatId", String(chat.id));
+      form.append("avatar", file);
+      const response = await fetch("/api/admin/chats/avatar", { method: "POST", body: form });
+      const data = await readJson(response);
+      if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "Не удалось сохранить аватарку");
+      setNotice("Аватарка чата обновлена.");
+      await refreshAdminChats();
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "Не удалось сохранить аватарку");
+    } finally {
+      setAdminChatBusy(null);
+    }
+  };
+
+  const removeChatAvatar = async (chat: AdminChatRow) => {
+    clearFeedback();
+    setAdminChatBusy(chat.id);
+    try {
+      const response = await fetch(`/api/admin/chats/avatar?chatId=${chat.id}`, { method: "DELETE" });
+      const data = await readJson(response);
+      if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "Не удалось удалить аватарку");
+      setNotice("Аватарка чата удалена.");
+      await refreshAdminChats();
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "Не удалось удалить аватарку");
+    } finally {
+      setAdminChatBusy(null);
+    }
+  };
+
+  const createGeneralChat = async () => {
+    const name = newChatName.trim();
+    if (!name || creatingChat) return;
+    clearFeedback();
+    setCreatingChat(true);
+    try {
+      const response = await fetch("/api/admin/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, isGeneral: true }),
+      });
+      const data = await readJson(response);
+      if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "Не удалось создать чат");
+      const created = data.chat as { id?: number } | undefined;
+      const chatId = Number(created?.id);
+      let avatarFailed = false;
+      if (newChatFile && Number.isSafeInteger(chatId) && chatId > 0) {
+        // The chat exists already; an avatar hiccup must not fail the whole action.
+        const form = new FormData();
+        form.append("chatId", String(chatId));
+        form.append("avatar", newChatFile);
+        const avatarResponse = await fetch("/api/admin/chats/avatar", { method: "POST", body: form });
+        avatarFailed = !avatarResponse.ok;
+      }
+      setNotice(
+        avatarFailed
+          ? `Чат «${name}» создан, но аватарку загрузить не удалось — повторите кнопкой «Аватарка» в его строке.`
+          : `Общий чат «${name}» создан — все текущие участники уже добавлены.`,
+      );
+      setNewChatName("");
+      setNewChatFile(null);
+      await refreshAdminChats();
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "Не удалось создать чат");
+    } finally {
+      setCreatingChat(false);
+    }
+  };
+
   const deleteAdminChat = async (chat: AdminChatRow) => {
     const label = chat.name || `Чат #${chat.id}`;
-    const warning = chat.isGeneralChat ? " Это публичный общий чат: он будет пересоздан при следующей синхронизации, но вся история исчезнет." : "";
+    const warning = chat.isGeneral ? " Это публичный общий чат: он будет пересоздан при следующей синхронизации, но вся история исчезнет." : "";
     if (!window.confirm(`Удалить «${label}» со всеми участниками (${chat.memberCount}) и сообщениями (${chat.messageCount})?${warning}`)) return;
     clearFeedback();
     setAdminChatBusy(chat.id);
@@ -610,6 +724,37 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
 
         {tab === "chats" && (
           <section className="space-y-4">
+            <div className="rounded-2xl border border-purple-500/25 bg-purple-500/5 p-4 sm:p-5">
+              <h2 className="text-sm font-semibold">Создать общий чат</h2>
+              <p className="mt-1 text-xs text-gray-400">
+                Новый публичный чат для всех: текущие участники добавятся сразу, остальные — при первой синхронизации.
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <input
+                  value={newChatName}
+                  onChange={(event) => setNewChatName(event.target.value)}
+                  maxLength={100}
+                  placeholder="Название (например: Общий чат · Оффтоп)"
+                  className="w-64 min-w-0 flex-1 rounded-xl border border-dark-500 bg-dark-900 px-4 py-2.5 text-sm outline-none focus:border-purple-500"
+                />
+                <label className="cursor-pointer rounded-lg border border-dark-500 bg-dark-900 px-3 py-2.5 text-xs text-gray-300 transition hover:border-purple-500">
+                  {newChatFile ? newChatFile.name : "Аватарка (необязательно)"}
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    className="sr-only"
+                    onChange={(event) => setNewChatFile(event.target.files?.[0] ?? null)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  disabled={creatingChat || !newChatName.trim()}
+                  onClick={() => void createGeneralChat()}
+                  className="rounded-xl bg-purple-500 px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-purple-600 disabled:opacity-40"
+                >{creatingChat ? "Создаём…" : "Создать общий чат"}</button>
+              </div>
+            </div>
+
             <div className="rounded-2xl border border-dark-600 bg-dark-800 p-4 sm:p-5">
               <label htmlFor="chat-search" className="mb-2 block text-sm font-semibold">Найти чат</label>
               <input
@@ -620,9 +765,10 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
                 className="w-full rounded-xl border border-dark-500 bg-dark-900 px-4 py-3 text-sm outline-none transition focus:border-purple-500 sm:max-w-xl"
               />
               <p className="mt-2 text-xs text-gray-500">
-                Удаление чата необратимо: участники, сообщения, receipts и Telegram-вложения удаляются каскадом. Общий чат лучше очищать, а не удалять — он пересоздаётся автоматически.
+                Удаление чата необратимо: участники, сообщения, receipts и Telegram-вложения удаляются каскадом. Общий чат лучше очищать, а не удалять — он пересоздаётся автоматически. Переименование безопасно: публичный статус закреплён флагом, а не названием.
               </p>
             </div>
+
             {adminChatLoading ? (
               <p className="px-2 py-8 text-center text-sm text-gray-500">Загрузка чатов…</p>
             ) : adminChatRows.length === 0 ? (
@@ -631,32 +777,84 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
               <div className="space-y-2">
                 {adminChatRows.map((chat) => (
                   <article key={chat.id} className="rounded-2xl border border-dark-600 bg-dark-800 p-4 flex flex-wrap items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <h2 className="truncate font-semibold">{chat.name || `Чат #${chat.id}`}</h2>
-                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${chat.isGeneralChat ? "bg-sky-500/20 text-sky-200" : chat.isGroup ? "bg-purple-500/20 text-purple-200" : "bg-dark-600 text-gray-400"}`}>
-                          {chat.isGeneralChat ? "Общий чат" : chat.isGroup ? "Группа" : "Личный"}
-                        </span>
+                    <div className="flex min-w-0 items-center gap-3">
+                      <Avatar src={chat.avatarUrl} name={chat.name || `Чат #${chat.id}`} color={chat.isGeneral ? "#0984E3" : "#6C5CE7"} size={40} cacheKey={chat.avatarUpdatedAt} />
+                      <div className="min-w-0">
+                        {editingChatId === chat.id ? (
+                          <div className="flex flex-wrap items-center gap-2">
+                            <input
+                              value={editingChatName}
+                              onChange={(event) => setEditingChatName(event.target.value)}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") { event.preventDefault(); void saveChatRename(chat); }
+                                if (event.key === "Escape") setEditingChatId(null);
+                              }}
+                              maxLength={100}
+                              autoFocus
+                              className="w-64 min-w-0 rounded-lg border border-purple-500/50 bg-dark-900 px-3 py-1.5 text-sm outline-none"
+                              aria-label={`Новое название чата ${chat.id}`}
+                            />
+                            <button type="button" disabled={adminChatBusy !== null} onClick={() => void saveChatRename(chat)} className="rounded-lg bg-purple-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-purple-600 disabled:opacity-40">Сохранить</button>
+                            <button type="button" onClick={() => setEditingChatId(null)} className="rounded-lg border border-dark-500 px-3 py-1.5 text-xs text-gray-300 hover:bg-dark-700">Отмена</button>
+                          </div>
+                        ) : (
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h2 className="truncate font-semibold">{chat.name || `Чат #${chat.id}`}</h2>
+                            <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${chat.isGeneral ? "bg-sky-500/20 text-sky-200" : chat.isGroup ? "bg-purple-500/20 text-purple-200" : "bg-dark-600 text-gray-400"}`}>
+                              {chat.isGeneral ? "Общий чат" : chat.isGroup ? "Группа" : "Личный"}
+                            </span>
+                          </div>
+                        )}
+                        <p className="mt-1 text-xs text-gray-500">
+                          ID {chat.id} · участников: {chat.memberCount} · сообщений: {chat.messageCount} · создан: {dateLabel(chat.createdAt)}
+                          {chat.creatorUsername ? ` · автор: @${chat.creatorUsername}` : chat.createdBy ? ` · автор: ID ${chat.createdBy} (удалён)` : " · автор: неизвестен"}
+                        </p>
                       </div>
-                      <p className="mt-1 text-xs text-gray-500">
-                        ID {chat.id} · участников: {chat.memberCount} · сообщений: {chat.messageCount} · создан: {dateLabel(chat.createdAt)}
-                        {chat.creatorUsername ? ` · автор: @${chat.creatorUsername}` : chat.createdBy ? ` · автор: ID ${chat.createdBy} (удалён)` : " · автор: неизвестен"}
-                      </p>
                     </div>
-                    <div className="flex shrink-0 flex-wrap items-center gap-2">
-                      <button
-                        type="button"
-                        disabled={adminChatBusy !== null || chat.messageCount === 0}
-                        onClick={() => void clearAdminChatMessages(chat)}
-                        className="rounded-lg border border-amber-500/30 px-3 py-2 text-xs text-amber-200 transition hover:bg-amber-500/10 disabled:opacity-40"
-                      >Очистить сообщения</button>
-                      <button
-                        type="button"
-                        disabled={adminChatBusy !== null}
-                        onClick={() => void deleteAdminChat(chat)}
-                        className="rounded-lg border border-red-500/30 px-3 py-2 text-xs text-red-200 transition hover:bg-red-500/10 disabled:opacity-40"
-                      >{adminChatBusy === chat.id ? "Удаляем…" : "Удалить чат"}</button>
-                    </div>
+                    {editingChatId !== chat.id && (
+                      <div className="flex shrink-0 flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={adminChatBusy !== null}
+                          onClick={() => startChatRename(chat)}
+                          className="rounded-lg border border-dark-500 px-3 py-2 text-xs text-gray-200 transition hover:border-purple-500 disabled:opacity-40"
+                        >Переименовать</button>
+                        <label className={`cursor-pointer rounded-lg border border-dark-500 px-3 py-2 text-xs text-gray-200 transition hover:border-purple-500 ${adminChatBusy !== null ? "opacity-40" : ""}`}>
+                          {adminChatBusy === chat.id ? "…" : "Аватарка"}
+                          <input
+                            type="file"
+                            accept="image/jpeg,image/png,image/webp"
+                            className="sr-only"
+                            disabled={adminChatBusy !== null}
+                            onChange={(event) => {
+                              const file = event.target.files?.[0];
+                              event.target.value = "";
+                              void uploadChatAvatar(chat, file);
+                            }}
+                          />
+                        </label>
+                        {chat.avatarUrl && (
+                          <button
+                            type="button"
+                            disabled={adminChatBusy !== null}
+                            onClick={() => void removeChatAvatar(chat)}
+                            className="rounded-lg border border-dark-500 px-3 py-2 text-xs text-gray-400 transition hover:border-amber-500/50 hover:text-amber-200 disabled:opacity-40"
+                          >Убрать аватарку</button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={adminChatBusy !== null || chat.messageCount === 0}
+                          onClick={() => void clearAdminChatMessages(chat)}
+                          className="rounded-lg border border-amber-500/30 px-3 py-2 text-xs text-amber-200 transition hover:bg-amber-500/10 disabled:opacity-40"
+                        >Очистить сообщения</button>
+                        <button
+                          type="button"
+                          disabled={adminChatBusy !== null}
+                          onClick={() => void deleteAdminChat(chat)}
+                          className="rounded-lg border border-red-500/30 px-3 py-2 text-xs text-red-200 transition hover:bg-red-500/10 disabled:opacity-40"
+                        >{adminChatBusy === chat.id ? "Удаляем…" : "Удалить чат"}</button>
+                      </div>
+                    )}
                   </article>
                 ))}
               </div>

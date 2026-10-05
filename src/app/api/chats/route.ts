@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { chats, chatMembers, users, messages } from "@/db/schema";
 import { getCurrentUser } from "@/lib/auth";
-import { ensureGeneralChatMembership, GENERAL_CHAT_NAME } from "@/lib/chats";
+import { ensureGeneralChatMembership, isGeneralChat } from "@/lib/chats";
 import { eq, and, desc, inArray, sql } from "drizzle-orm";
 
 export async function GET() {
@@ -26,13 +26,14 @@ export async function GET() {
 
     let { ids: chatIds, list: chatList } = await loadMemberships();
 
-    // Accounts that lost their membership (deleted chat, admin wipe, manual
-    // cleanup in the database) used to be stuck with an empty chat list
-    // forever: only registration could join the public chat. Restore it.
-    const hasGeneralChat = chatList.some(
-      (chat) => chat.isGroup && chat.name === GENERAL_CHAT_NAME,
-    );
-    if (!hasGeneralChat) {
+    // Accounts that lost a membership (deleted chat, admin wipe, manual
+    // cleanup in the database) and every user who has not yet been joined to
+    // a newly created public chat are fixed up here. Membership follows the
+    // is_general flag, so renaming a general chat never orphans anyone.
+    const generalIds = (
+      await db.select({ id: chats.id }).from(chats).where(eq(chats.isGeneral, true))
+    ).map((row) => row.id);
+    if (generalIds.length === 0 || generalIds.some((id) => !chatIds.includes(id))) {
       await ensureGeneralChatMembership(payload.userId);
       ({ ids: chatIds, list: chatList } = await loadMemberships());
     }
@@ -97,9 +98,9 @@ export async function GET() {
         return {
           ...chat,
           name: chatName,
-          // The reserved general chat carries the public-chat moderation rules;
-          // the client must not re-derive that from the display name alone.
-          isGeneralChat: chat.isGroup && chat.name === GENERAL_CHAT_NAME,
+          // The flagged chats carry the public-chat moderation rules; the
+          // client must not re-derive that from the display name alone.
+          isGeneralChat: isGeneralChat(chat),
           members,
           notificationsMuted,
           lastMessage: lastMessage || null,

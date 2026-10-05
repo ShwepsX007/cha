@@ -60,6 +60,8 @@ export interface Chat {
   isGroup: boolean;
   isGeneralChat: boolean;
   createdBy: number | null;
+  avatarUrl?: string | null;
+  avatarUpdatedAt?: string | null;
   members: User[];
   notificationsMuted?: boolean;
   lastMessage: {

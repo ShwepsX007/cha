@@ -36,6 +36,7 @@ export async function DELETE(
         id: chats.id,
         name: chats.name,
         isGroup: chats.isGroup,
+        isGeneral: chats.isGeneral,
         createdBy: chats.createdBy,
       })
       .from(chats)
