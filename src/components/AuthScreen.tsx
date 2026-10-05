@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import type { User } from "@/app/page";
+import CaptchaField, { type CaptchaChallenge } from "./CaptchaField";
 
 export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void }) {
   const [isLogin, setIsLogin] = useState(true);
@@ -11,6 +12,9 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [captcha, setCaptcha] = useState<CaptchaChallenge | null>(null);
+  const [captchaAnswer, setCaptchaAnswer] = useState("");
+  const [captchaRefresh, setCaptchaRefresh] = useState(0);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -21,7 +25,13 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
       const endpoint = isLogin ? "/api/auth/login" : "/api/auth/register";
       const body = isLogin
         ? { username, password }
-        : { username, password, displayName: displayName || username };
+        : {
+            username,
+            password,
+            displayName: displayName || username,
+            captchaToken: captcha?.token ?? "",
+            captchaAnswer,
+          };
 
       const res = await fetch(endpoint, {
         method: "POST",
@@ -32,13 +42,21 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
       const data = await res.json();
       if (!res.ok) {
         setError(data.error || "Произошла ошибка");
+        // Captcha tokens are single-use: any failed registration consumed the
+        // challenge (or was refused because of it), so always show a new one.
+        if (!isLogin) {
+          setCaptchaAnswer("");
+          setCaptchaRefresh((n) => n + 1);
+        }
         return;
       }
 
       setPassword("");
+      setCaptchaAnswer("");
       onAuth(data.user);
     } catch {
       setError("Ошибка соединения");
+      if (!isLogin) setCaptchaRefresh((n) => n + 1);
     } finally {
       setLoading(false);
     }
@@ -121,6 +139,16 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
                 </button>
               </div>
             </div>
+
+            {!isLogin && (
+              <CaptchaField
+                value={captchaAnswer}
+                onChange={setCaptchaAnswer}
+                onChallengeChange={setCaptcha}
+                refreshSignal={captchaRefresh}
+                disabled={loading}
+              />
+            )}
 
             {error && (
               <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-sm">

@@ -72,6 +72,9 @@ export const messages = pgTable("messages", {
   ),
   // Telegram file storage
   telegramFileId: text("telegram_file_id"),
+  // Bot-API message id of the uploaded attachment in the storage chat; lets
+  // deletions remove the Telegram copy too (null for rows predating it).
+  telegramMessageId: bigint("telegram_message_id", { mode: "number" }),
   fileName: varchar("file_name", { length: 500 }),
   fileSize: bigint("file_size", { mode: "number" }),
   mimeType: varchar("mime_type", { length: 200 }),
@@ -98,5 +101,14 @@ export const pushSubscriptions = pgTable("push_subscriptions", {
   endpoint: text("endpoint").notNull().unique(),
   p256dh: text("p256dh").notNull(),
   auth: text("auth").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+/**
+ * Single-use registry for registration captcha tokens (drizzle/0011). Rows
+ * are garbage-collected by the app; the table is intentionally bare.
+ */
+export const captchaNonces = pgTable("captcha_nonces", {
+  nonce: text("nonce").primaryKey(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });

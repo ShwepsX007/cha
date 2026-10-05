@@ -22,6 +22,19 @@ type AdminChat = {
   createdAt: string;
 };
 
+type AdminChatRow = {
+  id: number;
+  name: string | null;
+  isGroup: boolean;
+  isGeneralChat: boolean;
+  createdAt: string;
+  createdBy: number | null;
+  creatorUsername: string | null;
+  creatorDisplayName: string | null;
+  memberCount: number;
+  messageCount: number;
+};
+
 type AdminMessage = {
   id: number;
   chatId: number;
@@ -50,7 +63,7 @@ type SystemStatus = {
   counts: { users: number; chats: number; messages: number; auditLogs: number };
 };
 
-type Tab = "users" | "moderation" | "system" | "audit";
+type Tab = "users" | "chats" | "moderation" | "system" | "audit";
 
 const BAN_OPTIONS = [
   { value: "15m", label: "15 минут" },
@@ -62,6 +75,7 @@ const BAN_OPTIONS = [
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: "users", label: "Пользователи" },
+  { id: "chats", label: "Чаты" },
   { id: "moderation", label: "Модерация" },
   { id: "system", label: "Система" },
   { id: "audit", label: "Аудит" },
@@ -94,6 +108,10 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
   const [banReasons, setBanReasons] = useState<Record<number, string>>({});
 
   const [chats, setChats] = useState<AdminChat[]>([]);
+  const [adminChatRows, setAdminChatRows] = useState<AdminChatRow[]>([]);
+  const [adminChatQuery, setAdminChatQuery] = useState("");
+  const [adminChatLoading, setAdminChatLoading] = useState(false);
+  const [adminChatBusy, setAdminChatBusy] = useState<number | null>(null);
   const [messages, setMessages] = useState<AdminMessage[]>([]);
   const [selectedChat, setSelectedChat] = useState("");
   const [selectedSender, setSelectedSender] = useState("");
@@ -154,6 +172,78 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
     void loadModeration();
     return () => { cancelled = true; };
   }, [tab, selectedChat, selectedSender]);
+
+  const refreshAdminChats = async () => {
+    const params = new URLSearchParams();
+    if (adminChatQuery.trim()) params.set("q", adminChatQuery.trim());
+    const response = await fetch(`/api/admin/chats${params.size ? `?${params}` : ""}`, { cache: "no-store" });
+    const data = await readJson(response);
+    if (response.ok && Array.isArray(data.chats)) setAdminChatRows(data.chats as AdminChatRow[]);
+  };
+
+  useEffect(() => {
+    if (tab !== "chats") return;
+    let cancelled = false;
+    const timeout = window.setTimeout(async () => {
+      setAdminChatLoading(true);
+      try {
+        const params = new URLSearchParams();
+        if (adminChatQuery.trim()) params.set("q", adminChatQuery.trim());
+        const response = await fetch(`/api/admin/chats${params.size ? `?${params}` : ""}`, { cache: "no-store" });
+        const data = await readJson(response);
+        if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "Не удалось загрузить чаты");
+        if (!cancelled) setAdminChatRows(Array.isArray(data.chats) ? data.chats as AdminChatRow[] : []);
+      } catch (loadError) {
+        if (!cancelled) setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить чаты");
+      } finally {
+        if (!cancelled) setAdminChatLoading(false);
+      }
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [tab, adminChatQuery]);
+
+  const deleteAdminChat = async (chat: AdminChatRow) => {
+    const label = chat.name || `Чат #${chat.id}`;
+    const warning = chat.isGeneralChat ? " Это публичный общий чат: он будет пересоздан при следующей синхронизации, но вся история исчезнет." : "";
+    if (!window.confirm(`Удалить «${label}» со всеми участниками (${chat.memberCount}) и сообщениями (${chat.messageCount})?${warning}`)) return;
+    clearFeedback();
+    setAdminChatBusy(chat.id);
+    try {
+      const response = await fetch(`/api/admin/chats?chatId=${chat.id}`, { method: "DELETE" });
+      const data = await readJson(response);
+      if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "Не удалось удалить чат");
+      setNotice(`Чат «${label}» удалён. Сообщений удалено: ${String(data.deletedMessages ?? 0)}.`);
+      await refreshAdminChats();
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "Не удалось удалить чат");
+    } finally {
+      setAdminChatBusy(null);
+    }
+  };
+
+  const clearAdminChatMessages = async (chat: AdminChatRow) => {
+    if (!window.confirm(`Удалить все сообщения (${chat.messageCount}) из «${chat.name || `Чат #${chat.id}`}»? Сам чат останется.`)) return;
+    clearFeedback();
+    setAdminChatBusy(chat.id);
+    try {
+      const response = await fetch("/api/admin/moderation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "clear_chat", chatId: chat.id }),
+      });
+      const data = await readJson(response);
+      if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "Не удалось очистить чат");
+      setNotice(`Очищено сообщений: ${String(data.deletedMessages ?? 0)}.`);
+      await refreshAdminChats();
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "Не удалось очистить чат");
+    } finally {
+      setAdminChatBusy(null);
+    }
+  };
 
   useEffect(() => {
     if (tab !== "system") return;
@@ -512,6 +602,62 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
                       {message.fileName && <p className="mt-1 text-xs text-gray-500">Вложение: {message.fileName}</p>}
                     </div>
                   </label>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {tab === "chats" && (
+          <section className="space-y-4">
+            <div className="rounded-2xl border border-dark-600 bg-dark-800 p-4 sm:p-5">
+              <label htmlFor="chat-search" className="mb-2 block text-sm font-semibold">Найти чат</label>
+              <input
+                id="chat-search"
+                value={adminChatQuery}
+                onChange={(event) => setAdminChatQuery(event.target.value)}
+                placeholder="Название или ID (пусто — все чаты, максимум 200)"
+                className="w-full rounded-xl border border-dark-500 bg-dark-900 px-4 py-3 text-sm outline-none transition focus:border-purple-500 sm:max-w-xl"
+              />
+              <p className="mt-2 text-xs text-gray-500">
+                Удаление чата необратимо: участники, сообщения, receipts и Telegram-вложения удаляются каскадом. Общий чат лучше очищать, а не удалять — он пересоздаётся автоматически.
+              </p>
+            </div>
+            {adminChatLoading ? (
+              <p className="px-2 py-8 text-center text-sm text-gray-500">Загрузка чатов…</p>
+            ) : adminChatRows.length === 0 ? (
+              <div className="rounded-2xl border border-dark-600 bg-dark-800 p-8 text-center text-sm text-gray-500">Чаты не найдены.</div>
+            ) : (
+              <div className="space-y-2">
+                {adminChatRows.map((chat) => (
+                  <article key={chat.id} className="rounded-2xl border border-dark-600 bg-dark-800 p-4 flex flex-wrap items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h2 className="truncate font-semibold">{chat.name || `Чат #${chat.id}`}</h2>
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${chat.isGeneralChat ? "bg-sky-500/20 text-sky-200" : chat.isGroup ? "bg-purple-500/20 text-purple-200" : "bg-dark-600 text-gray-400"}`}>
+                          {chat.isGeneralChat ? "Общий чат" : chat.isGroup ? "Группа" : "Личный"}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs text-gray-500">
+                        ID {chat.id} · участников: {chat.memberCount} · сообщений: {chat.messageCount} · создан: {dateLabel(chat.createdAt)}
+                        {chat.creatorUsername ? ` · автор: @${chat.creatorUsername}` : chat.createdBy ? ` · автор: ID ${chat.createdBy} (удалён)` : " · автор: неизвестен"}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={adminChatBusy !== null || chat.messageCount === 0}
+                        onClick={() => void clearAdminChatMessages(chat)}
+                        className="rounded-lg border border-amber-500/30 px-3 py-2 text-xs text-amber-200 transition hover:bg-amber-500/10 disabled:opacity-40"
+                      >Очистить сообщения</button>
+                      <button
+                        type="button"
+                        disabled={adminChatBusy !== null}
+                        onClick={() => void deleteAdminChat(chat)}
+                        className="rounded-lg border border-red-500/30 px-3 py-2 text-xs text-red-200 transition hover:bg-red-500/10 disabled:opacity-40"
+                      >{adminChatBusy === chat.id ? "Удаляем…" : "Удалить чат"}</button>
+                    </div>
+                  </article>
                 ))}
               </div>
             )}

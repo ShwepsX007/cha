@@ -8,6 +8,12 @@
  *
  * The write mode creates users named smoke_<random> and leaves them in the
  * database on purpose: delete them from the admin panel afterwards.
+ *
+ * Registration is captcha-protected (the test "reads" the generated SVG) and
+ * capped at 3 successful registrations per hour per IP — repeated runs against
+ * the same server all come from 127.0.0.1. For a test environment the server
+ * can run with REGISTER_MAX_PER_IP=0 in .env (or higher), otherwise the quota
+ * 429s the third run of the hour.
  */
 const baseUrl = (process.env.BASE_URL || "http://127.0.0.1:8010").replace(/\/+$/, "");
 const allowWrites = process.env.SMOKE_ALLOW_WRITES === "1";
@@ -36,6 +42,39 @@ async function json(path, options = {}, cookie) {
   return { response, body, cookie: setCookie.map((c) => c.split(";")[0]).join("; ") };
 }
 
+/**
+ * Solve the registration captcha like a sighted user would: request a
+ * challenge, "read" the SVG. Decoding the glyph positions from the distorted
+ * image via regex is only possible because we own the renderer — a real bot
+ * facing the public site must do OCR, which the distortion is built for.
+ */
+async function solvedCaptcha() {
+  const challenge = await json("/api/auth/captcha", { method: "POST" });
+  if (!challenge.response.ok || !challenge.body?.token || !challenge.body?.image) {
+    throw new Error(`captcha challenge failed: HTTP ${challenge.response.status}`);
+  }
+  const svg = Buffer.from(challenge.body.image.split(",")[1], "base64").toString("utf8");
+  const code = [...svg.matchAll(/<text[^>]*>([^<]+)<\/text>/g)].map((m) => m[1]).join("");
+  // The server rejects answers submitted <1s after issuing the challenge.
+  await new Promise((resolve) => setTimeout(resolve, 1150));
+  return { token: challenge.body.token, code };
+}
+
+async function register(username, password, displayName) {
+  const captcha = await solvedCaptcha();
+  return json("/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username,
+      password,
+      displayName,
+      captchaToken: captcha.token,
+      captchaAnswer: captcha.code,
+    }),
+  });
+}
+
 async function main() {
   console.log(`Smoke test against ${baseUrl}\n`);
 
@@ -55,6 +94,25 @@ async function main() {
   const chatsUnauthorized = await json("/api/chats");
   check("GET /api/chats without a session is 401", chatsUnauthorized.response.status === 401);
 
+  const usersUnauthorized = await json("/api/users?q=an");
+  check("GET /api/users without a session is 401", usersUnauthorized.response.status === 401);
+
+  const captchaChallenge = await json("/api/auth/captcha", { method: "POST" });
+  check("captcha challenge issues a token + SVG image",
+    captchaChallenge.response.ok &&
+      typeof captchaChallenge.body?.token === "string" &&
+      String(captchaChallenge.body?.image || "").startsWith("data:image/svg+xml;base64,"),
+    `HTTP ${captchaChallenge.response.status}`);
+
+  const registerNoCaptcha = await json("/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "smoke_nocapt", password: "whatever-1" }),
+  });
+  check("register without a captcha is refused",
+    registerNoCaptcha.response.status === 400 && registerNoCaptcha.body?.captchaRequired === true,
+    `HTTP ${registerNoCaptcha.response.status} ${JSON.stringify(registerNoCaptcha.body)}`);
+
   const passwordChangeUnauthorized = await json("/api/profile/password", {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -72,12 +130,8 @@ async function main() {
     const [a, b] = [`smoke_a_${suffix}`, `smoke_b_${suffix}`];
 
     console.log("\nRegistration and public chat");
-    const regA = await json("/api/auth/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: a, password: "smoke-password-1", displayName: `Smoke A ${suffix}` }),
-    });
-    check("register user A", regA.response.ok, `HTTP ${regA.response.status} ${JSON.stringify(regA.body)}`);
+    const regA = await register(a, "smoke-password-1", `Smoke A ${suffix}`);
+    check("register user A (with captcha)", regA.response.ok, `HTTP ${regA.response.status} ${JSON.stringify(regA.body)}`);
 
     const newPassword = "smoke-password-2";
     const passwordChange = await json("/api/profile/password", {
@@ -105,12 +159,8 @@ async function main() {
     check("old password no longer works", oldPasswordLogin.response.status === 401,
       `HTTP ${oldPasswordLogin.response.status}`);
 
-    const regB = await json("/api/auth/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: b, password: "smoke-password-1", displayName: `Smoke B ${suffix}` }),
-    });
-    check("register user B", regB.response.ok, `HTTP ${regB.response.status}`);
+    const regB = await register(b, "smoke-password-1", `Smoke B ${suffix}`);
+    check("register user B (with captcha)", regB.response.ok, `HTTP ${regB.response.status}`);
     const pushStatus = await json("/api/push/status", {}, regA.cookie);
     check("authenticated push status reports subscriptions", pushStatus.response.ok &&
       Number.isInteger(pushStatus.body?.subscriptionCount), `HTTP ${pushStatus.response.status}`);
@@ -128,17 +178,50 @@ async function main() {
     check("direct chat created", dmChat.response.ok && dmChat.body?.chat?.id > 0,
       `HTTP ${dmChat.response.status}`);
     if (dmChat.body?.chat?.id) {
+      const dmId = dmChat.body.chat.id;
       const dmMessage = await json("/api/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId: dmChat.body.chat.id, content: "smoke dm ping" }),
+        body: JSON.stringify({ chatId: dmId, content: "smoke dm ping" }),
       }, regA.cookie);
       check("message accepted into the direct chat", dmMessage.response.status === 200,
         `HTTP ${dmMessage.response.status} ${JSON.stringify(dmMessage.body)}`);
-      const dmTimeline = await json(`/api/messages?chatId=${dmChat.body.chat.id}`, {}, regA.cookie);
+      const dmTimeline = await json(`/api/messages?chatId=${dmId}`, {}, regA.cookie);
       check("direct chat timeline contains the message",
         Array.isArray(dmTimeline.body?.messages) &&
         dmTimeline.body.messages.some((message) => message.content === "smoke dm ping"));
+
+      console.log("\nSearch-only users, message and chat deletion");
+      const usersListNoQuery = await json("/api/users", {}, regA.cookie);
+      check("user directory is hidden without a search query",
+        usersListNoQuery.response.ok && usersListNoQuery.body?.needsSearch === true &&
+        Array.isArray(usersListNoQuery.body?.users) && usersListNoQuery.body.users.length === 0,
+        JSON.stringify(usersListNoQuery.body));
+      const usersSearch = await json(`/api/users?q=${encodeURIComponent(b)}`, {}, regA.cookie);
+      check("user is findable by exact search",
+        usersSearch.response.ok && (usersSearch.body?.users || []).some((u) => u.username === b),
+        JSON.stringify(usersSearch.body));
+
+      const messageId = dmMessage.body?.message?.id;
+      const foreignDelete = await json(`/api/messages?messageId=${messageId}`, { method: "DELETE" }, regB.cookie);
+      check("a non-author cannot delete a message", foreignDelete.response.status === 403,
+        `HTTP ${foreignDelete.response.status}`);
+      const ownDelete = await json(`/api/messages?messageId=${messageId}`, { method: "DELETE" }, regA.cookie);
+      check("the author deletes their message", ownDelete.response.ok && ownDelete.body?.deleted === true,
+        `HTTP ${ownDelete.response.status} ${JSON.stringify(ownDelete.body)}`);
+      const afterDelete = await json(`/api/messages?chatId=${dmId}`, {}, regA.cookie);
+      check("deleted message is gone from the timeline",
+        (afterDelete.body?.messages || []).every((message) => message.id !== messageId));
+
+      const nonCreatorDelete = await json(`/api/chats/${dmId}`, { method: "DELETE" }, regB.cookie);
+      check("a non-creator cannot delete the chat", nonCreatorDelete.response.status === 403,
+        `HTTP ${nonCreatorDelete.response.status}`);
+      const chatDelete = await json(`/api/chats/${dmId}`, { method: "DELETE" }, regA.cookie);
+      check("the creator deletes the direct chat", chatDelete.response.ok && chatDelete.body?.success === true,
+        `HTTP ${chatDelete.response.status} ${JSON.stringify(chatDelete.body)}`);
+      const bChats = await json("/api/chats", {}, regB.cookie);
+      check("the deleted chat is gone for the other participant too",
+        (bChats.body?.chats || []).every((chat) => chat.id !== dmId));
     }
 
     const chats = await json("/api/chats", {}, regA.cookie);

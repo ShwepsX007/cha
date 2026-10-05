@@ -91,6 +91,7 @@ export async function POST(req: NextRequest) {
         messageType,
         replyToMessageId,
         telegramFileId: telegramResult?.fileId || null,
+        telegramMessageId: telegramResult?.messageId ?? null,
         fileName,
         fileSize: telegramResult?.fileSize || buffer.length,
         mimeType,

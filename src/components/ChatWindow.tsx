@@ -75,6 +75,8 @@ function MessageBubble({
   onReply,
   onMention,
   onJumpToMessage,
+  onDelete,
+  deleteBusy,
 }: {
   msg: ChatMessage;
   isOwn: boolean;
@@ -85,6 +87,8 @@ function MessageBubble({
   onReply: (message: ChatMessage) => void;
   onMention?: (message: ChatMessage) => void;
   onJumpToMessage: (id: number | string) => void;
+  onDelete?: (message: ChatMessage) => void;
+  deleteBusy?: boolean;
 }) {
   const renderFileContent = () => {
     const hasFile = Boolean(msg.telegramFileId);
@@ -252,6 +256,18 @@ function MessageBubble({
             >
               ↩
             </button>
+            {isOwn && onDelete && (
+              <button
+                type="button"
+                onClick={() => onDelete(msg)}
+                disabled={deleteBusy}
+                className="mr-1 rounded px-1 text-[12px] opacity-70 transition hover:bg-black/10 hover:opacity-100 disabled:opacity-30"
+                title="Удалить сообщение у всех"
+                aria-label="Удалить сообщение"
+              >
+                🗑
+              </button>
+            )}
             {formatTime(String(msg.createdAt))}
             {isOwn && <MessageStatus status={status} title={statusTitle} />}
           </div>
@@ -267,12 +283,15 @@ export default function ChatWindow({
   onBack,
   onMessageSent,
   onChatUpdated,
+  onDeleteChat,
 }: {
   chat: Chat;
   currentUser: User;
   onBack: () => void;
   onMessageSent: () => void;
   onChatUpdated?: (patch: Partial<Chat>) => void;
+  /** Called after the whole chat was deleted (creator/admin action). */
+  onDeleteChat?: () => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [newMessage, setNewMessage] = useState("");
@@ -283,6 +302,8 @@ export default function ChatWindow({
   const [showAddMembers, setShowAddMembers] = useState(false);
   const [notificationsMuted, setNotificationsMuted] = useState(Boolean(chat.notificationsMuted));
   const [muteBusy, setMuteBusy] = useState(false);
+  const [deletingMessageId, setDeletingMessageId] = useState<number | null>(null);
+  const [deletingChat, setDeletingChat] = useState(false);
 
   useEffect(() => {
     setNotificationsMuted(Boolean(chat.notificationsMuted));
@@ -697,6 +718,47 @@ export default function ChatWindow({
   const otherMember = chat.isGroup ? undefined : chat.members.find((m) => m.id !== currentUser.id);
   const canManageMembers = chat.isGroup
     && (chat.createdBy === currentUser.id || currentUser.role === "admin");
+  // Deleting a chat is the creator's (or an admin's) decision and it wipes the
+  // conversation for everybody; the general chat is protected on the server.
+  const canDeleteChat = !chat.isGeneralChat
+    && (chat.createdBy === currentUser.id || currentUser.role === "admin");
+
+  const handleDeleteMessage = useCallback(async (message: ChatMessage) => {
+    if (deletingMessageId !== null || typeof message.id !== "number") return;
+    if (!window.confirm("Удалить это сообщение у всех участников? Файл-вложение тоже будет удалён.")) return;
+    setDeletingMessageId(message.id);
+    setSendError("");
+    try {
+      const response = await fetch(`/api/messages?messageId=${message.id}`, { method: "DELETE" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : "Не удалось удалить сообщение");
+      await loadMessages();
+      onMessageSent();
+    } catch (err) {
+      console.error("Failed to delete message", err);
+      setSendError(err instanceof Error ? err.message : "Не удалось удалить сообщение");
+    } finally {
+      setDeletingMessageId(null);
+    }
+  }, [deletingMessageId, loadMessages, onMessageSent]);
+
+  const handleDeleteChat = useCallback(async () => {
+    if (deletingChat) return;
+    const what = chat.isGroup ? "группу" : "чат";
+    if (!window.confirm(`Удалить ${what} «${chat.name}» со всеми сообщениями и файлами? Это необратимо и для остальных участников.`)) return;
+    setDeletingChat(true);
+    try {
+      const response = await fetch(`/api/chats/${chat.id}`, { method: "DELETE" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : "Не удалось удалить чат");
+      onDeleteChat?.();
+    } catch (err) {
+      console.error("Failed to delete chat", err);
+      setSendError(err instanceof Error ? err.message : "Не удалось удалить чат");
+    } finally {
+      setDeletingChat(false);
+    }
+  }, [chat.id, chat.isGroup, chat.name, deletingChat, onDeleteChat]);
 
   return (
     <div className="flex h-[100dvh] min-h-0 flex-col overflow-hidden bg-dark-900 md:h-full">
@@ -760,6 +822,24 @@ export default function ChatWindow({
             </svg>
           </button>
         )}
+        {canDeleteChat && (
+          <button
+            type="button"
+            onClick={() => void handleDeleteChat()}
+            disabled={deletingChat}
+            className="rounded-lg p-2 text-gray-400 hover:bg-red-500/10 hover:text-red-300 touch-manipulation disabled:opacity-50"
+            title={chat.isGroup ? "Удалить группу (создатель)" : "Удалить чат (создатель)"}
+            aria-label="Удалить чат"
+          >
+            {deletingChat ? (
+              <span className="block h-5 w-5 animate-spin rounded-full border-2 border-red-300 border-t-transparent" />
+            ) : (
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+            )}
+          </button>
+        )}
         </div>
       </div>
 
@@ -786,6 +866,8 @@ export default function ChatWindow({
               onReply={handleReplyToMessage}
               onMention={chat.isGroup ? handleMentionMessageAuthor : undefined}
               onJumpToMessage={jumpToMessage}
+              onDelete={msg.senderId === currentUser.id ? handleDeleteMessage : undefined}
+              deleteBusy={deletingMessageId !== null}
             />
           ))
         )}

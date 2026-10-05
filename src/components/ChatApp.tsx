@@ -192,6 +192,16 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
             currentUser={currentUserState}
             onBack={handleBack}
             onMessageSent={loadChats}
+            onDeleteChat={() => {
+              // The chat row is gone server-side; drop the local selection and
+              // the sidebar poll will remove it from the list.
+              setChats((prev) => prev.filter((c) => c.id !== selectedChat.id));
+              setSelectedChatId(null);
+              const url = new URL(window.location.href);
+              url.searchParams.delete("chatId");
+              window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+              void loadChats();
+            }}
             onChatUpdated={(patch) => {
               if (!selectedChat) return;
               setChats((prev) => prev.map((c) => c.id === selectedChat.id ? { ...c, ...patch } : c));

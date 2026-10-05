@@ -46,6 +46,26 @@ export default function ChatSidebar({
 }) {
   const [showNewChat, setShowNewChat] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [deletingChatId, setDeletingChatId] = useState<number | null>(null);
+
+  // Deleting is only offered for chats the user created (checked again on the
+  // server); the general chat has no button at all.
+  const deleteChat = async (chat: Chat) => {
+    if (deletingChatId !== null) return;
+    const what = chat.isGroup ? "группу" : "чат";
+    if (!window.confirm(`Удалить ${what} «${chat.name}» со всеми сообщениями и файлами? Это необратимо и для остальных участников.`)) return;
+    setDeletingChatId(chat.id);
+    try {
+      const response = await fetch(`/api/chats/${chat.id}`, { method: "DELETE" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : "Не удалось удалить чат");
+      onChatsUpdated();
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : "Не удалось удалить чат");
+    } finally {
+      setDeletingChatId(null);
+    }
+  };
 
   const filteredChats = chats.filter((c) =>
     c.name?.toLowerCase().includes(searchQuery.toLowerCase())
@@ -140,13 +160,23 @@ export default function ChatSidebar({
         ) : (
           filteredChats.map((chat) => {
             const otherMember = chat.members.find((m) => m.id !== user.id);
+            const canDelete = !chat.isGeneralChat
+              && (chat.createdBy === user.id || user.role === "admin");
             return (
-              <button
+              <div
                 key={chat.id}
-                onClick={() => onSelectChat(chat.id)}
-                className={`w-full flex items-center gap-3 px-4 py-3 hover:bg-dark-700 transition-colors text-left ${
+                className={`group/chat relative w-full flex items-center gap-3 px-4 py-3 hover:bg-dark-700 transition-colors cursor-pointer ${
                   selectedChatId === chat.id ? "bg-dark-700 border-l-2 border-purple-500" : ""
                 }`}
+                onClick={() => onSelectChat(chat.id)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onSelectChat(chat.id);
+                  }
+                }}
               >
                 <Avatar
                   src={chat.isGroup ? null : otherMember?.avatarUrl || null}
@@ -176,7 +206,28 @@ export default function ChatSidebar({
                     {getLastMessagePreview(chat.lastMessage)}
                   </div>
                 </div>
-              </button>
+                {canDelete && (
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void deleteChat(chat);
+                    }}
+                    disabled={deletingChatId === chat.id}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-1.5 text-gray-500 opacity-0 transition group-hover/chat:opacity-100 hover:bg-red-500/15 hover:text-red-300 focus:opacity-100 disabled:opacity-40"
+                    title={chat.isGroup ? "Удалить группу и все сообщения" : "Удалить чат и все сообщения"}
+                    aria-label={`Удалить чат ${chat.name ?? chat.id}`}
+                  >
+                    {deletingChatId === chat.id ? (
+                      <span className="block h-4 w-4 animate-spin rounded-full border-2 border-red-300 border-t-transparent" />
+                    ) : (
+                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                      </svg>
+                    )}
+                  </button>
+                )}
+              </div>
             );
           })
         )}

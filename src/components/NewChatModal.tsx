@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import Avatar from "./Avatar";
 
 interface AvailableUser {
@@ -12,6 +12,8 @@ interface AvailableUser {
   lastSeen: string | null;
 }
 
+const MIN_SEARCH_LENGTH = 2;
+
 export default function NewChatModal({
   onClose,
   onChatCreated,
@@ -20,7 +22,7 @@ export default function NewChatModal({
   onChatCreated: (chatId: number) => void;
 }) {
   const [users, setUsers] = useState<AvailableUser[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState("");
   const [error, setError] = useState("");
@@ -28,21 +30,35 @@ export default function NewChatModal({
   const [selectedUserIds, setSelectedUserIds] = useState<number[]>([]);
   const [groupName, setGroupName] = useState("");
 
+  // Users are not listed anymore — the server only answers explicit searches.
+  // Debounce keystrokes so typing a name does not fire a query per letter.
+  const requestSeqRef = useRef(0);
   useEffect(() => {
-    fetch("/api/users")
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.users) setUsers(data.users);
-      })
-      .catch(() => setError("Не удалось загрузить пользователей"))
-      .finally(() => setLoading(false));
-  }, []);
+    const query = search.trim();
+    if (query.length < MIN_SEARCH_LENGTH) {
+      setUsers([]);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    const seq = ++requestSeqRef.current;
+    const timeout = window.setTimeout(async () => {
+      try {
+        const response = await fetch(`/api/users?q=${encodeURIComponent(query)}`, { cache: "no-store" });
+        const data = await response.json();
+        if (seq !== requestSeqRef.current) return;
+        if (response.ok && Array.isArray(data.users)) setUsers(data.users);
+        else setError(data.error || "Не удалось выполнить поиск");
+      } catch {
+        if (seq === requestSeqRef.current) setError("Не удалось выполнить поиск");
+      } finally {
+        if (seq === requestSeqRef.current) setLoading(false);
+      }
+    }, 300);
+    return () => window.clearTimeout(timeout);
+  }, [search]);
 
-  const filteredUsers = users.filter(
-    (u) =>
-      u.username.toLowerCase().includes(search.toLowerCase()) ||
-      u.displayName.toLowerCase().includes(search.toLowerCase()),
-  );
+  const filteredUsers = users;
 
   const createChat = async (memberUserIds: number[], isGroup: boolean) => {
     if (creating) return;
@@ -157,11 +173,15 @@ export default function NewChatModal({
 
         <div className="flex-1 overflow-y-auto p-2">
           {loading ? (
-            <div className="p-6 text-center text-gray-500">Загрузка...</div>
-          ) : filteredUsers.length === 0 ? (
-            <div className="p-6 text-center text-gray-500">
-              {users.length === 0 ? "Пока нет других пользователей" : "Никого не найдено"}
+            <div className="p-6 text-center text-gray-500">Ищем…</div>
+          ) : filteredUsers.length === 0 && search.trim().length < MIN_SEARCH_LENGTH ? (
+            <div className="p-6 text-center text-gray-500 text-sm leading-relaxed">
+              Пользователей здесь не показывают списком.
+              <br />
+              Введите @логин или имя (от {MIN_SEARCH_LENGTH} символов), чтобы найти человека.
             </div>
+          ) : filteredUsers.length === 0 ? (
+            <div className="p-6 text-center text-gray-500">Никого не найдено</div>
           ) : (
             filteredUsers.map((user) => (
               <button
