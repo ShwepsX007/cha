@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { clearLocalMatrixCryptoStores, initializeMatrixCryptoAfterLogin } from "@/lib/matrix/client";
 import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
+import { getMatrixDeviceId } from "@/lib/matrix/device-id";
 
 interface User {
   id: number;
@@ -19,20 +20,6 @@ interface User {
   initialRecoveryKey?: string | null;
   initialRecoveryKeySaved?: boolean;
   matrixNotice?: string;
-}
-
-function getMatrixDeviceId(username: string, forceNew = false): string {
-  const storageKey = `chata_matrix_device_${username.toLowerCase()}`;
-  try {
-    const existing = localStorage.getItem(storageKey);
-    if (!forceNew && existing && /^[A-Za-z0-9._=-]{1,255}$/.test(existing)) return existing;
-
-    const deviceId = crypto.randomUUID().replaceAll("-", "").toUpperCase();
-    localStorage.setItem(storageKey, deviceId);
-    return deviceId;
-  } catch {
-    return crypto.randomUUID().replaceAll("-", "").toUpperCase();
-  }
 }
 
 export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void }) {

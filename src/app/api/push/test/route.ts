@@ -17,6 +17,7 @@ export async function POST() {
       body: "Тестовое push-уведомление. Если вы видите его, доставка работает.",
       chatId: 0,
       url: "/",
+      force: true,
     });
     if (result.subscriptions === 0) {
       return NextResponse.json(

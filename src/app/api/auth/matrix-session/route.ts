@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
       typeof input.password !== "string" || input.password.length < 1 || input.password.length > 1024 ||
       typeof input.deviceId !== "string" || !/^[A-Za-z0-9._=-]{1,255}$/u.test(input.deviceId)
     ) {
-      return NextResponse.json({ error: "Требуются пароль и новый Matrix device ID" }, { status: 400 });
+      return NextResponse.json({ error: "Требуются пароль аккаунта и Matrix device ID" }, { status: 400 });
     }
 
     const [user] = await db
@@ -36,14 +36,19 @@ export async function POST(req: NextRequest) {
       .from(users)
       .where(eq(users.id, session.userId));
     if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    if (!user.matrixResetRequired) {
-      return NextResponse.json({ error: "Matrix-сброс не запрошен" }, { status: 409 });
-    }
     if (!(await bcrypt.compare(input.password, user.passwordHash))) {
       return NextResponse.json({ error: "Неверный пароль аккаунта" }, { status: 401 });
     }
-    if (await matrixDeviceExistsForAppUser(user.id, input.deviceId)) {
+
+    const deviceExists = await matrixDeviceExistsForAppUser(user.id, input.deviceId);
+    if (user.matrixResetRequired && deviceExists) {
       return NextResponse.json({ error: "Этот device ID уже существует. Создайте новый и повторите попытку." }, { status: 409 });
+    }
+    if (!user.matrixResetRequired && !deviceExists) {
+      return NextResponse.json(
+        { error: "Matrix-устройство не найдено. Для нового устройства выполните обычный вход." },
+        { status: 404 },
+      );
     }
 
     const matrix = await createMatrixSession({

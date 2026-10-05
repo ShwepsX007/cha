@@ -20,6 +20,7 @@ import type {
   KeyBackupRestoreResult,
 } from "matrix-js-sdk/lib/crypto-api/index";
 import { decodeRecoveryKey, encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
+import type { RoomMessageEventContent } from "matrix-js-sdk/lib/@types/events";
 import type { IEncryptedFile } from "matrix-encrypt-attachment";
 import type { MatrixSession } from "./types";
 import type { MatrixEvent } from "matrix-js-sdk/lib/models/event";
@@ -46,6 +47,16 @@ const automaticRecoveryNotices = new Map<string, MatrixRecoveryNotice>();
 export const MATRIX_OUTBOX_EVENT = "chata:matrix-outbox-update";
 export const MATRIX_RECOVERY_EVENT = "chata:matrix-recovery-update";
 
+export interface MatrixReplyReference {
+  eventId: string;
+  senderMxid: string;
+  senderUserId: string;
+  senderDisplayName: string;
+  senderUsername: string;
+  body: string;
+  messageType: string;
+}
+
 export interface EncryptedOutboxMessage {
   id: string;
   transactionId: string;
@@ -53,6 +64,8 @@ export interface EncryptedOutboxMessage {
   roomId: string;
   isDirect: boolean;
   body: string;
+  replyTo?: MatrixReplyReference;
+  mentionUserIds?: string[];
   createdAt: string;
   status: "queued" | "sending" | "error";
   error?: string;
@@ -86,6 +99,14 @@ export interface MatrixDeviceInfo {
   verified: boolean;
 }
 
+export interface MatrixTimelineReply {
+  eventId: string;
+  senderUserId: string;
+  senderMxid: string;
+  body: string;
+  msgtype: "m.text" | "m.notice" | "m.file";
+}
+
 export interface MatrixTimelineMessage {
   eventId: string;
   senderUserId: string;
@@ -94,6 +115,11 @@ export interface MatrixTimelineMessage {
   timestamp: number;
   msgtype: "m.text" | "m.notice" | "m.file";
   readByOther: boolean;
+  readByCount: number;
+  recipientCount: number;
+  replyToEventId?: string;
+  replyTo?: MatrixTimelineReply;
+  mentionUserIds?: string[];
   mimeType?: string;
   fileSize?: number;
   encryptedFile?: IEncryptedFile & { url: string };
@@ -128,6 +154,20 @@ function readEncryptedOutbox(appUserId: number): EncryptedOutboxMessage[] {
       typeof (item as EncryptedOutboxMessage).roomId === "string" &&
       typeof (item as EncryptedOutboxMessage).isDirect === "boolean" &&
       typeof (item as EncryptedOutboxMessage).body === "string" &&
+      ((item as EncryptedOutboxMessage).replyTo === undefined || Boolean(
+        (item as EncryptedOutboxMessage).replyTo &&
+        typeof (item as EncryptedOutboxMessage).replyTo?.eventId === "string" &&
+        typeof (item as EncryptedOutboxMessage).replyTo?.senderMxid === "string" &&
+        typeof (item as EncryptedOutboxMessage).replyTo?.senderUserId === "string" &&
+        typeof (item as EncryptedOutboxMessage).replyTo?.senderDisplayName === "string" &&
+        typeof (item as EncryptedOutboxMessage).replyTo?.senderUsername === "string" &&
+        typeof (item as EncryptedOutboxMessage).replyTo?.body === "string" &&
+        typeof (item as EncryptedOutboxMessage).replyTo?.messageType === "string"
+      )) &&
+      ((item as EncryptedOutboxMessage).mentionUserIds === undefined || (
+        Array.isArray((item as EncryptedOutboxMessage).mentionUserIds) &&
+        (item as EncryptedOutboxMessage).mentionUserIds?.every((id) => typeof id === "string")
+      )) &&
       typeof (item as EncryptedOutboxMessage).createdAt === "string" &&
       ["queued", "sending", "error"].includes((item as EncryptedOutboxMessage).status)
     ));
@@ -225,6 +265,8 @@ export function createEncryptedOutboxMessage(input: {
   roomId: string;
   isDirect: boolean;
   body: string;
+  replyTo?: MatrixReplyReference;
+  mentionUserIds?: string[];
   createdAt?: string;
 }): EncryptedOutboxMessage {
   const message: EncryptedOutboxMessage = {
@@ -234,6 +276,8 @@ export function createEncryptedOutboxMessage(input: {
     roomId: input.roomId,
     isDirect: input.isDirect,
     body: input.body,
+    ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+    ...(input.mentionUserIds?.length ? { mentionUserIds: input.mentionUserIds } : {}),
     createdAt: input.createdAt || new Date().toISOString(),
     status: "queued",
   };
@@ -399,6 +443,17 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
     currentSessionKey = null;
     throw error;
   }
+}
+
+/** Recreate a failed Matrix sync client while preserving the same crypto device store. */
+export async function restartMatrixClient(session: MatrixSession): Promise<MatrixClient> {
+  if (clientPromise && currentSessionKey === sessionKey(session)) {
+    const current = await clientPromise.catch(() => null);
+    const state = current?.getSyncState();
+    if (current && state !== SyncState.Error && state !== SyncState.Stopped) return current;
+    await stopMatrixClient(false);
+  }
+  return getMatrixClient(session);
 }
 
 const MATRIX_INITIAL_SYNC_TIMEOUT_MS = 45_000;
@@ -1192,11 +1247,50 @@ export async function createEncryptedRoom(
   return roomId;
 }
 
+function formatMatrixReplyBody(body: string, reply: MatrixReplyReference): string {
+  const quotedLines = reply.body.replace(/\r/g, "").split("\n").slice(0, 5);
+  const fallback = quotedLines.map((line, index) =>
+    `> ${index === 0 ? `<${reply.senderMxid}> ` : ""}${line.slice(0, 300)}`,
+  ).join("\n");
+  return `${fallback}\n\n${body}`;
+}
+
+async function relayEncryptedMessagePush(
+  session: MatrixSession,
+  chatId: number,
+  roomId: string,
+  eventId: string,
+): Promise<void> {
+  try {
+    const response = await fetch("/api/messages/matrix-push", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatId,
+        roomId,
+        eventId,
+        accessToken: session.accessToken,
+        deviceId: session.deviceId,
+      }),
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      console.warn("Encrypted message push relay failed", { statusCode: response.status });
+    }
+  } catch {
+    console.warn("Encrypted message push relay failed", { reason: "network" });
+    // The encrypted message has already been sent. Push is best-effort and
+    // must never turn a successful Matrix send into an outbox failure.
+  }
+}
+
 export async function sendEncryptedText(
   session: MatrixSession,
   roomId: string,
   body: string,
   transactionId?: string,
+  replyTo?: MatrixReplyReference,
+  mentionUserIds: string[] = [],
 ): Promise<string> {
   const client = await ensureEncryptedRoomReady(session, roomId);
   const crypto = client.getCrypto();
@@ -1205,7 +1299,14 @@ export async function sendEncryptedText(
   }
 
   await ensureRoomDeviceListsAreDownloaded(client, roomId);
-  const response = await client.sendTextMessage(roomId, body, transactionId);
+  const response = replyTo || mentionUserIds.length > 0
+    ? await client.sendMessage(roomId, {
+        msgtype: MsgType.Text,
+        body: replyTo ? formatMatrixReplyBody(body, replyTo) : body,
+        ...(replyTo ? { "m.relates_to": { "m.in_reply_to": { event_id: replyTo.eventId } } } : {}),
+        ...(mentionUserIds.length ? { "m.mentions": { user_ids: mentionUserIds } } : {}),
+      } satisfies RoomMessageEventContent, transactionId)
+    : await client.sendTextMessage(roomId, body, transactionId);
   return response.event_id;
 }
 
@@ -1266,7 +1367,10 @@ async function runEncryptedOutboxMessage(
           item.roomId,
           item.body,
           item.transactionId,
+          item.replyTo,
+          item.mentionUserIds,
         );
+        await relayEncryptedMessagePush(session, item.chatId, item.roomId, eventId);
         try {
           removeEncryptedOutboxMessage(appUserId, item.id);
         } catch {
@@ -1373,10 +1477,13 @@ export async function sendEncryptedAttachment(
   session: MatrixSession,
   roomId: string,
   input: {
+    chatId: number;
     fileName: string;
     mimeType: string;
     fileSize: number;
     encryptedFile: IEncryptedFile & { url: string };
+    replyTo?: MatrixReplyReference;
+    mentionUserIds?: string[];
   },
 ): Promise<void> {
   const client = await ensureEncryptedRoomReady(session, roomId);
@@ -1391,9 +1498,9 @@ export async function sendEncryptedAttachment(
     throw new Error("Matrix encrypted attachment metadata is incomplete");
   }
 
-  await client.sendMessage(roomId, {
+  const response = await client.sendMessage(roomId, {
     msgtype: MsgType.File,
-    body: input.fileName,
+    body: input.replyTo ? formatMatrixReplyBody(input.fileName, input.replyTo) : input.fileName,
     filename: input.fileName,
     file: {
       url: input.encryptedFile.url,
@@ -1406,7 +1513,10 @@ export async function sendEncryptedAttachment(
       mimetype: input.mimeType || "application/octet-stream",
       size: input.fileSize,
     },
-  });
+    ...(input.replyTo ? { "m.relates_to": { "m.in_reply_to": { event_id: input.replyTo.eventId } } } : {}),
+    ...(input.mentionUserIds?.length ? { "m.mentions": { user_ids: input.mentionUserIds } } : {}),
+  } satisfies RoomMessageEventContent);
+  await relayEncryptedMessagePush(session, input.chatId, roomId, response.event_id);
 }
 
 export async function joinRoomIfInvited(
@@ -1452,6 +1562,24 @@ export async function hasMatrixInvitePermission(
   return inviteLevel >= 50 && userLevel >= inviteLevel;
 }
 
+function getMatrixReplyEventId(content: Record<string, unknown>): string | undefined {
+  const relatesTo = content["m.relates_to"];
+  if (!relatesTo || typeof relatesTo !== "object") return undefined;
+  const inReplyTo = (relatesTo as Record<string, unknown>)["m.in_reply_to"];
+  if (!inReplyTo || typeof inReplyTo !== "object") return undefined;
+  const eventId = (inReplyTo as Record<string, unknown>).event_id;
+  return typeof eventId === "string" ? eventId : undefined;
+}
+
+function stripMatrixReplyFallback(body: string, replyToEventId?: string): string {
+  if (!replyToEventId) return body;
+  const separator = body.indexOf("\n\n");
+  if (separator < 0) return body;
+  const fallback = body.slice(0, separator).split("\n");
+  if (!fallback.length || fallback.some((line) => !line.startsWith(">"))) return body;
+  return body.slice(separator + 2);
+}
+
 export async function getEncryptedRoomMessages(
   session: MatrixSession,
   roomId: string,
@@ -1481,25 +1609,66 @@ export async function getEncryptedRoomMessages(
     .filter((member) => member.membership === "join" && member.userId !== session.userId)
     .map((member) => member.userId);
 
-  const messages = timelineEvents
-    .filter((event) => event.getType() === EventType.RoomMessage)
+  const messageEvents = timelineEvents.filter((event) => event.getType() === EventType.RoomMessage);
+  const messageEventById = new Map(
+    messageEvents
+      .map((event) => [event.getId(), event] as const)
+      .filter((entry): entry is readonly [string, typeof messageEvents[number]] => Boolean(entry[0])),
+  );
+
+  const messages = messageEvents
     .map<MatrixTimelineMessage | null>((event) => {
       const content = event.getContent<Record<string, unknown>>();
       const sender = event.getSender();
       const eventId = event.getId();
-      const body = content.body;
+      const rawBody = content.body;
       const senderMatch = sender?.match(/^@chata_u(\d+):/);
-      if (typeof body !== "string" || !sender || !eventId || !senderMatch) return null;
+      if (typeof rawBody !== "string" || !sender || !eventId || !senderMatch) return null;
+
+      const replyToEventId = getMatrixReplyEventId(content);
+      const body = stripMatrixReplyFallback(rawBody, replyToEventId);
+      const replyEvent = replyToEventId ? messageEventById.get(replyToEventId) : undefined;
+      const replyContent = replyEvent?.getContent<Record<string, unknown>>();
+      const replySender = replyEvent?.getSender();
+      const replySenderMatch = replySender?.match(/^@chata_u(\d+):/);
+      const replyBody = typeof replyContent?.body === "string"
+        ? stripMatrixReplyFallback(replyContent.body, getMatrixReplyEventId(replyContent))
+        : "";
+      const replyMsgType = replyContent?.msgtype === "m.file" ? "m.file" : "m.text";
+      const replyTo = replyEvent && replyToEventId && replySender && replySenderMatch
+        ? {
+            eventId: replyToEventId,
+            senderUserId: replySenderMatch[1],
+            senderMxid: replySender,
+            body: replyBody,
+            msgtype: replyMsgType,
+          } satisfies MatrixTimelineReply
+        : undefined;
+      const readByCount = otherJoinedUserIds.filter((userId) => room.hasUserReadEvent(userId, eventId)).length;
+      const mentionContent = content["m.mentions"] && typeof content["m.mentions"] === "object"
+        ? (content["m.mentions"] as Record<string, unknown>).user_ids
+        : undefined;
+      const mentionUserIds = Array.isArray(mentionContent)
+        ? mentionContent.filter((userId): userId is string => typeof userId === "string")
+        : undefined;
+      const common = {
+        eventId,
+        senderUserId: senderMatch[1],
+        senderMxid: sender,
+        body,
+        timestamp: event.getTs(),
+        readByOther: readByCount > 0,
+        readByCount,
+        recipientCount: otherJoinedUserIds.length,
+        ...(replyToEventId ? { replyToEventId } : {}),
+        ...(replyTo ? { replyTo } : {}),
+        ...(mentionUserIds?.length ? { mentionUserIds } : {}),
+      };
 
       if (content.msgtype === "m.text" || content.msgtype === "m.notice") {
         return {
-          eventId,
-          senderUserId: senderMatch[1],
-          senderMxid: sender,
-          body,
-          timestamp: event.getTs(),
+          ...common,
           msgtype: content.msgtype as "m.text" | "m.notice",
-          readByOther: otherJoinedUserIds.some((userId) => room.hasUserReadEvent(userId, eventId)),
         } satisfies MatrixTimelineMessage;
       }
 
@@ -1508,13 +1677,8 @@ export async function getEncryptedRoomMessages(
         : {};
       if (content.msgtype === "m.file" && isEncryptedAttachmentInfo(content.file, session.baseUrl, chatId)) {
         return {
-          eventId,
-          senderUserId: senderMatch[1],
-          senderMxid: sender,
-          body,
-          timestamp: event.getTs(),
+          ...common,
           msgtype: "m.file",
-          readByOther: otherJoinedUserIds.some((userId) => room.hasUserReadEvent(userId, eventId)),
           mimeType: typeof info.mimetype === "string" ? info.mimetype : "application/octet-stream",
           fileSize: typeof info.size === "number" ? info.size : undefined,
           encryptedFile: content.file,

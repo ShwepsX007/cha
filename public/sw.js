@@ -16,9 +16,27 @@ self.addEventListener("push", (event) => {
     tag: data.chatId ? `chat-${data.chatId}` : "chata-message",
     renotify: true,
   };
-  event.waitUntil(
-    self.registration.showNotification(title, options).catch(() => undefined),
-  );
+  event.waitUntil((async () => {
+    try {
+      // Suppress only when a visible Secret Chat tab is already showing this
+      // exact conversation. A different foreground chat must not hide the
+      // notification, and stale server-side lastSeen values are irrelevant.
+      const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      const chatIsVisible = windows.some((client) => {
+        if (client.visibilityState !== "visible" || !data.chatId) return false;
+        try {
+          const url = new URL(client.url);
+          return url.origin === self.location.origin && url.searchParams.get("chatId") === String(data.chatId);
+        } catch {
+          return false;
+        }
+      });
+      if (!data.force && chatIsVisible) return;
+      await self.registration.showNotification(title, options);
+    } catch {
+      /* Push is best-effort. */
+    }
+  })());
 });
 
 self.addEventListener("notificationclick", (event) => {

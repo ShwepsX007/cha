@@ -1,5 +1,5 @@
 import { db } from "@/db";
-import { messages, messageReceipts } from "@/db/schema";
+import { messages, messageReceipts, chatMembers } from "@/db/schema";
 import { and, eq, inArray, sql } from "drizzle-orm";
 
 export type ReceiptStatus = "sent" | "delivered" | "read";
@@ -54,13 +54,14 @@ export async function markReceipts(params: {
 }
 
 /**
- * Compute per-message aggregate receipt status from the perspective of the
- * sender: sent (no recipients have acked yet), delivered (at least one
- * recipient got it), read (all non-sender recipients in the chat read it).
+ * Compute per-message aggregate receipt status from the sender's perspective:
+ * sent (no recipients have acked yet), delivered (at least one recipient got
+ * it), read (at least one recipient has read it). Per-recipient counts remain
+ * available so group senders can see partial acknowledgements.
  */
 export type MessageReceiptSummary = Record<
   number,
-  { status: ReceiptStatus; readByCount: number; deliveredToCount: number }
+  { status: ReceiptStatus; readByCount: number; deliveredToCount: number; recipientCount: number }
 >;
 
 export async function getMessageReceipts(chatId: number): Promise<MessageReceiptSummary> {
@@ -68,14 +69,24 @@ export async function getMessageReceipts(chatId: number): Promise<MessageReceipt
     .select({
       messageId: messageReceipts.messageId,
       status: messageReceipts.status,
+      senderId: messages.senderId,
     })
     .from(messageReceipts)
     .innerJoin(messages, eq(messages.id, messageReceipts.messageId))
     .where(eq(messages.chatId, chatId));
+  const members = await db
+    .select({ userId: chatMembers.userId })
+    .from(chatMembers)
+    .where(eq(chatMembers.chatId, chatId));
 
   const summary: MessageReceiptSummary = {};
   for (const r of rows) {
-    const prev = summary[r.messageId] || { status: "sent" as ReceiptStatus, readByCount: 0, deliveredToCount: 0 };
+    const prev = summary[r.messageId] || {
+      status: "sent" as ReceiptStatus,
+      readByCount: 0,
+      deliveredToCount: 0,
+      recipientCount: members.filter((member) => member.userId !== r.senderId).length,
+    };
     if (r.status === "read") {
       prev.readByCount += 1;
       prev.deliveredToCount += 1;
