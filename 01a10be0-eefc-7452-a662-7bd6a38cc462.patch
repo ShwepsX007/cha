@@ -1,0 +1,2990 @@
+diff --git a/.env.example b/.env.example
+index 798f22f..c9b6886 100644
+--- a/.env.example
++++ b/.env.example
+@@ -35,11 +35,23 @@ MATRIX_INTERNAL_URL=
+ MATRIX_SERVER_NAME=
+ # Keep this server-side only. Never expose it with a NEXT_PUBLIC_ prefix.
+ MATRIX_ADMIN_ACCESS_TOKEN=
++# Optional: request Matrix refresh tokens at login. Leave OFF.
++# With refresh tokens Synapse issues access tokens that expire after
++# `refreshable_access_token_lifetime` (5 minutes by default), which is what made
++# the browser lose its Matrix session on almost every reload. Revoking a device
++# here is explicit (profile settings / admin panel), so long-lived tokens are
++# safe. Turn this on only together with `refreshable_access_token_lifetime` set
++# to something long (days) in homeserver.yaml - the app then rotates tokens
++# automatically and persists them across tabs.
++MATRIX_REFRESH_TOKENS=
+ 
+ # Web Push (optional). Generate a pair once with:
+ #   npx web-push generate-vapid-keys
+-# and set VAPID_PUBLIC_KEY as NEXT_PUBLIC_VAPID_PUBLIC_KEY too (browsers need it).
++# All three values are required - push stays disabled if VAPID_EMAIL is empty.
++# VAPID_EMAIL must be a mailto: or https: URL (a bare address is normalized to
++# mailto:, anything else makes web-push throw before the first send).
+ VAPID_PUBLIC_KEY=
+ VAPID_PRIVATE_KEY=
+ VAPID_EMAIL=mailto:admin@example.com
++# Optional. Only needed if the client cannot read the key from /api/push/subscribe.
+ NEXT_PUBLIC_VAPID_PUBLIC_KEY=
+diff --git a/README.md b/README.md
+index 493ffe2..f4927dc 100644
+--- a/README.md
++++ b/README.md
+@@ -109,15 +109,30 @@ location ^~ /_matrix/ {
+ | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | нет | Хранилище вложений |
+ | `BOT_OWNER_TELEGRAM_ID` | нет | Владелец Telegram-бота администратора |
+ | `MATRIX_PUBLIC_URL`, `MATRIX_INTERNAL_URL`, `MATRIX_SERVER_NAME`, `MATRIX_ADMIN_ACCESS_TOKEN` | нет | Matrix E2EE; задаются **только все вместе** |
+-| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_EMAIL`, `NEXT_PUBLIC_VAPID_PUBLIC_KEY` | нет | Web Push |
+-
+-Web Push в приложении пока отправляется **только для «Общего чата»**. На каждом
+-устройстве нужно отдельно открыть настройки профиля → «Уведомления» → включить
+-push и разрешить уведомления в браузере. Страница должна открываться по HTTPS.
+-В тех же настройках доступны счётчик сохранённых подписок и кнопка тестовой
+-отправки; ошибки доставки пишутся в `pm2 logs chata`. Push намеренно не
+-отправляется отправителю, в заглушённый чат и в течение минуты после активности
+-получателя. Для приватных Matrix E2EE-чатов push-доставка пока не реализована.
++| `MATRIX_REFRESH_TOKENS` | нет | `1` — запрашивать refresh-токены Matrix (тогда в Synapse нужно выставить длинный `refreshable_access_token_lifetime`); по умолчанию выключено, токены не истекают |
++| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_EMAIL` | нет | Web Push; `VAPID_EMAIL` обязателен (`mailto:` или `https:`) |
++| `NEXT_PUBLIC_VAPID_PUBLIC_KEY` | нет | Запасной публичный ключ для браузера; обычно не нужен — клиент получает ключ из `/api/push/subscribe` |
++
++Web Push настраивается тремя переменными `VAPID_*`: **`VAPID_EMAIL` обязателен**
++(формат `mailto:admin@example.com`; без него `isPushConfigured()` возвращает
++`false`, и сервер отвечает `503` на подписку). На каждом устройстве нужно отдельно
++открыть настройки профиля → «Уведомления» → включить push и разрешить уведомления в
++браузере. Страница должна открываться по HTTPS: вне secure context `serviceWorker`
++недоступен, и приложение честно пишет «Push требует HTTPS».
++
++Push отправляется в общий чат сервером при сохранении сообщения, а в приватные
++Matrix-чаты — через ретрансляцию `/api/messages/matrix-push` из браузера
++отправителя (содержимое E2EE-сообщений в уведомления не попадает). Уведомление
++намеренно не показывается, если нужный чат открыт в фокусе, и не отправляется
++отправителю и в заглушённый чат. На iOS доставка работает только для
++установлённого PWA («Добавить на главный экран»).
++
++Диагностика: `/api/push/status` отдаёт `configured`, `subscriptionCount` и
++`missingEnv`; кнопка «Отправить тестовое» в ответах `401/403` подсказывает
++про VAPID-ключи, `404/410` — про устаревшую подписку, пустой список кодов — про
++недоступность `fcm.googleapis.com`/`updates.push.services.mozilla.com` с VPS.
++Ошибки доставки пишутся в `pm2 logs chata`. Отправка сообщения больше не ждёт
++push-провайдера дольше 10 секунд.
+ 
+ Без Matrix приложение работает в режиме «только общий чат»: приватные чаты не
+ создаются, старые приватные чаты помечены как `legacy`, новые сообщения в них
+@@ -154,6 +169,8 @@ SMOKE_ALLOW_WRITES=1 npm run smoke   # + регистрация, сообщен
+ | «Matrix недоступен. Приватные сообщения не отправляются» | `MATRIX_*` не заданы или Synapse недоступен — общий чат продолжает работать |
+ | «Push-уведомления не настроены на сервере» | Не заданы VAPID-ключи (см. `.env.example`) |
+ | Чаты не создаются | Приватные чаты требуют Matrix-сессии; проверьте `matrix` в `/api/health` |
++| Matrix «отваливается» при каждом обновлении страницы | Проверьте `select id, username, matrix_reset_required from users;` (флаг `true` = устройство отозвано, нужно один раз ввести пароль в «Восстановить Matrix-сессию») и `refreshable_access_token_lifetime` в `homeserver.yaml`; в консоли браузера признак — `Token no longer valid - assuming logout`. Приложение больше не запрашивает refresh-токены, поэтому токены Synapse не истекают, если `MATRIX_REFRESH_TOKENS` не включён |
++| Уведомления не приходят, хотя подписка есть | `curl -s -X POST .../api/push/test`; `401/403` — VAPID-ключи не пара, `404/410` — пересоздать подписку, пустые коды — VPS не видит push-сервис; `missingEnv` в `/api/push/status` = не хватает переменных в `.env` |
+ | Список чатов пуст, хотя «Общий чат» был | Обновление восстановит членство автоматически при открытии чатов (`ensureGeneralChatMembership`) |
+ 
+ Полезные команды:
+diff --git a/docs/e2ee-implementation.md b/docs/e2ee-implementation.md
+index 438288c..e3823ca 100644
+--- a/docs/e2ee-implementation.md
++++ b/docs/e2ee-implementation.md
+@@ -85,4 +85,4 @@ Back up the chat database first. The chat-security schema and explicit General C
+ 7. Open **Устройства и ключи Matrix** on both devices. On the new device choose **Запросить QR**; on the trusted device accept the request, show the QR and confirm the scan; verify trust and automatic backup restore. Separately inspect the profile to confirm it contains only the encrypted recovery envelope and salt, reveal/copy/download the key after password entry, rotate it, and test restore on a clean device.
+ 8. Disconnect Matrix or simulate a transient send failure. Confirm the private message appears immediately as `sending`, ends as `error` with manual retry available after retries, and is sent exactly once after retry/reconnect. Confirm no private message body was written to PostgreSQL. Do not describe the product as device-recoverable until these real-homeserver tests pass.
+ 
+-E2EE does not hide all metadata (membership, timing, traffic size). The browser must receive the Matrix decryption keys to display content. The current implementation uses the Matrix SDK's persistent browser IndexedDB store without a separate user-entered local storage passphrase; protect the browser profile/device, and treat XSS or a compromised web server as capable of accessing plaintext/keys. Pending private text is held in tab-scoped `sessionStorage` until it can be encrypted and sent; it is not written to the app database. A compromised web server could serve malicious JavaScript, so do not call the deployment fully secure until the real-service tests above pass.
++E2EE does not hide all metadata (membership, timing, traffic size). The browser must receive the Matrix decryption keys to display content. The current implementation uses the Matrix SDK's persistent browser IndexedDB store without a separate user-entered local storage passphrase; protect the browser profile/device, and treat XSS or a compromised web server as capable of accessing plaintext/keys. Pending private text is held in tab-scoped `sessionStorage` until it can be encrypted and sent; it is not written to the app database. The Matrix access token itself is persisted per app user in `localStorage` (`chata_matrix_session_v2_u<id>`, with the previous tab-scoped copy migrated automatically), because a token that lives only in one tab is lost on every new tab, PWA window or browser restart, and re-creating it costs the account password. A compromised web server could serve malicious JavaScript, so do not call the deployment fully secure until the real-service tests above pass.
+diff --git a/docs/matrix-session-and-push-diagnosis-2026-10-05.md b/docs/matrix-session-and-push-diagnosis-2026-10-05.md
+new file mode 100644
+index 0000000..80ab9fe
+--- /dev/null
++++ b/docs/matrix-session-and-push-diagnosis-2026-10-05.md
+@@ -0,0 +1,430 @@
++# Диагностика: Matrix-сессия «отваливается» при обновлении страницы и не работают push
++
++**Дата:** 5 октября 2026 г.
++**Ветка:** `arena/01a10be0-cha` (коммит `95e63d8`)
++**Метод:** чтение кода (`src/lib/matrix/**`, `src/components/ChatApp.tsx`, `src/app/page.tsx`,
++`src/lib/push*.ts`, `public/sw.js`, API-роуты) + сверка с `matrix-js-sdk@43.0.0` и
++документацией Synapse. Логику никуда не переносил, это отчёт о причинах.
++
++---
++
++## TL;DR
++
++| # | Симптом | Причина | Где |
++|---|---|---|---|
++| 1 | Matrix «ожидает пароль» почти при каждом F5 | Приложение логинится с `refresh_token: true`, а Synapse по умолчанию выдаёт такой access token **на 5 минут**. На перегрузке токен уже мёртв | `src/lib/matrix/server.ts:533` |
++| 2 | Автовосстановление не срабатывает / гоняет клиент по кругу | `createClient()` вызывается **без** `refreshToken`/`onTokenRefresh`, поэтому SDK не обновляет токен сам, а при `M_UNKNOWN_TOKEN` делает `sync.stop()`; приложение обновляет токен вручную и из-за этого пересоздаёт клиент (в `sessionKey` входит `accessToken`) | `src/lib/matrix/client.ts:399-405`, `133-135`, `src/components/ChatApp.tsx:289-320` |
++| 3 | Сессия живёт только в одной вкладке | Matrix-сессия хранится в `sessionStorage` (per-tab), а не в `localStorage`. Новая вкладка, PWA-окно, перезапуск браузера, `clients.openWindow()` из push → «В этой вкладке нет Matrix-сессии». Пароль для восстановления хранить негде | `src/app/page.tsx:44-64`, `src/components/AuthScreen.tsx:136`, `src/components/ChatApp.tsx:196` |
++| 4 | После одного сбоя — разлогин **на каждом** обновлении навсегда | Липкий флаг `users.matrix_reset_required`: `page.tsx` при нём стирает сессию и показывает экран входа. Снимается только в ветке входа, а любая ошибка в этой ветке проглатывается | `src/app/page.tsx:36-39`, `src/components/AuthScreen.tsx:65-101` |
++| 5 | Самоубийство E2EE-идентичности из-за безобидной ошибки | `handleFatalMatrixReset` срабатывает на широченную регулярку (в т.ч. `decryption`, `invalid session`), отзывает все устройства в Synapse и удаляет локальные ключи — и ставит флаг из п.4 | `src/components/ChatApp.tsx:347-356, 385-392` |
++| 6 | Пуш нет вообще (и «не настраивается») | `isPushConfigured()` требует все три `VAPID_*` (включая `VAPID_EMAIL`), а `web-push` бросает исключение, если subject не `mailto:`/`https:` — отправка тогда тихо падает | `src/lib/push.ts:6-21` |
++| 7 | Кнопка «Включить уведомления» жмётся без ответа | `Notification.requestPermission()` вызывается **после** `fetch` + ожидания Service Worker (до 10 с) — трансиентная user activation в Chrome к этому моменту истекла, промпт не показывается | `src/lib/push-client.ts:76-95` |
++| 8 | Пуш не приходит в приватные чаты | Push для E2EE ретранслирует **браузер отправителя** через `/api/messages/matrix-push`, который требует живой Matrix access token (см. п.1) и точного совпадения `chats.matrix_room_id`; ошибка — только `console.warn` | `src/lib/matrix/client.ts:1258-1284`, `src/app/api/messages/matrix-push/route.ts:42` |
++| 9 | Пуш «пропал» при тесте с открытым чатом | `sw.js` подавляет уведомление, если в любой видимой вкладке в URL есть этот `chatId` (а `handleSelectChat` пишет `?chatId=` через `replaceState` в каждой вкладке) | `public/sw.js:25-34`, `src/components/ChatApp.tsx:443-449` |
++
++Пункты 1–2 и 8 связаны: **одна и та же короткая жизнь токена ломает и Matrix, и пуш в
++приватных чатах.**
++
++---
++
++## 1. Matrix: почему сессия падает именно на обновлении страницы
++
++### 1.1 Токен живёт 5 минут, а приложение этого не учитывает
++
++`createMatrixSession()` (`src/lib/matrix/server.ts:508-536`) шлёт в Synapse:
++
++```jsonc
++{ "type": "m.login.password", ..., "refresh_token": true }
++```
++
++Согласно документации Synapse, `refreshable_access_token_lifetime` (время жизни access
++токена для клиентов, которые поддерживают refresh tokens) **по умолчанию = 5m**;
++`nonrefreshable_access_token_lifetime` — по умолчанию infinity
++([synapse docs](https://element-hq.github.io/synapse/latest/usage/configuration/config_documentation.html)).
++То есть, включая refresh tokens, приложение само выбрало 5-минутные токены.
++
++Дальше:
++
++* `expiresAt` вычисляется на сервере и кладётся в сессию (`server.ts:569-571`), но
++  **нигде не проверяется**: `src/app/page.tsx:43-64` при загрузке валидирует только форму
++  объекта (`typeof`), срок годности не смотрит.
++* Единственный путь обновления токена — реакция на событие синхронизации
++  `SyncState.Error` с `errcode === "M_UNKNOWN_TOKEN"`
++  (`src/components/ChatApp.tsx:341-356`). При этом `matrix-js-sdk` в этом случае сначала
++  делает `this.stop()` и переходит в `Error` (`node_modules/matrix-js-sdk/lib/sync.js:540-548`),
++  т.е. синхронизация уже остановлена; `client.setAccessToken()` её не перезапускает.
++* Обновление токена меняет `accessToken` → меняется `sessionKey()`
++  (`src/lib/matrix/client.ts:133-135`) → `getMatrixClient()` считает это **другой сессией**:
++  останавливает старый клиент, создаёт новый и заново открывает Rust-crypto store
++  (`client.ts:352-368`). Это тяжёлая и гоночная операция (45-секундный гейт
++  `waitForMatrixSync`, `client.ts:459`), и она же — лишний шанс получить ошибку хранилища.
++
++**Как это выглядит для пользователя:** зашёл, поработал, переключил вкладку/постоял 5 минут,
++нажал F5 → стартовый `/sync` приходит с мёртвым токеном → состояние `unavailable` →
++«Matrix не синхронизируется · восстановить» → модалка, требующая **пароль аккаунта**
++(`/api/auth/matrix-session` делает `bcrypt.compare`, `src/app/api/auth/matrix-session/route.ts:41-43`).
++Тихой перезагрузки сессии не существует.
++
++**Признак в консоли браузера:** `Token no longer valid - assuming logout` — это лог SDK
++(`sync.js:542`). Если он есть — причина точно эта.
++
++### 1.2 Refresh-токен вращается, а сохранён он в per-tab хранилище
++
++Synapse при `POST /refresh` выдаёт новый refresh token и **отзывает использованный**.
++Приложение пишет повёрнутые токены в `sessionStorage` текущей вкладки
++(`src/components/ChatApp.tsx:306-316`) и обновляет React-состояние. Отсюда:
++
++* две вкладки/PWA-окна одного пользователя — у каждой своя копия токена; первая,
++  обновившая его, делает копию второй невалидной (и её refresh-токен тоже);
++* перегрузка страницы в момент `handleUnknownToken` (пока не выполнен `sessionStorage.setItem`)
++  теряет повёрнутый токен целиком: в `sessionStorage` остаётся старый refresh token,
++  который сервер уже отозвал → восстановить сессию можно только паролем;
++* `sessionStorage` в принципе не переживает «нов вкладку», перезапуск браузера, а в
++  мобильном Safari/Chrome ещё и выгрузку вкладки из памяти.
++
++### 1.3 Липкий флаг `matrix_reset_required` — разлогин на каждом обновлении
++
++```js
++// src/app/page.tsx:36-39
++if (data.user.matrixResetRequired) {
++  sessionStorage.removeItem("chata_matrix_session");
++  sessionStorage.removeItem("chata_matrix_availability");
++  setUser(null);          // ← экран входа, а не «переподключись к Matrix»
++  return;
++}
++```
++
++Флаг ставится из трёх мест: `POST /api/auth/matrix-reset`, админка по пользователю,
++`POST /api/admin/system` с `action: "mass_matrix_reset"`. Снимается **только**
++`POST /api/auth/matrix-reset-complete`.
++
++Проблемы:
++
++1. `/api/admin/system` (`src/app/api/admin/system/route.ts:44-46`) выполняет
++   `db.update(users).set({ matrixResetRequired: true })` **без `where`** — один клик в
++   админке помечает всех пользователей, и у всех Matrix отваливается на следующем F5,
++   пока каждый не пройдёт полный вход с доступным Synapse.
++2. В `AuthScreen` (`src/components/AuthScreen.tsx:65-101`) цепочка
++   `clearLocalMatrixCryptoStores → /api/auth/matrix-session → /api/auth/matrix-reset-complete`
++   обёрнута в `try/catch`, который **не отменяет вход**, а только пишет notice. Не удалось
++   удалить IndexedDB (другая вкладка держит соединение → `onblocked` →
++   «Закройте другие вкладки приложения…», `src/lib/matrix/client.ts:231`), Synapse ответил
++   5xx, `whoami`/`devices` не сошлись — флаг остаётся `true`, и п.1 этого раздела
++   превращается в «при каждом обновлении меня выкидывает».
++3. Обработчик фатальных ошибок (`src/components/ChatApp.tsx:347-356, 385-392`) ловит
++   `/unknown device|corrupted|indexeddb|crypto store|decryption|key error|invalid session/i`.
++   Шаблон намеренно широкий, но `decryption`/`invalid session` легко возникают штатно —
++   например, пока в фоне идёт восстановление ключей из backup после перезагрузки
++   (`initializeMatrixCryptoAfterLogin`, `client.ts:975-990`). Один такой «ложный выстрел»
++   = отзыв всех устройств в Synapse + удаление локальных ключей + флаг из п.1:
++   история E2EE теряется, а сессия начинает отваливаться на каждом обновлении.
++
++### 1.4 Мелкая, но злая деталь: `expiresAt` и `null`
++
++`ChatApp.tsx:310` пишет `expiresAt: Date.now() + tokens.expires_in_ms`. Если хостинг не Synapse
++или версия отдаёт `expires_ms` вместо `expires_in_ms`, получается `NaN`, а
++`JSON.stringify(NaN)` → `null`. В `page.tsx:54` условие
++
++```js
++(candidate.expiresAt === undefined || (typeof candidate.expiresAt === "number" && Number.isFinite(candidate.expiresAt)))
++```
++
++на `null` не проходит → вся сессия считается мусором и удаляется. Итог — 100% потеря
++Matrix-сессии на каждом обновлении, без единого сообщения об ошибке.
++
++### 1.5 `cryptoDatabasePrefix` (справка)
++
++`initRustCrypto({ useIndexedDB, cryptoDatabasePrefix })` в SDK 43 ещё принимается
++(`client.d.ts:1172-1184` → `sync`: `storePrefix: args.cryptoDatabasePrefix ?? "matrix-js-sdk:crypto"`),
++`npx tsc --noEmit` проходит. Это не причина падений, но опция устарела — при переходе на
++следующий мажор SDK ключи начнут писаться в общее хранилище `matrix-js-sdk:crypto`,
++и тогда несколько аккаунтов в одном браузере будут перетирать друг друга.
++
++---
++
++## 2. Push: почему не работает
++
++### 2.1 Конфигурация (самое частое)
++
++```js
++// src/lib/push.ts:6-21
++isPushConfigured = (VAPID_PUBLIC_KEY || NEXT_PUBLIC_VAPID_PUBLIC_KEY) && VAPID_PRIVATE_KEY && VAPID_EMAIL
++```
++
++* `VAPID_EMAIL` обязателен, хотя `npx web-push generate-vapid-keys` его не выдаёт.
++  Не задан → `configured: false` → «Push-уведомления не настроены на сервере» и `503` на подписку.
++* `web-push` валидирует subject (`node_modules/web-push/src/vapid-helper.js:68-88`):
++  подходит только `mailto:...` или `https://...`. Обычный `admin@example.com` **бросает
++  исключение** в `setVapidDetails`, оно всплывает из `sendPushToUser` до всякой отправки,
++  а в `notifyChatMessage` проглатывается (`src/lib/notifications.ts:60-67`) — наружу
++  выходит только `errorName` в логе.
++* `/api/health` проверяет `config.push` по `VAPID_PUBLIC_KEY` без фallback'а на
++  `NEXT_PUBLIC_VAPID_PUBLIC_KEY` (`src/app/api/health/route.ts:37-38`) — может показать
++  `push: false` при рабочей конфигурации (и наоборот).
++* Нет `trim()`: `VAPID_PUBLIC_KEY="  BKabc…"` с пробелом/кавычкой ломает
++  `urlBase64ToUint8Array` на клиенте → «Не удалось подписаться на уведомления».
++
++### 2.2 Промпт на разрешение теряется
++
++`subscribeToPush()` (`src/lib/push-client.ts:63-95`) сначала делает `fetch("/api/push/subscribe")`,
++затем `waitForActiveServiceWorker()` (ожидание до **10 секунд**), и только потом
++`Notification.requestPermission()`. Chrome (и Firefox по-своему) показывают промпт только
++по «свежему» действию пользователя; после выхода за окно transient activation промпт
++не появляется, а promise `requestPermission()` не резолвится — UI зависает на
++`pushBusy` или получает «Разрешение на уведомления не выдано». Порядок надо обратный:
++запрос разрешения синхронно в обработчике клика, остальное — после.
++
++### 2.3 Service Worker регистрируется только после входа
++
++`registerServiceWorker()` вызывается из `ChatApp` (`src/components/ChatApp.tsx:137`), т.е.
++push физически невозможен для незалогиненной вкладки и для вкладки, открытой по ссылке из
++уведомления (нужен `?chatId=`). Плюс `sw.js` живёт в `public/` — его обязан отдавать
++тот же origin без кэша (`updateViaCache: "none"` задан — это правильно), иначе браузер
++годами крутит старый SW.
++
++### 2.4 Push для приватных E2EE-чатов зависит от Matrix-токена отправителя
++
++Единственный способ уведомить о сообщении в `e2ee`-чате — вызов из браузера отправителя
++(`src/lib/matrix/client.ts:1373, 1519` → `relayEncryptedMessagePush` → `/api/messages/matrix-push`).
++Сервер проверяет событие **токеном отправителя**
++(`verifyEncryptedMessageEvent`, `src/lib/matrix/server.ts:262-334`) и требует
++`chats.security_mode = 'e2ee'` + `chats.matrix_room_id === roomId`
++(`src/app/api/messages/matrix-push/route.ts:42`). Любое расхождение → `403`, а
++`relayEncryptedMessagePush` пишет только `console.warn`. То есть **просроченный токен из
++раздела 1.1 отключает и пуш в личке**. Отправка сообщения при этом успешно — проблема
++не видна вовсе.
++
++### 2.5 Подавление уведомления при открытом чате и отсутствие серверного флага
++
++* `public/sw.js:25-34` не показывает уведомление, если в какой-либо видимой вкладке в URL
++  есть `chatId` этого чата. `handleSelectChat` (`src/components/ChatApp.tsx:443-449`) пишет
++  `?chatId=` через `history.replaceState` — достаточно один раз открыть чат, и все пуши в него
++  «пропадают», пока вкладка видима.
++* `user.pushEnabled` нигде не сохраняется: в `users` нет колонки
++  (`src/db/schema.ts:13-34`), `ProfileSettingsModal` меняет только React-состояние
++  (`onProfileUpdated({ pushEnabled: true })`), `/api/auth/me` его не отдаёт. Переключатель
++  «включено» живёт до первой перезагрузки — ещё один источник ощущения «всё сбрасывается».
++* Реального серверного состояния «пользователь отключил уведомления» нет: фильтрация только по
++  `chat_members.notifications_muted`.
++
++### 2.6 Блокирующая отправка
++
++`POST /api/messages` (`src/app/api/messages/route.ts:181`) и
++`/api/messages/matrix-push` **дожидаются** `notifyChatMessage` → `webpush.sendNotification` без
++таймаута. Если VPS не может достучаться до `fcm.googleapis.com` /
++`updates.push.services.mozilla.com`, отправка сообщения висит до сетевого таймаута. Это
++выглядит одновременно и как «пуш не работает», и как «сообщения не уходят».
++
++---
++
++## 3. Как подтвердить за 5 минут
++
++### На сервере
++
++```bash
++# 1. Matrix: health + жив ли homeserver изнутри
++curl -s http://127.0.0.1:8010/api/health | python3 -m json.tool   # expect "matrix":"ok", config.push
++
++# 2. Липкий флаг — причина разлогинов на F5?
++psql "$DATABASE_URL" -c "select id, username, matrix_reset_required from users order by id;"
++
++# 3. Кто и с каких устройств реально подписан на пуш
++psql "$DATABASE_URL" -c "select user_id, count(*), max(created_at) from push_subscriptions group by 1;"
++psql "$DATABASE_URL" -c "select id, security_mode, matrix_room_id is not null as has_room from chats order by id;"
++
++# 4. Кто стоит на масс-сбросе в истории админа
++psql "$DATABASE_URL" -c "select created_at, action, details from admin_audit_logs where action like '%matrix%' order by id desc limit 20;"
++
++# 5. Ошибки доставки пуша (коды status без секретов)
++npx pm2 logs chata --lines 300 --nostream | grep -Ei "web push|push|matrix"
++
++# 6. Срок жизни токенов в Synapse (главный подозреваемый)
++grep -RnE "refreshable_access_token_lifetime|nonrefreshable_access_token_lifetime|refresh_token_lifetime" /etc/matrix-synapse/ || \
++  echo "не задано → refreshable=5m по умолчанию"
++```
++
++### В браузере
++
++1. DevTools → Console: ищем `Token no longer valid - assuming logout`
++   (токен протух) и `[Matrix E2EE] received to-device event` (клиент жив).
++2. Application → Session Storage: есть ли `chata_matrix_session`, и что внутри `expiresAt`.
++   Если после «восстановления» там `expiresAt: null` — это пункт 1.4.
++3. Application → Service Workers: `active`/`error`; Network → `GET /sw.js` → 200,
++   `Content-Type: text/javascript`, без `immutable`.
++4. `chrome://settings/content/notifications` для домена: не в «Block» ли.
++5. Настройки профиля → Уведомления → «Отправить тестовое»: ответ
++   `503` = VAPID, `409` = нет подписки, `502` = пуш-сервис отверг (смотреть `pm2 logs`).
++6. Сравнить: в приватном чате пуш не приходит **только** когда у отправителя просрочен
++   Matrix-токен (в консоли отправителя — `Encrypted message push relay failed {statusCode: 403}`).
++
++Быстрый эксперимент, который подтверждает п.1 за минуту: в `homeserver.yaml` поставить
++`refreshable_access_token_lifetime: 30d`, `systemctl restart matrix-synapse`, перезайти в
++приложение и погонять F5. Симптом исчезнет — причина в коротком токене.
++
++---
++
++## 4. Что чинить (по приоритету)
++
++### P0 — не просить 5-минутный токен или научить SDK его обновлять
++
++Вариант A (минимальный, 1 строка). В `src/lib/matrix/server.ts:508-536` убрать `refresh_token: true`
++→ Synapse выдаёт токен без срока (`nonrefreshable_access_token_lifetime` по умолчанию infinity).
++Цена: нет авто-истечения, отзыв только явный (`resetMatrixDevicesForAppUser` уже есть).
++
++```diff
++-      // Homeservers that support Matrix refresh tokens can keep a long-lived
++-      // device session alive without making the user sign out and back in.
++-      refresh_token: true,
+++      // Refresh tokens make Synapse issue 5-minute access tokens by default
+++      // (`refreshable_access_token_lifetime: 5m`), which is what drops the tab
+++      // session on every reload. Revocation is explicit in this app.
++```
++
++Вариант B (правильный, если хочется короткоживущие токены): прокинуть ротацию в сам SDK,
++чтобы он продлевал сессию *до* истечения (`client.d.ts:118-134` — `refreshToken` + `onTokenRefresh`):
++
++```ts
++const client = createClient({
++  baseUrl: session.baseUrl,
++  userId: session.userId,
++  accessToken: session.accessToken,
++  refreshToken: session.refreshToken,        // ← было не передано
++  onTokenRefresh: (tokens) => persistRotatedTokens(tokens), // ← обязателен при refreshToken
++  deviceId: session.deviceId,
++  cryptoCallbacks,
++});
++```
++
++`persistRotatedTokens` обязан записать **новый refresh token в хранилище до** того, как им
++воспользуется другая вкладка (см. 1.2), и обновить токен в клиенте без пересоздания.
++
++### P0 — не пересоздавать клиент из-за ротации токена
++
++`src/lib/matrix/client.ts:133-135` — исключить `accessToken` из ключа и обновлять его на месте:
++
++```diff
++ function sessionKey(session: MatrixSession): string {
++-  return `${session.baseUrl}|${session.userId}|${session.deviceId}|${session.accessToken}`;
+++  // The access token rotates (refresh tokens); keying on it tears the client and
+++  // the Rust crypto store down on every refresh. Identity = base URL + device.
+++  return `${session.baseUrl}|${session.userId}|${session.deviceId}`;
++ }
++```
++
+++ в месте смены токена: `client.getHttpClient().setAccessToken(next)` /
++`client.setAccessToken(next)` вместо `getMatrixClient(newSession)`.
++
++### P1 — хранить Matrix-сессию так, чтобы она переживала вкладку, и проверять срок
++
++* `chata_matrix_session` → `localStorage` (ключ уже привязан к `@chata_u<id>`, а сам доступ
++  защищён cookie `auth_token` с `httpOnly+sameSite=lax`), либо добавить серверный
++  `POST /api/auth/matrix-refresh`, который по сохранённому refresh token
++  перевыпускает сессию без пароля.
++* В `src/app/page.tsx` перед использованием сравнивать `expiresAt` с `Date.now()` и, если
++  осталось < 60 с, идти на `/api/auth/matrix-refresh`; `expiresAt` валидировать мягко
++  (`null`/`NaN` → трактовать как «без срока», а не «мусор») — п.1.4.
++* Синхронизировать повёрнутые токены между вкладками через `storage`-событие.
++
++### P1 — убрать «ядерный» автосброс и разорвать петлю флага
++
++* Сузить регулярку в `ChatApp.tsx:347-356, 385-392` до реально невосстановимых ошибок
++  (`"Storage is not initialized"|CorruptStorage|database is unavailable`) и показывать
++  кнопку «Сбросить Matrix» вместо автоматического `handleFatalMatrixReset()`.
++* `src/app/page.tsx:36-39` при `matrixResetRequired` не выкидывать на экран входа, а
++  открывать `MatrixSessionRecoveryModal` (сессия приложения валидна, нужен только новый Matrix device).
++* `src/app/api/admin/system/route.ts:44-46`: добавить `where`, либо явно подтверждаемое
++  действие + счётчик, иначе массовый сброс — это DoS всех E2EE-сессий.
++* В `AuthScreen` не глотать ошибку ветки сброса: если `matrix-reset-complete` не прошёл,
++  оставаться в модалке с понятной ошибкой, а не «входить с заведомо липким флагом».
++
++### P1 — пуш: не терять промпт и не вешать отправку
++
++* `src/lib/push-client.ts`: сначала `await Notification.requestPermission()` (в том же тике,
++  что и клик), потом `registerServiceWorker()`/`subscribe()`; при `permission !== "granted"`
++  не начинать сетевые вызовы.
++* `src/lib/push.ts`: `?.trim()` для ключей, валидация формата subject
++  (`VAPID_EMAIL` → нормализовать в `mailto:` если это просто e-mail), и `Promise.race` с
++  таймаутом ~10 с вокруг `webpush.sendNotification`, чтобы зависший пуш-провайдер не
++  блокировал `POST /api/messages`.
++* `src/app/api/health/route.ts:37-38`: тот же фallback на `NEXT_PUBLIC_VAPID_PUBLIC_KEY`,
++  что и в `isPushConfigured()`, иначе диагностика врёт.
++* Завести `users.push_enabled` + `PATCH /api/profile/push`, чтобы состояние не терялось и
++  сервер реально фильтровал отправку.
++
++### P2 — пуш для приватных чатов без браузера отправителя
++
++Сейчас это «лучше effort». Минимально полезные шаги: поднять `relayEncryptedMessagePush`
++из `console.warn` в видимый UI-статус (иначе «не доставлено» не отличить от «доставлено»),
++и/или поставить Synapse push gateway (`matrix-synapse` + `sygnal`) и подписывать `pusher`
++через `POST /_matrix/client/v3/pushers/set` — тогда уведомления о E2EE-событиях приходят,
++даже когда вкладка отправителя закрыта.
++
++### P2 — убрать подавление «по открытому чату»
++
++`public/sw.js`: подавлять только когда документ реально в фокусе **и** это уведомление о
++том же чате было получено не ранее `document.visibilityState === "visible"`; либо показывать
++всегда и ограничиваться `silent`-вариантом. Текущее поведение («у меня же открыт чат») легко
++выглядит как «пуш не работает» при любой проверке.
++
++---
++
++## 5. Что исправлено в этой ветке
++
++Реализовано (см. `git diff` в коммите этой ветки):
++
++**Matrix**
++
++| Файл | Изменение |
++|---|---|
++| `src/lib/matrix/server.ts` | `refresh_token: true` убран: refresh-токены теперь запрашиваются только при `MATRIX_REFRESH_TOKENS=1`. Добавлены `matrixRefreshTokensEnabled()` и `refreshMatrixSession()` (серверная ротация с проверкой `/whoami`: пользователь + device обязательны). |
++| `src/app/api/auth/matrix-refresh/route.ts` | **новый** эндпоинт тихого обновления токена по refresh token — без пароля. `401` означает «нужен пароль», `503` — Matrix недоступен. |
++| `src/lib/matrix/session-store.ts` | **новый** модуль хранения: `localStorage` + `sessionStorage`, ключ по id пользователя (`chata_matrix_session_v2_u<id>`), авто-миграция старой per-tab записи, защита от передачи сессии другому аккаунту, терпимый парсинг `expiresAt` (NaN/null больше не уничтожают сессию), событие `storage` для синхронизации вкладок. |
++| `src/lib/matrix/client.ts` | `sessionKey()` больше не содержит `accessToken` → ротация токена не пересоздаёт клиент и не перезапускает Rust crypto; токен «принимается» на живом клиенте через `setAccessToken`. В `createClient` передаются `refreshToken` + `onTokenRefresh` (SDK продлевает токен **до** истечения и пишет повёрнутую пару в хранилище). `relayEncryptedMessagePush` получил 3 попытки и попытку ротации при `401/403`. Добавлен `isFatalMatrixCryptoError()` — узкий, только реально повреждённое хранилище. |
++| `src/app/page.tsx` | Загрузка сессии через стор + `loadUsableMatrixSession()` (тихое обновление просроченного токена при загрузке). При `matrix_reset_required` пользователя **больше не выкидывает** на экран входа: чистится только Matrix-часть, открывается модалка восстановления. Стабильный `onLogout` (`useCallback`). |
++| `src/components/AuthScreen.tsx`, `ChatApp.tsx`, `src/lib/matrix/recover-session.ts` | Единый восстановление-хелпер: сначала переиспользуется **тот же** device ID (ключи и история остаются), новое устройство создаётся только если homeserver ответил `409`. Ошибки больше не проглатываются молча. |
++| `src/app/api/auth/matrix-session/route.ts` | Снимает `matrix_reset_required` на сервере сразу после успешного создания сессии — петля «разлогин на каждом F5» больше не может заклинить. |
++| `src/components/ChatApp.tsx` | Авто-`handleFatalMatrixReset` удалён: вместо него баннер + кнопка «Сбросить Matrix-идентичность» в сайдбаре с подтверждением. Ротация токена ограничена 2 попытками, затем — модалка. Вкладки синхронизируют токены через `subscribeToMatrixSessionChanges`. |
++| `src/app/api/admin/system/route.ts`, `AdminDashboard.tsx` | `mass_matrix_reset` требует фразу-подтверждение `МАССОВЫЙ СБРОС` (как nuclear wipe). |
++
++**Push**
++
++| Файл | Изменение |
++|---|---|
++| `src/lib/push-client.ts` | `Notification.requestPermission()` вызывается **первым**, до `fetch` и ожидания SW (иначе Chrome глотает промпт, а promise висит). Отдельное сообщение про небезопасный контекст (http), `missingEnv` в ошибке конфигурации. |
++| `src/lib/push.ts` | `trim()` всех `VAPID_*`, нормализация `VAPID_EMAIL` → `mailto:` (было: `web-push` бросает исключение и вся отправка молча падает), `missingPushEnv()` для диагностики, таймаут 10 с на `sendNotification` (зависший провайдер больше не вешает `POST /api/messages`), текст ошибки в лог вместо голого `errorName`. |
++| `src/app/api/health/route.ts` | `config.push` = тот же предикат, что у кода отправки; добавлены `pushMissingEnv` и `matrixRefreshTokens`. |
++| `src/app/api/push/{status,subscribe}/route.ts` | Отдают `missingEnv`, `no-store` на GET. |
++| `src/app/api/push/test/route.ts` | Понятные подсказки: `401/403` → VAPID-пара не та, `404/410` → пересоздать подписку, пустые коды → VPS не видит push-сервис. |
++| `public/sw.js` | Подавление только когда вкладка с этим чатом в **фокусе** (ранее — просто `visible`, что выглядело как «уведомления не работают»). |
++| `scripts/smoke-test.mjs` | Проверки: `/api/auth/matrix-refresh` недоступен анонимно (401) и с некорректным телом (400). |
++
++Дополнение по E2EE push: добавлен `POST /api/messages/private-ping` как резерв после обычного проверяющего `/api/messages/matrix-push`. Сначала клиент отправляет подтверждённое Matrix-событие на прежний endpoint; если его проверка/доставка не проходит после повтора и обновления токена, вызывается резервный ping. Он проверяет app-сессию и членство в приватном чате, дедуплицирует `eventId`, ограничивает частоту до 60 попыток на чат в минуту и рассылает только общее уведомление без текста. Это сохраняет строгую проверку как основной путь и даёт резерв, если Synapse-токен отправителя устарел или сервер не может перечитать событие. В `notifyPrivateChatMessage` подсчитываются успешные/неуспешные отправки отдельно по адресатам. На Android сайт можно установить из Chrome как PWA — отдельный APK для Web Push не нужен.
++
++Не делал осознанно: `users.push_enabled` в БД (текущий тумблер — только UI-статус, на доставку не влияет; если нужен серверный флаг — скажите), и собственный push-gateway к Synapse (`sygnal`), который убрал бы зависимость E2EE-уведомлений от вкладки отправителя.
++
++Что нужно сделать на сервере после деплоя:
++
++```bash
++git pull && npm ci && npm run db:setup && npm run build && npx pm2 restart chata --update-env
++# .env: VAPID_* без изменений; MATRIX_REFRESH_TOKENS можно не трогать (по умолчанию выкл)
++# в homeserver.yaml ничего менять не обязательно; если refresh-токены включите —
++# выставьте refreshable_access_token_lifetime: 30d
++```
++
++Пользователям с уже «залипшим» флагом: один раз войти (или нажать «Восстановить Matrix-сессию»
++и ввести пароль) — флаг снимется сам.
++
++## 6. Проверенные факты, на которые опирается отчёт
++
++* `matrix-js-sdk@43.0.0`, `initRustCrypto` принимает `cryptoDatabasePrefix`
++  (`node_modules/matrix-js-sdk/lib/client.d.ts:1172-1184`), `createClient` поддерживает
++  `refreshToken` + обязательный `onTokenRefresh` (там же, `118-134`).
++* При `M_UNKNOWN_TOKEN` синк-цикл SDK останавливается сам:
++  `node_modules/matrix-js-sdk/lib/sync.js:540-548`.
++* Synapse по умолчанию: `refreshable_access_token_lifetime` = 5m,
++  `refresh_token_lifetime` = infinity, `nonrefreshable_access_token_lifetime` = infinity
++  (docs/usage/configuration/config_documentation.md, element-hq/synapse).
++* `web-push` требует subject `mailto:`/`https:`
++  (`node_modules/web-push/src/vapid-helper.js:68-88`).
++* `npx tsc --noEmit` в текущем состоянии проходит — то есть все перечисленные проблемы
++  это логика/конфигурация, а не ошибки типов.
+diff --git a/public/chata-icon-192.png b/public/chata-icon-192.png
+new file mode 100644
+index 0000000..899d155
+Binary files /dev/null and b/public/chata-icon-192.png differ
+diff --git a/public/chata-icon-512.png b/public/chata-icon-512.png
+new file mode 100644
+index 0000000..237f73f
+Binary files /dev/null and b/public/chata-icon-512.png differ
+diff --git a/public/manifest.json b/public/manifest.json
+index 2c33033..3015e0d 100644
+--- a/public/manifest.json
++++ b/public/manifest.json
+@@ -7,7 +7,8 @@
+   "background_color": "#0a0a0f",
+   "theme_color": "#0a0a0f",
+   "icons": [
+-    { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any maskable" },
+-    { "src": "/favicon-96x96.png", "sizes": "96x96", "type": "image/png" }
++    { "src": "/chata-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
++    { "src": "/chata-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" },
++    { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any" }
+   ]
+ }
+diff --git a/public/sw.js b/public/sw.js
+index 3c386ec..1d5e5be 100644
+--- a/public/sw.js
++++ b/public/sw.js
+@@ -24,6 +24,10 @@ self.addEventListener("push", (event) => {
+       const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+       const chatIsVisible = windows.some((client) => {
+         if (client.visibilityState !== "visible" || !data.chatId) return false;
++        // "Visible" is not "being looked at": a second monitor or an unfocused
++        // window is still visible, and suppressing there reads as "notifications
++        // are broken". Only a focused tab showing this exact chat suppresses.
++        if (typeof client.focused === "boolean" && !client.focused) return false;
+         try {
+           const url = new URL(client.url);
+           return url.origin === self.location.origin && url.searchParams.get("chatId") === String(data.chatId);
+diff --git a/scripts/smoke-test.mjs b/scripts/smoke-test.mjs
+index bea73ea..d379ebe 100644
+--- a/scripts/smoke-test.mjs
++++ b/scripts/smoke-test.mjs
+@@ -62,6 +62,22 @@ async function main() {
+   });
+   check("password change without a session is 401", passwordChangeUnauthorized.response.status === 401);
+ 
++  // Silent Matrix session recovery must never be callable anonymously, and must
++  // not accept a body without a refresh token/device ID.
++  const matrixRefreshAnonymous = await json("/api/auth/matrix-refresh", { method: "POST" });
++  check("POST /api/auth/matrix-refresh without a session is 401",
++    matrixRefreshAnonymous.response.status === 401, `HTTP ${matrixRefreshAnonymous.response.status}`);
++
++  const privatePingAnonymous = await json("/api/messages/private-ping", {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ chatId: 1, eventId: "$smoke" }),
++  });
++  check("POST /api/messages/private-ping without a session is 401", privatePingAnonymous.response.status === 401);
++
++  const pushStatusPublic = await json("/api/push/status");
++  check("push status without a session is 401", pushStatusPublic.response.status === 401);
++
+   if (!allowWrites) {
+     console.log("\nSkipping write checks (set SMOKE_ALLOW_WRITES=1 to enable).");
+   } else {
+@@ -111,6 +127,14 @@ async function main() {
+     const pushStatus = await json("/api/push/status", {}, regA.cookie);
+     check("authenticated push status reports subscriptions", pushStatus.response.ok &&
+       Number.isInteger(pushStatus.body?.subscriptionCount), `HTTP ${pushStatus.response.status}`);
++    const matrixRefreshBadBody = await json("/api/auth/matrix-refresh", {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ deviceId: "SMOKEDEVICE" }),
++    }, regA.cookie);
++    check("matrix-refresh rejects a body without a refresh token",
++      matrixRefreshBadBody.response.status === 400, `HTTP ${matrixRefreshBadBody.response.status}`);
++
+     const pushTest = await json("/api/push/test", { method: "POST" }, regA.cookie);
+     check("push test endpoint gives a clear unconfigured/unsubscribed result",
+       pushTest.response.status === 409 || pushTest.response.status === 503,
+diff --git a/src/app/api/admin/system/route.ts b/src/app/api/admin/system/route.ts
+index db5f39b..d430321 100644
+--- a/src/app/api/admin/system/route.ts
++++ b/src/app/api/admin/system/route.ts
+@@ -41,6 +41,15 @@ export async function POST(request: NextRequest) {
+   const input = body as { action?: unknown; confirmation?: unknown };
+ 
+   if (input.action === "mass_matrix_reset") {
++    // Flagging every account also means every user's Matrix session is refused
++    // until they log in again with a reachable homeserver, so it needs the same
++    // explicit confirmation as the destructive wipe.
++    if (input.confirmation !== "МАССОВЫЙ СБРОС") {
++      return NextResponse.json(
++        { error: "Для подтверждения введите точную фразу: МАССОВЫЙ СБРОС" },
++        { status: 400 },
++      );
++    }
+     try {
+       const accounts = await db.select({ id: users.id }).from(users);
+       await db.update(users).set({ matrixResetRequired: true });
+diff --git a/src/app/api/auth/matrix-refresh/route.ts b/src/app/api/auth/matrix-refresh/route.ts
+new file mode 100644
+index 0000000..b808cbd
+--- /dev/null
++++ b/src/app/api/auth/matrix-refresh/route.ts
+@@ -0,0 +1,55 @@
++import { NextRequest, NextResponse } from "next/server";
++import { getCurrentUser } from "@/lib/auth";
++import { refreshMatrixSession } from "@/lib/matrix/server";
++
++export const dynamic = "force-dynamic";
++
++/**
++ * Silently rotates a stored Matrix refresh token into a fresh access token.
++ *
++ * The browser can call this on every page load without ever asking for the
++ * account password, which is what was missing before: an expired Matrix token
++ * used to mean "re-enter your password", and with Synapse's default
++ * `refreshable_access_token_lifetime` of 5 minutes that happened constantly.
++ * A rejected refresh token (already rotated, or the device was revoked) is
++ * reported as 401 so the client can fall back to password recovery.
++ */
++export async function POST(req: NextRequest) {
++  try {
++    const session = await getCurrentUser();
++    if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
++
++    const body: unknown = await req.json().catch(() => null);
++    if (!body || typeof body !== "object") {
++      return NextResponse.json({ error: "Некорректный запрос" }, { status: 400 });
++    }
++    const input = body as { refreshToken?: unknown; deviceId?: unknown };
++    if (
++      typeof input.refreshToken !== "string" || !input.refreshToken || input.refreshToken.length > 8192 ||
++      typeof input.deviceId !== "string" || !/^[A-Za-z0-9._=-]{1,255}$/u.test(input.deviceId)
++    ) {
++      return NextResponse.json({ error: "Нужны Matrix refresh token и device ID" }, { status: 400 });
++    }
++
++    const matrixSession = await refreshMatrixSession({
++      appUserId: session.userId,
++      deviceId: input.deviceId,
++      refreshToken: input.refreshToken,
++    });
++
++    return NextResponse.json(
++      { matrixAvailability: "ready", matrixSession },
++      { headers: { "Cache-Control": "no-store" } },
++    );
++  } catch (error) {
++    const message = error instanceof Error ? error.message : "";
++    const rejected = /rejected \(40[13]\)|could not be verified|does not match/.test(message);
++    if (!rejected) console.error("Matrix token refresh failed:", message || "unknown");
++    return NextResponse.json(
++      { error: rejected
++        ? "Matrix-сессия на этом устройстве больше не может обновляться автоматически. Введите пароль один раз."
++        : "Не удалось обновить Matrix-сессию" },
++      { status: rejected ? 401 : 503, headers: { "Cache-Control": "no-store" } },
++    );
++  }
++}
+diff --git a/src/app/api/auth/matrix-session/route.ts b/src/app/api/auth/matrix-session/route.ts
+index c1e6b2e..fccb712 100644
+--- a/src/app/api/auth/matrix-session/route.ts
++++ b/src/app/api/auth/matrix-session/route.ts
+@@ -58,6 +58,25 @@ export async function POST(req: NextRequest) {
+       password: input.password,
+       deviceId: input.deviceId,
+     });
++
++    // A reset flag means "this device must be re-created". Once the homeserver
++    // has accepted a brand-new device for this user, the flag is satisfied by
++    // definition. Clearing it here (instead of relying on the client to make a
++    // second round-trip that used to be swallowed by a catch block) is what
++    // stops a failed reset from disabling Matrix on every page reload.
++    if (user.matrixResetRequired && matrix.availability === "ready" && matrix.session) {
++      try {
++        await db
++          .update(users)
++          .set({ matrixResetRequired: false })
++          .where(eq(users.id, user.id));
++      } catch (resetError) {
++        // The session itself is valid; a database hiccup while clearing the flag
++        // must not turn a successful Matrix login into an error response.
++        console.error("Matrix reset flag could not be cleared:", resetError instanceof Error ? resetError.name : "UnknownError");
++      }
++    }
++
+     return NextResponse.json(
+       { matrixAvailability: matrix.availability, matrixSession: matrix.session },
+       { headers: { "Cache-Control": "no-store" } },
+diff --git a/src/app/api/health/route.ts b/src/app/api/health/route.ts
+index 2848777..2354f7b 100644
+--- a/src/app/api/health/route.ts
++++ b/src/app/api/health/route.ts
+@@ -1,6 +1,7 @@
+ import { db } from "@/db";
+ import { sql } from "drizzle-orm";
+-import { getMatrixHealthStatus } from "@/lib/matrix/server";
++import { getMatrixHealthStatus, isMatrixConfigured, matrixRefreshTokensEnabled } from "@/lib/matrix/server";
++import { isPushConfigured, missingPushEnv } from "@/lib/push";
+ 
+ export const dynamic = "force-dynamic";
+ 
+@@ -27,17 +28,13 @@ const REQUIRED_TABLES = [
+ export async function GET() {
+   const config = {
+     jwtSecret: Boolean(process.env.JWT_SECRET),
+-    matrix: Boolean(
+-      process.env.MATRIX_INTERNAL_URL &&
+-        process.env.MATRIX_PUBLIC_URL &&
+-        process.env.MATRIX_SERVER_NAME &&
+-        process.env.MATRIX_ADMIN_ACCESS_TOKEN,
+-    ),
++    matrix: isMatrixConfigured(),
+     telegram: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID),
+-    push: Boolean(
+-      process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY && process.env.VAPID_EMAIL,
+-    ),
++    // Same predicate the sending code uses, so the probe cannot lie about push.
++    push: isPushConfigured(),
++    matrixRefreshTokens: matrixRefreshTokensEnabled(),
+   };
++  const pushMissing = missingPushEnv();
+ 
+   try {
+     await db.execute(sql`select 1`);
+@@ -72,6 +69,7 @@ export async function GET() {
+       database: "ok",
+       schema,
+       ...(missingTables.length > 0 ? { missingTables, hint: "Run: npm run db:setup" } : {}),
++      ...(pushMissing.length > 0 ? { pushMissingEnv: pushMissing } : {}),
+       matrix,
+       config,
+     },
+diff --git a/src/app/api/messages/matrix-push/route.ts b/src/app/api/messages/matrix-push/route.ts
+index 77af8f7..e9f43b0 100644
+--- a/src/app/api/messages/matrix-push/route.ts
++++ b/src/app/api/messages/matrix-push/route.ts
+@@ -4,7 +4,7 @@ import { db } from "@/db";
+ import { chatMembers, chats, matrixPushEvents } from "@/db/schema";
+ import { getCurrentUser } from "@/lib/auth";
+ import { verifyEncryptedMessageEvent } from "@/lib/matrix/server";
+-import { notifyChatMessage } from "@/lib/notifications";
++import { notifyPrivateChatMessage } from "@/lib/notifications";
+ 
+ export const dynamic = "force-dynamic";
+ 
+@@ -77,15 +77,13 @@ export async function POST(req: NextRequest) {
+ 
+     // E2EE content is intentionally never sent to Web Push. The title/body are
+     // generic; only the chat ID is included to open the correct conversation.
+-    await notifyChatMessage({
++    const result = await notifyPrivateChatMessage({
+       chatId,
+       senderId: appUser.userId,
+       senderName: "Secret Chat",
+-      textPreview: "Новое сообщение в приватном чате",
+-      url: `/?chatId=${chatId}`,
+     });
+ 
+-    return NextResponse.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });
++    return NextResponse.json({ ok: true, ...result }, { headers: { "Cache-Control": "no-store" } });
+   } catch (error) {
+     console.error("Encrypted message push dispatch failed:", error instanceof Error ? error.name : "UnknownError");
+     return NextResponse.json({ error: "Не удалось отправить уведомление" }, { status: 500 });
+diff --git a/src/app/api/messages/private-ping/route.ts b/src/app/api/messages/private-ping/route.ts
+new file mode 100644
+index 0000000..47d78f9
+--- /dev/null
++++ b/src/app/api/messages/private-ping/route.ts
+@@ -0,0 +1,113 @@
++import { NextRequest, NextResponse } from "next/server";
++import { and, eq, sql } from "drizzle-orm";
++import { db } from "@/db";
++import { chatMembers, chats, matrixPushEvents, users } from "@/db/schema";
++import { getCurrentUser } from "@/lib/auth";
++import { notifyPrivateChatMessage } from "@/lib/notifications";
++
++export const dynamic = "force-dynamic";
++
++/**
++ * Keep an authenticated notification ping below an abusive rate while leaving
++ * plenty of headroom for a busy chat. The count includes recent claims made by
++ * both this endpoint and the older Matrix-verified relay.
++ */
++const MAX_CLAIMS_PER_MINUTE = 60;
++
++function isValidEventId(eventId: string): boolean {
++  return eventId.length <= 255 && eventId.startsWith("$") && !/\s/u.test(eventId);
++}
++
++/**
++ * A lightweight ping that says "I just sent an encrypted message into this
++ * chat". Private message plaintext never reaches this server. The older relay
++ * at `/api/messages/matrix-push` also verifies the event against Synapse, but
++ * that verification depends on a live Matrix token. This authenticated ping
++ * keeps push working when that token has just expired or rotated. This endpoint
++ * intentionally does not treat eventId as proof that Synapse accepted a message;
++ * it only deduplicates client pings. The app session, chat membership, generic
++ * notification body, and per-chat throttle bound that trade-off.
++ */
++export async function POST(req: NextRequest) {
++  try {
++    const appUser = await getCurrentUser();
++    if (!appUser) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
++
++    const body: unknown = await req.json().catch(() => null);
++    if (!body || typeof body !== "object") {
++      return NextResponse.json({ error: "Некорректный запрос" }, { status: 400 });
++    }
++    const input = body as { chatId?: unknown; eventId?: unknown };
++    const chatId = Number(input.chatId);
++    const eventId = typeof input.eventId === "string" ? input.eventId : "";
++    if (!Number.isInteger(chatId) || chatId <= 0) {
++      return NextResponse.json({ error: "chatId required" }, { status: 400 });
++    }
++    if (!isValidEventId(eventId)) {
++      return NextResponse.json({ error: "eventId required" }, { status: 400 });
++    }
++
++    const [chat] = await db
++      .select({ securityMode: chats.securityMode })
++      .from(chats)
++      .where(eq(chats.id, chatId));
++    // Public chats notify from `POST /api/messages`, where the content exists.
++    if (!chat) return NextResponse.json({ error: "Chat not found" }, { status: 404 });
++    if (chat.securityMode !== "e2ee") {
++      return NextResponse.json({ error: "Chat is not end-to-end encrypted" }, { status: 409 });
++    }
++
++    const [membership] = await db
++      .select({ id: chatMembers.id })
++      .from(chatMembers)
++      .where(and(eq(chatMembers.chatId, chatId), eq(chatMembers.userId, appUser.userId)))
++      .limit(1);
++    if (!membership) return NextResponse.json({ error: "Not a member" }, { status: 403 });
++
++    const [{ count }] = await db
++      .select({ count: sql<number>`count(*)::int` })
++      .from(matrixPushEvents)
++      .where(
++        and(
++          eq(matrixPushEvents.chatId, chatId),
++          sql`${matrixPushEvents.createdAt} > now() - interval '1 minute'`,
++        ),
++      );
++    if (Number(count) >= MAX_CLAIMS_PER_MINUTE) {
++      return NextResponse.json({ error: "Слишком много уведомлений" }, { status: 429 });
++    }
++
++    // Read display name before claiming the event, so a DB error here does not
++    // mark an event as delivered before the push fan-out has even started.
++    const [sender] = await db
++      .select({ displayName: users.displayName })
++      .from(users)
++      .where(eq(users.id, appUser.userId));
++
++    // Claim the event id first: a client retry must never double-notify.
++    const [claimedEvent] = await db
++      .insert(matrixPushEvents)
++      .values({ eventId, chatId })
++      .onConflictDoNothing()
++      .returning({ eventId: matrixPushEvents.eventId });
++    if (!claimedEvent) {
++      return NextResponse.json({ ok: true, duplicate: true }, { headers: { "Cache-Control": "no-store" } });
++    }
++
++    // Expire idempotency records after a month to keep this table bounded.
++    void db
++      .execute(sql`DELETE FROM matrix_push_events WHERE created_at < now() - interval '30 days'`)
++      .catch(() => undefined);
++
++    const result = await notifyPrivateChatMessage({
++      chatId,
++      senderId: appUser.userId,
++      senderName: sender?.displayName || "Secret Chat",
++    });
++
++    return NextResponse.json({ ok: true, ...result }, { headers: { "Cache-Control": "no-store" } });
++  } catch (error) {
++    console.error("Private chat push dispatch failed:", error instanceof Error ? error.name : "UnknownError");
++    return NextResponse.json({ error: "Не удалось отправить уведомление" }, { status: 500 });
++  }
++}
+diff --git a/src/app/api/push/status/route.ts b/src/app/api/push/status/route.ts
+index b1f2a14..0b21ba3 100644
+--- a/src/app/api/push/status/route.ts
++++ b/src/app/api/push/status/route.ts
+@@ -1,6 +1,6 @@
+ import { NextResponse } from "next/server";
+ import { getCurrentUser } from "@/lib/auth";
+-import { getPushSubscriptionCount, isPushConfigured } from "@/lib/push";
++import { getPushSubscriptionCount, isPushConfigured, missingPushEnv } from "@/lib/push";
+ 
+ export const dynamic = "force-dynamic";
+ 
+@@ -11,7 +11,11 @@ export async function GET() {
+   try {
+     const subscriptionCount = await getPushSubscriptionCount(user.userId);
+     return NextResponse.json(
+-      { configured: isPushConfigured(), subscriptionCount },
++      {
++        configured: isPushConfigured(),
++        subscriptionCount,
++        ...(isPushConfigured() ? {} : { missingEnv: missingPushEnv() }),
++      },
+       { headers: { "Cache-Control": "no-store" } },
+     );
+   } catch (error) {
+diff --git a/src/app/api/push/subscribe/route.ts b/src/app/api/push/subscribe/route.ts
+index 746cae5..29e12ce 100644
+--- a/src/app/api/push/subscribe/route.ts
++++ b/src/app/api/push/subscribe/route.ts
+@@ -1,6 +1,6 @@
+ import { NextRequest, NextResponse } from "next/server";
+ import { getCurrentUser } from "@/lib/auth";
+-import { getVapidPublicKey, isPushConfigured, savePushSubscription } from "@/lib/push";
++import { getVapidPublicKey, isPushConfigured, missingPushEnv, savePushSubscription } from "@/lib/push";
+ 
+ export const dynamic = "force-dynamic";
+ 
+@@ -9,10 +9,12 @@ function isValidBase64(s: unknown): s is string {
+ }
+ 
+ export async function GET() {
++  const configured = isPushConfigured();
+   return NextResponse.json({
+-    configured: isPushConfigured(),
+-    publicKey: getVapidPublicKey(),
+-  });
++    configured,
++    publicKey: configured ? getVapidPublicKey() : null,
++    ...(!configured ? { missingEnv: missingPushEnv() } : {}),
++  }, { headers: { "Cache-Control": "no-store" } });
+ }
+ 
+ export async function POST(req: NextRequest) {
+@@ -20,7 +22,10 @@ export async function POST(req: NextRequest) {
+     const payload = await getCurrentUser();
+     if (!payload) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+     if (!isPushConfigured()) {
+-      return NextResponse.json({ error: "Push is not configured on the server" }, { status: 503 });
++      return NextResponse.json(
++        { error: "Push is not configured on the server", missingEnv: missingPushEnv() },
++        { status: 503 },
++      );
+     }
+     const body = await req.json().catch(() => ({}));
+     const endpoint = typeof body.endpoint === "string" ? body.endpoint.trim() : "";
+diff --git a/src/app/api/push/test/route.ts b/src/app/api/push/test/route.ts
+index d6194d9..c72ddfd 100644
+--- a/src/app/api/push/test/route.ts
++++ b/src/app/api/push/test/route.ts
+@@ -1,6 +1,6 @@
+ import { NextResponse } from "next/server";
+ import { getCurrentUser } from "@/lib/auth";
+-import { isPushConfigured, sendPushToUser } from "@/lib/push";
++import { isPushConfigured, missingPushEnv, sendPushToUser } from "@/lib/push";
+ 
+ export const dynamic = "force-dynamic";
+ 
+@@ -8,7 +8,14 @@ export async function POST() {
+   const user = await getCurrentUser();
+   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+   if (!isPushConfigured()) {
+-    return NextResponse.json({ error: "Push is not configured on the server" }, { status: 503 });
++    return NextResponse.json(
++      {
++        error: `Push не настроен на сервере. Не задано: ${missingPushEnv().join(", ") || "проверьте VAPID_*"} . `
++          + "VAPID_EMAIL обязателен и должен быть в формате mailto:admin@example.com.",
++        missingEnv: missingPushEnv(),
++      },
++      { status: 503 },
++    );
+   }
+ 
+   try {
+@@ -26,9 +33,17 @@ export async function POST() {
+       );
+     }
+     if (result.sent === 0) {
++      const codes = new Set(result.failureStatusCodes);
++      const hint = codes.has(404) || codes.has(410)
++        ? "Подписки устарели: выключите и снова включите уведомления в настройках профиля."
++        : codes.has(401) || codes.has(403)
++          ? "Push-сервис отклонил VAPID-ключи: вероятно, VAPID_PUBLIC_KEY не соответствует VAPID_PRIVATE_KEY или подписка создана другим ключом. Пересоздайте ключи и включите уведомления заново."
++          : result.failureStatusCodes.length === 0
++            ? "Ни один запрос не дошёл до push-сервиса (нет интернета к fcm.googleapis.com / updates.push.services.mozilla.com или таймаут). Проверьте исходящий трафик на VPS."
++            : "Проверьте pm2 logs chata; код ошибки безопасно записан в серверный лог.";
+       return NextResponse.json(
+         {
+-          error: "Push-сервис не принял отправку. Проверьте pm2 logs chata; код ошибки безопасно записан в серверный лог.",
++          error: `Push-сервис не принял отправку. ${hint}`,
+           attempted: result.subscriptions,
+           failed: result.failed,
+           failureStatusCodes: result.failureStatusCodes,
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index 146b0d6..d052fa4 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -1,9 +1,14 @@
+ "use client";
+ 
+-import { useState, useEffect } from "react";
++import { useCallback, useEffect, useState } from "react";
+ import AuthScreen from "@/components/AuthScreen";
+ import ChatApp from "@/components/ChatApp";
+ import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
++import {
++  clearMatrixSession,
++  loadMatrixAvailability,
++  loadUsableMatrixSession,
++} from "@/lib/matrix/session-store";
+ 
+ interface User {
+   id: number;
+@@ -28,51 +33,75 @@ export default function Home() {
+   const [user, setUser] = useState<User | null>(null);
+   const [loading, setLoading] = useState(true);
+ 
++  // Stable identity: ChatApp keys its Matrix client effect on the user object,
++  // so a fresh inline callback here would tear the Matrix client down and
++  // rebuild it whenever this component re-rendered.
++  const handleLogout = useCallback(() => setUser(null), []);
++
+   useEffect(() => {
+-    fetch("/api/auth/me")
+-      .then((r) => r.json())
+-      .then((data) => {
+-        if (data.user) {
+-          if (data.user.matrixResetRequired) {
+-            sessionStorage.removeItem("chata_matrix_session");
+-            sessionStorage.removeItem("chata_matrix_availability");
+-            setUser(null);
+-            return;
+-          }
++    let cancelled = false;
++
++    (async () => {
++      try {
++        const response = await fetch("/api/auth/me", { cache: "no-store" });
++        const data = await response.json().catch(() => ({}));
++        if (cancelled || !data.user) return;
+ 
+-          let matrixSession: MatrixSession | null = null;
++        let matrixNotice: string | undefined;
++
++        // A pending Matrix reset means the *homeserver* revoked this device; the
++        // stored session and crypto device belong to that revoked device and must
++        // not be reused. The app session is still valid, so instead of logging the
++        // user out (which used to repeat on every reload until a full re-login
++        // succeeded) the client is handed the flag and opens the recovery flow.
++        if (data.user.matrixResetRequired) {
++          clearMatrixSession(data.user.id);
++          matrixNotice =
++            "Текущее Matrix-устройство отозвано. Введите пароль один раз в «Восстановить Matrix-сессию» — локальные ключи будут переиспользованы.";
++        }
++
++        let matrixSession: MatrixSession | null = null;
++        if (!data.user.matrixResetRequired) {
+           try {
+-            const stored = sessionStorage.getItem("chata_matrix_session");
+-            const candidate = stored ? JSON.parse(stored) as MatrixSession : null;
+-            if (
+-              candidate &&
+-              typeof candidate.baseUrl === "string" &&
+-              typeof candidate.accessToken === "string" &&
+-              typeof candidate.deviceId === "string" &&
+-              typeof candidate.userId === "string" &&
+-              (candidate.refreshToken === undefined || typeof candidate.refreshToken === "string") &&
+-              (candidate.expiresAt === undefined || (typeof candidate.expiresAt === "number" && Number.isFinite(candidate.expiresAt))) &&
+-              candidate.userId.startsWith(`@chata_u${data.user.id}:`)
+-            ) {
+-              matrixSession = candidate;
+-            } else {
+-              sessionStorage.removeItem("chata_matrix_session");
++            const usable = await loadUsableMatrixSession(data.user.id);
++            matrixSession = usable.session;
++            if (usable.refreshFailed) {
++              matrixNotice = usable.error
++                || "Matrix-сессия истекла и не обновилась автоматически. Нажмите «Восстановить Matrix-сессию».";
+             }
+           } catch {
+-            sessionStorage.removeItem("chata_matrix_session");
++            matrixSession = null;
+           }
++        }
+ 
+-          const storedAvailability = sessionStorage.getItem("chata_matrix_availability");
+-          const matrixAvailability = storedAvailability === "not_configured"
++        const storedAvailability = loadMatrixAvailability();
++        const matrixAvailability: MatrixAvailability = matrixSession
++          ? "ready"
++          : storedAvailability === "not_configured"
+             ? "not_configured"
+-            : matrixSession && storedAvailability === "ready"
+-              ? "ready"
+-              : "unavailable";
+-          setUser({ ...data.user, matrixSession, matrixAvailability });
++            : "unavailable";
++
++        // Order matters: publishing the user before clearing `loading` avoids a
++        // one-frame flash of the login screen on every reload.
++        if (!cancelled) {
++          setUser({
++            ...data.user,
++            matrixSession,
++            matrixAvailability,
++            matrixNotice: matrixNotice || data.user.matrixNotice || undefined,
++          });
+         }
+-      })
+-      .catch(() => {})
+-      .finally(() => setLoading(false));
++      } catch {
++        // A failed session check must not log the user out: the app falls back
++        // to the login screen only when the server really says 401.
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    })();
++
++    return () => {
++      cancelled = true;
++    };
+   }, []);
+ 
+   if (loading) {
+@@ -90,5 +119,5 @@ export default function Home() {
+     return <AuthScreen onAuth={setUser} />;
+   }
+ 
+-  return <ChatApp user={user} onLogout={() => setUser(null)} />;
++  return <ChatApp user={user} onLogout={handleLogout} />;
+ }
+diff --git a/src/components/AdminDashboard.tsx b/src/components/AdminDashboard.tsx
+index fe26f61..59f0ee4 100644
+--- a/src/components/AdminDashboard.tsx
++++ b/src/components/AdminDashboard.tsx
+@@ -112,6 +112,7 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
+ 
+   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+   const [wipeConfirmation, setWipeConfirmation] = useState("");
++  const [massMatrixConfirmation, setMassMatrixConfirmation] = useState("");
+   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
+ 
+   useEffect(() => {
+@@ -294,6 +295,7 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
+       if (!response.ok && response.status !== 202) throw new Error(typeof data.error === "string" ? data.error : "Системное действие не выполнено");
+       setNotice(typeof data.warning === "string" ? data.warning : "Системное действие выполнено.");
+       setWipeConfirmation("");
++      setMassMatrixConfirmation("");
+       const statusResponse = await fetch("/api/admin/system", { cache: "no-store" });
+       const statusData = await readJson(statusResponse);
+       if (statusResponse.ok) setSystemStatus(statusData as unknown as SystemStatus);
+@@ -555,16 +557,25 @@ export default function AdminDashboard({ admin }: { admin: { id: number; usernam
+               <h2 className="font-semibold">Matrix / Synapse</h2>
+               <p className="mt-2 text-sm text-gray-400">Статус: <span className="text-gray-200">{systemStatus ? matrixStatusLabel(systemStatus.matrixStatus) : "Проверка…"}</span></p>
+               <p className="mt-2 text-xs leading-relaxed text-gray-500">Matrix admin token остаётся только на сервере и не передаётся в браузер.</p>
+-              <button
+-                type="button"
+-                disabled={busy}
+-                onClick={() => {
+-                  if (window.confirm("Отозвать устройства Matrix всех пользователей? Для каждого аккаунта будет установлен флаг нового входа.")) {
+-                    void runSystemAction("mass_matrix_reset");
+-                  }
+-                }}
+-                className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-semibold text-amber-100 hover:bg-amber-500/20 disabled:opacity-50"
+-              >Массовый Matrix-сброс</button>
++              <label htmlFor="mass-matrix-confirmation" className="mt-3 block text-xs text-amber-200/80">
++                Отозвать устройства Matrix у всех: введите фразу <b>МАССОВЫЙ СБРОС</b>. Пока пользователь не введёт
++                пароль заново, его Matrix-сессия не будет создана.
++              </label>
++              <div className="mt-2 flex flex-col gap-3 sm:flex-row">
++                <input
++                  id="mass-matrix-confirmation"
++                  value={massMatrixConfirmation}
++                  onChange={(event) => setMassMatrixConfirmation(event.target.value)}
++                  placeholder="МАССОВЫЙ СБРОС"
++                  className="flex-1 rounded-xl border border-dark-500 bg-dark-700 px-4 py-3 text-sm text-white outline-none focus:border-amber-400"
++                />
++                <button
++                  type="button"
++                  disabled={busy || massMatrixConfirmation.trim() !== "МАССОВЫЙ СБРОС"}
++                  onClick={() => void runSystemAction("mass_matrix_reset", massMatrixConfirmation.trim())}
++                  className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-semibold text-amber-100 hover:bg-amber-500/20 disabled:opacity-50"
++                >Массовый Matrix-сброс</button>
++              </div>
+             </div>
+ 
+             <div className="rounded-2xl border border-red-500/30 bg-red-950/20 p-5 sm:p-6">
+diff --git a/src/components/AuthScreen.tsx b/src/components/AuthScreen.tsx
+index 3daf4d2..583808c 100644
+--- a/src/components/AuthScreen.tsx
++++ b/src/components/AuthScreen.tsx
+@@ -1,9 +1,15 @@
+ "use client";
+ 
+ import { useState } from "react";
+-import { clearLocalMatrixCryptoStores, initializeMatrixCryptoAfterLogin } from "@/lib/matrix/client";
++import { initializeMatrixCryptoAfterLogin } from "@/lib/matrix/client";
+ import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
+ import { getMatrixDeviceId } from "@/lib/matrix/device-id";
++import { recoverMatrixSession } from "@/lib/matrix/recover-session";
++import {
++  normalizeMatrixSession,
++  saveMatrixAvailability,
++  saveMatrixSession,
++} from "@/lib/matrix/session-store";
+ 
+ interface User {
+   id: number;
+@@ -55,54 +61,37 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
+         return;
+       }
+ 
+-      let matrixSession: MatrixSession | null = data.matrixSession || null;
+-      let matrixAvailability: MatrixAvailability = data.matrixAvailability || "unavailable";
++      let matrixSession: MatrixSession | null = normalizeMatrixSession(data.matrixSession);
++      let matrixAvailability: MatrixAvailability = matrixSession
++        ? (data.matrixAvailability || "ready")
++        : (data.matrixAvailability || "unavailable");
+       let matrixResetRequired = Boolean(data.matrixResetRequired || data.user?.matrixResetRequired);
+       let initialRecoveryKey: string | null = null;
+       let initialRecoveryKeySaved = false;
+       let matrixNotice = "";
+ 
+       if (matrixResetRequired) {
++        // The device was revoked on the homeserver. Re-authenticate the device
++        // this browser already owns (that keeps the local E2EE keys usable) and
++        // only fall back to a brand-new device when the server insists.
+         try {
+-          // Do not start Rust crypto with the stale device ID or IndexedDB. The
+-          // server waits for this clean client before provisioning a new device.
+-          await clearLocalMatrixCryptoStores(data.user.id);
+-          matrixSession = null;
+-          matrixAvailability = "unavailable";
+-          const freshDeviceId = getMatrixDeviceId(username, true);
+-          const freshSessionResponse = await fetch("/api/auth/matrix-session", {
+-            method: "POST",
+-            headers: { "Content-Type": "application/json" },
+-            body: JSON.stringify({ password, deviceId: freshDeviceId }),
+-            cache: "no-store",
++          const recovered = await recoverMatrixSession({
++            username,
++            appUserId: data.user.id,
++            password,
++            resetRequired: true,
+           });
+-          const freshSessionData = await freshSessionResponse.json();
+-          if (!freshSessionResponse.ok) throw new Error(freshSessionData.error || "Не удалось создать Matrix-сессию");
+-          matrixSession = freshSessionData.matrixSession || null;
+-          matrixAvailability = freshSessionData.matrixAvailability || "unavailable";
+-
+-          if (matrixSession && matrixAvailability === "ready") {
+-            const completionResponse = await fetch("/api/auth/matrix-reset-complete", {
+-              method: "POST",
+-              headers: { "Content-Type": "application/json" },
+-              body: JSON.stringify({ deviceId: matrixSession.deviceId }),
+-              cache: "no-store",
+-            });
+-            if (!completionResponse.ok) {
+-              const completion = await completionResponse.json().catch(() => ({}));
+-              throw new Error(completion.error || "Не удалось подтвердить новый Matrix device");
+-            }
+-            matrixResetRequired = false;
+-          } else {
+-            matrixNotice = "Локальные Matrix-ключи очищены. Сервер Matrix пока недоступен; войдите снова, когда он заработает.";
+-          }
++          matrixSession = recovered.session;
++          matrixAvailability = "ready";
++          matrixResetRequired = false;
++          matrixNotice = recovered.notice || "";
+         } catch (resetError) {
+           matrixSession = null;
+           matrixAvailability = "unavailable";
+           matrixNotice = resetError instanceof Error
+-            ? `Не удалось завершить безопасный сброс Matrix: ${resetError.message}`
+-            : "Не удалось завершить безопасный сброс Matrix. Повторите вход.";
+-          console.error("Matrix local reset failed");
++            ? `Не удалось завершить восстановление Matrix: ${resetError.message}`
++            : "Не удалось завершить восстановление Matrix. Общий чат доступен, приватные чаты - после восстановления.";
++          console.error("Matrix reset completion failed");
+         }
+       }
+ 
+@@ -132,12 +121,8 @@ export default function AuthScreen({ onAuth }: { onAuth: (user: User) => void })
+         matrixNotice,
+       };
+ 
+-      if (authenticatedUser.matrixSession) {
+-        sessionStorage.setItem("chata_matrix_session", JSON.stringify(authenticatedUser.matrixSession));
+-      } else {
+-        sessionStorage.removeItem("chata_matrix_session");
+-      }
+-      sessionStorage.setItem("chata_matrix_availability", authenticatedUser.matrixAvailability || "unavailable");
++      saveMatrixSession(authenticatedUser.id, authenticatedUser.matrixSession ?? null);
++      saveMatrixAvailability(authenticatedUser.matrixAvailability || "unavailable");
+       setPassword("");
+       onAuth(authenticatedUser);
+     } catch {
+diff --git a/src/components/ChatApp.tsx b/src/components/ChatApp.tsx
+index 7a91f28..2f4f945 100644
+--- a/src/components/ChatApp.tsx
++++ b/src/components/ChatApp.tsx
+@@ -15,6 +15,7 @@ import {
+   drainEncryptedOutbox,
+   getAutomaticRecoveryNotice,
+   getMatrixClient,
++  isFatalMatrixCryptoError,
+   joinRoomIfInvited,
+   MATRIX_RECOVERY_EVENT,
+   restartMatrixClient,
+@@ -24,7 +25,13 @@ import {
+ } from "@/lib/matrix/client";
+ import type { IEncryptedFile } from "matrix-encrypt-attachment";
+ import type { MatrixAvailability, MatrixSession } from "@/lib/matrix/types";
+-import { getMatrixDeviceId } from "@/lib/matrix/device-id";
++import { recoverMatrixSession } from "@/lib/matrix/recover-session";
++import {
++  clearMatrixSession,
++  loadMatrixSession,
++  refreshMatrixSessionFromServer,
++  subscribeToMatrixSessionChanges,
++} from "@/lib/matrix/session-store";
+ 
+ export interface User {
+   id: number;
+@@ -122,6 +129,9 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
+   const [showDeviceSecurity, setShowDeviceSecurity] = useState(Boolean(user.initialRecoveryKey));
+   const [showProfileSettings, setShowProfileSettings] = useState(false);
+   const [showMatrixRecovery, setShowMatrixRecovery] = useState(false);
++  // Set only when the *local* crypto store itself is unusable; it unlocks the
++  // manual "reset Matrix identity" action instead of running it automatically.
++  const [matrixIdentityResetNeeded, setMatrixIdentityResetNeeded] = useState(false);
+   const [initialRecoveryKey, setInitialRecoveryKey] = useState(user.initialRecoveryKey || null);
+   const [initialRecoveryKeySaved, setInitialRecoveryKeySaved] = useState(Boolean(user.initialRecoveryKeySaved));
+   const [currentUserState, setCurrentUserState] = useState<User>(user);
+@@ -155,65 +165,65 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
+     } catch {
+       console.error("Matrix logout failed");
+     }
+-    sessionStorage.removeItem("chata_matrix_session");
+-    sessionStorage.removeItem("chata_matrix_availability");
++    clearMatrixSession();
+     await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
+     onLogout();
+   }, [onLogout]);
+ 
+-  const handleFatalMatrixReset = useCallback(async () => {
++  /**
++   * Destroys the E2EE identity of this app account on purpose: it is the last
++   * resort when the local crypto store is genuinely unreadable. It used to run
++   * automatically from a broad error pattern, which turned ordinary reloads into
++   * a permanent Matrix outage (revoked devices + deleted keys + a sticky reset
++   * flag). It is now only reachable from the sidebar button.
++   */
++  const handleResetMatrixIdentity = useCallback(async () => {
+     try {
+       await stopMatrixClient(true);
+       await clearLocalMatrixCryptoStores(currentUserState.id);
+       await fetch("/api/auth/matrix-reset", { method: "POST", cache: "no-store" }).catch(() => undefined);
+     } catch {
+-      console.error("Fatal matrix reset failed");
++      console.error("Matrix identity reset failed");
+     }
+-    sessionStorage.removeItem("chata_matrix_session");
+-    sessionStorage.removeItem("chata_matrix_availability");
+-    await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
+-    onLogout();
+-  }, [onLogout, currentUserState.id]);
++    clearMatrixSession(currentUserState.id);
++    setMatrixIdentityResetNeeded(false);
++    setCurrentUserState((current) => ({ ...current, matrixSession: null, matrixResetRequired: true }));
++    setMatrixState("unavailable");
++    setShowMatrixRecovery(true);
++  }, [currentUserState.id]);
+ 
+   const handleRecoverMatrixSession = useCallback(async (password: string) => {
+-    const deviceId = getMatrixDeviceId(currentUserState.username);
+     // Stop the old SDK instance before re-authenticating this same device so
+     // Rust crypto can reopen its existing IndexedDB without losing keys.
+     await stopMatrixClient(false);
+-    const response = await fetch("/api/auth/matrix-session", {
+-      method: "POST",
+-      headers: { "Content-Type": "application/json" },
+-      body: JSON.stringify({ password, deviceId }),
+-      cache: "no-store",
++    const recovered = await recoverMatrixSession({
++      username: currentUserState.username,
++      appUserId: currentUserState.id,
++      password,
++      resetRequired: Boolean(currentUserState.matrixResetRequired),
+     });
+-    const data = await response.json().catch(() => ({}));
+-    if (!response.ok) throw new Error(data.error || "Не удалось восстановить Matrix-сессию");
+-    if (data.matrixAvailability !== "ready" || !data.matrixSession) {
+-      throw new Error("Matrix пока недоступен. Повторите попытку позже.");
+-    }
+ 
+-    const matrixSession = data.matrixSession as MatrixSession;
+-    sessionStorage.setItem("chata_matrix_session", JSON.stringify(matrixSession));
+-    sessionStorage.setItem("chata_matrix_availability", "ready");
+     setCurrentUserState((current) => ({
+       ...current,
+-      matrixSession,
++      matrixSession: recovered.session,
+       matrixAvailability: "ready",
++      matrixResetRequired: false,
+       matrixNotice: undefined,
+     }));
+     setMatrixState("checking");
+     try {
+-      await waitForMatrixSync(await getMatrixClient(matrixSession));
++      await waitForMatrixSync(await getMatrixClient(recovered.session));
+       setMatrixState("connected");
+       setAutomaticRecoveryNotice({
+         status: "restored",
+-        message: "Matrix-сессия восстановлена на прежнем устройстве. Локальные ключи E2EE сохранены.",
++        message: recovered.notice
++          || "Matrix-сессия восстановлена на прежнем устройстве. Локальные ключи E2EE сохранены.",
+       });
+     } catch (error) {
+       setMatrixState("unavailable");
+       throw new Error(error instanceof Error ? error.message : "Matrix пока не синхронизируется");
+     }
+-  }, [currentUserState.username]);
++  }, [currentUserState.username, currentUserState.id, currentUserState.matrixResetRequired]);
+ 
+   const loadChats = useCallback(async () => {
+     try {
+@@ -238,6 +248,26 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
+     return () => window.removeEventListener(MATRIX_RECOVERY_EVENT, onRecoveryUpdate);
+   }, [currentUserState.matrixSession]);
+ 
++  // Other tabs rotate the single-use refresh token; adopt their result so this
++  // tab keeps a valid session (and a valid token for the E2EE push relay).
++  useEffect(() => {
++    return subscribeToMatrixSessionChanges(() => {
++      const next = loadMatrixSession(user.id);
++      if (!next) return;
++      setCurrentUserState((current) => current.id === user.id && current.matrixSession?.accessToken !== next.accessToken
++        ? { ...current, matrixSession: next, matrixAvailability: "ready" }
++        : current);
++    });
++  }, [user.id]);
++
++  // A revoked device still leaves a valid app session: open the one-field
++  // recovery dialog instead of pushing the user back to the login screen.
++  useEffect(() => {
++    if (currentUserState.matrixResetRequired && !currentUserState.matrixSession) {
++      setShowMatrixRecovery(true);
++    }
++  }, [currentUserState.matrixResetRequired, currentUserState.matrixSession]);
++
+   useEffect(() => {
+     if (!currentUserState.matrixSession) return;
+     const session = currentUserState.matrixSession;
+@@ -247,6 +277,9 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
+     let recoveryAttempts = 0;
+     let recoveryInFlight = false;
+     let refreshInFlight = false;
++    // A rotation that the homeserver immediately rejects must not loop: two
++    // silent attempts, then the user is asked for the password exactly once.
++    let refreshAttempts = 0;
+ 
+     const clearRecoveryTimer = () => {
+       if (recoveryTimer !== null) {
+@@ -286,46 +319,64 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
+       }, waitMs);
+     };
+ 
+-    const handleUnknownToken = async (client: Awaited<ReturnType<typeof getMatrixClient>>) => {
++    const handleUnknownToken = async () => {
+       if (refreshInFlight || cancelled) return;
+-      if (!session.refreshToken) {
++      if (refreshAttempts >= 2) {
++        setMatrixState("unavailable");
+         setAutomaticRecoveryNotice({
+           status: "needs-recovery",
+-          message: "Matrix-сессия истекла, а сервер не выдал refresh token. Нажмите «Восстановить Matrix-сессию»; выходить из аккаунта не нужно.",
++          message: "Matrix отказывается обновлять токен этого устройства. Введите пароль аккаунта в «Восстановить Matrix-сессию» — ключи E2EE останутся на месте.",
+         });
++        setShowMatrixRecovery(true);
+         return;
+       }
+-
+       refreshInFlight = true;
++      refreshAttempts += 1;
+       setMatrixState("checking");
+       setAutomaticRecoveryNotice({ status: "restoring", message: "Обновляем Matrix-сессию…" });
+       try {
+-        const tokens = await client.refreshToken(session.refreshToken);
++        // Rotating through the app server (not the browser's own /refresh call)
++        // keeps one authoritative copy of the single-use refresh token: it is
++        // written to storage before the client restarts and broadcast to tabs.
++        const nextSession = await refreshMatrixSessionFromServer(session);
+         if (cancelled) return;
+-        client.setAccessToken(tokens.access_token);
+-        const nextSession: MatrixSession = {
+-          ...session,
+-          accessToken: tokens.access_token,
+-          refreshToken: tokens.refresh_token,
+-          expiresAt: Date.now() + tokens.expires_in_ms,
+-        };
+-        try {
+-          sessionStorage.setItem("chata_matrix_session", JSON.stringify(nextSession));
+-          sessionStorage.setItem("chata_matrix_availability", "ready");
+-        } catch {
+-          // Keep this tab working even if browser storage is full or disabled.
++        if (!nextSession) {
++          setMatrixState("unavailable");
++          setAutomaticRecoveryNotice({
++            status: "needs-recovery",
++            message: "Matrix-сессия истекла, а сервер не выдал refresh token. Нажмите «Восстановить Matrix-сессию»; выходить из аккаунта не нужно, ключи сохранятся.",
++          });
++          setShowMatrixRecovery(true);
++          return;
+         }
+         setCurrentUserState((current) => current.id === user.id
+           ? { ...current, matrixSession: nextSession, matrixAvailability: "ready", matrixNotice: undefined }
+           : current);
+-        setAutomaticRecoveryNotice({ status: "restored", message: "Matrix-сессия автоматически обновлена." });
+-      } catch {
++        // The SDK stops its sync loop on M_UNKNOWN_TOKEN, so the new token needs
++        // an explicit restart; reusing the client keeps the crypto store open.
++        try {
++          await restartMatrixClient(nextSession);
++          if (cancelled) return;
++          setMatrixState("connected");
++          setAutomaticRecoveryNotice({ status: "restored", message: "Matrix-сессия автоматически обновлена." });
++        } catch {
++          if (cancelled) return;
++          setMatrixState("unavailable");
++          setAutomaticRecoveryNotice({
++            status: "needs-recovery",
++            message: "Токен обновлён, но синхронизация Matrix ещё не восстановилась. Обновите страницу или нажмите «Восстановить Matrix-сессию».",
++          });
++        }
++      } catch (error) {
+         if (!cancelled) {
+           setMatrixState("unavailable");
+           setAutomaticRecoveryNotice({
+             status: "needs-recovery",
+-            message: "Не удалось обновить Matrix-сессию. Нажмите «Восстановить Matrix-сессию»; локальные ключи сохранятся.",
++            message: error instanceof Error
++              ? `${error.message} Нажмите «Восстановить Matrix-сессию»; локальные ключи сохранятся.`
++              : "Не удалось обновить Matrix-сессию. Нажмите «Восстановить Matrix-сессию»; локальные ключи сохранятся.",
+           });
++          setShowMatrixRecovery(true);
+         }
+       } finally {
+         refreshInFlight = false;
+@@ -345,20 +396,26 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
+           ? (error as { errcode?: unknown }).errcode
+           : undefined;
+         if (errcode === "M_UNKNOWN_TOKEN") {
+-          if (matrixClient) void handleUnknownToken(matrixClient);
++          void handleUnknownToken();
++        } else if (isFatalMatrixCryptoError(error)) {
++          // Surface it and let the user decide; never wipe keys by itself.
++          const detail = error instanceof Error ? error.message : "crypto store error";
++          setMatrixIdentityResetNeeded(true);
++          setAutomaticRecoveryNotice({
++            status: "needs-recovery",
++            message: `Локальное хранилище ключей Matrix недоступно (${detail}). Закройте другие вкладки `
++              + "с приложением и нажмите «Восстановить Matrix-сессию». Полный сброс идентичности нужен "
++              + "только если ключи действительно повреждены.",
++          });
+         } else {
+-          const errorMessage = error instanceof Error ? error.message : "";
+-          if (/unknown device|corrupted|indexeddb|crypto store|decryption|key error|invalid session/i.test(errorMessage)) {
+-            void handleFatalMatrixReset();
+-          } else {
+-            scheduleRestart();
+-          }
++          scheduleRestart();
+         }
+         return;
+       }
+       if (state === SyncState.Prepared || state === SyncState.Syncing || state === SyncState.Catchup) {
+         clearRecoveryTimer();
+         recoveryAttempts = 0;
++        refreshAttempts = 0;
+         setMatrixState("connected");
+       }
+       if (
+@@ -380,14 +437,22 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
+         setMatrixState("connected");
+         void drainEncryptedOutbox(session).catch(() => undefined);
+       })
+-      .catch((error) => {
++      .catch(async (error) => {
+         const errorType = error instanceof Error ? error.name : "Unknown Matrix sync error";
+-        const fatalCryptoError = error instanceof Error && /unknown device|corrupted|indexeddb|crypto store|decryption|key error|invalid session/i.test(error.message);
+         console.error("Matrix client unavailable:", errorType);
+         if (cancelled) return;
+         setMatrixState("unavailable");
+-        if (fatalCryptoError) {
+-          void handleFatalMatrixReset();
++        if (isFatalMatrixCryptoError(error)) {
++          setMatrixIdentityResetNeeded(true);
++        } else if (matrixClient?.getSyncState() === SyncState.Error) {
++          // Most common case after a reload: the stored access token is no
++          // longer accepted. Refresh it silently instead of waiting for a human.
++          const stateData = matrixClient.getSyncStateData() as { error?: { errcode?: string } } | undefined;
++          if (stateData?.error?.errcode === "M_UNKNOWN_TOKEN") {
++            await handleUnknownToken();
++            return;
++          }
++          onSync(SyncState.Error, null, stateData || undefined);
+         } else if (matrixClient) {
+           const currentState = matrixClient.getSyncState();
+           if (currentState === SyncState.Error || currentState === SyncState.Stopped) {
+@@ -401,7 +466,7 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
+       clearRecoveryTimer();
+       if (matrixClient) matrixClient.removeListener(ClientEvent.Sync, onSync);
+     };
+-  }, [handleFatalMatrixReset, currentUserState.matrixSession, user.id]);
++  }, [currentUserState.matrixSession, user.id]);
+ 
+   useEffect(() => {
+     if (!currentUserState.matrixSession) return;
+@@ -481,6 +546,8 @@ export default function ChatApp({ user, onLogout }: { user: User; onLogout: () =
+           onOpenDeviceSecurity={() => setShowDeviceSecurity(true)}
+           onOpenProfileSettings={() => setShowProfileSettings(true)}
+           onRecoverMatrixSession={() => setShowMatrixRecovery(true)}
++          matrixIdentityResetNeeded={matrixIdentityResetNeeded}
++          onResetMatrixIdentity={handleResetMatrixIdentity}
+         />
+       </div>
+ 
+diff --git a/src/components/ChatSidebar.tsx b/src/components/ChatSidebar.tsx
+index b741dd6..32227d3 100644
+--- a/src/components/ChatSidebar.tsx
++++ b/src/components/ChatSidebar.tsx
+@@ -44,6 +44,8 @@ export default function ChatSidebar({
+   onOpenDeviceSecurity,
+   onOpenProfileSettings,
+   onRecoverMatrixSession,
++  matrixIdentityResetNeeded,
++  onResetMatrixIdentity,
+ }: {
+   user: User;
+   chats: Chat[];
+@@ -56,6 +58,9 @@ export default function ChatSidebar({
+   onOpenDeviceSecurity: () => void;
+   onOpenProfileSettings: () => void;
+   onRecoverMatrixSession: () => void;
++  /** True only when the local crypto store itself is unreadable. */
++  matrixIdentityResetNeeded?: boolean;
++  onResetMatrixIdentity?: () => void;
+ }) {
+   const [showNewChat, setShowNewChat] = useState(false);
+   const [searchQuery, setSearchQuery] = useState("");
+@@ -82,7 +87,7 @@ export default function ChatSidebar({
+                   matrixState === "unavailable"
+                     ? user.matrixSession
+                       ? "Matrix-сессия есть, но синхронизация не прошла. Проверьте подключение или восстановите сессию. Не очищайте данные сайта: там хранятся ключи устройства."
+-                      : "В этой вкладке нет Matrix-сессии. Нажмите «Восстановить Matrix-сессию»; локальные ключи устройства сохранятся."
++                      : "Нет действующей Matrix-сессии для этого устройства. Нажмите «Восстановить Matrix-сессию» и введите пароль один раз; локальные ключи устройства сохранятся."
+                     : matrixState === "not_configured"
+                       ? "На сервере не настроен Matrix; личные чаты E2EE недоступны."
+                       : "E2EE пока не включено для отправки новых личных сообщений"
+@@ -99,13 +104,30 @@ export default function ChatSidebar({
+                         : "Matrix не синхронизируется · восстановить"}
+               </div>
+               {matrixState === "unavailable" && (
+-                <button
+-                  type="button"
+-                  onClick={onRecoverMatrixSession}
+-                  className="mt-1 text-[10px] font-medium text-purple-300 hover:text-purple-200"
+-                >
+-                  Восстановить Matrix-сессию
+-                </button>
++                <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
++                  <button
++                    type="button"
++                    onClick={onRecoverMatrixSession}
++                    className="text-[10px] font-medium text-purple-300 hover:text-purple-200"
++                  >
++                    Восстановить Matrix-сессию
++                  </button>
++                  {matrixIdentityResetNeeded && onResetMatrixIdentity && (
++                    <button
++                      type="button"
++                      onClick={() => {
++                        if (window.confirm(
++                          "Сбросить Matrix-идентичность этого устройства? Будут отозваны все устройства Synapse и удалены локальные E2EE-ключи; старые сообщения станут нечитаемыми без recovery key. Применяется, только если хранилище ключей действительно повреждено.",
++                        )) {
++                          onResetMatrixIdentity();
++                        }
++                      }}
++                      className="text-[10px] font-medium text-red-300 underline decoration-dotted hover:text-red-200"
++                    >
++                      Сбросить Matrix-идентичность
++                    </button>
++                  )}
++                </span>
+               )}
+             </div>
+           </div>
+diff --git a/src/lib/matrix/client.ts b/src/lib/matrix/client.ts
+index c689cdc..d73f28a 100644
+--- a/src/lib/matrix/client.ts
++++ b/src/lib/matrix/client.ts
+@@ -29,9 +29,17 @@ import {
+   fetchStoredRecoveryKey,
+   saveRecoveryKeyToProfile,
+ } from "./recovery-key-storage";
++import {
++  appUserIdFromMatrixUserId,
++  clearMatrixSession,
++  loadMatrixSession,
++  refreshMatrixSessionFromServer,
++  saveMatrixSession,
++} from "./session-store";
+ 
+ let clientPromise: Promise<MatrixClient> | null = null;
+ let currentSessionKey: string | null = null;
++let currentSessionToken: string | null = null;
+ const backfilledRoomIds = new Set<string>();
+ const roomPreparationPromises = new Map<string, Promise<MatrixClient>>();
+ const directHistoryVisibilityPromises = new Map<string, Promise<void>>();
+@@ -130,8 +138,17 @@ export interface MatrixTimelineResult {
+   undecryptableCount: number;
+ }
+ 
++/**
++ * Identifies the *device session*, i.e. everything the Matrix client and its
++ * IndexedDB crypto store are bound to.
++ *
++ * The access token is deliberately excluded: tokens rotate (refresh flow, a
++ * recovery re-login), and keying the cache on them used to tear down the
++ * client and re-open the Rust crypto store on every rotation. `getMatrixClient`
++ * now adopts a rotated token in place instead.
++ */
+ function sessionKey(session: MatrixSession): string {
+-  return `${session.baseUrl}|${session.userId}|${session.deviceId}|${session.accessToken}`;
++  return `${session.baseUrl}|${session.userId}|${session.deviceId}`;
+ }
+ 
+ function matrixOutboxStorageKey(appUserId: number): string {
+@@ -232,8 +249,7 @@ export async function clearLocalMatrixCryptoStores(appUserId: number): Promise<v
+   })));
+ 
+   try {
+-    window.sessionStorage.removeItem("chata_matrix_session");
+-    window.sessionStorage.removeItem("chata_matrix_availability");
++    clearMatrixSession(appUserId);
+   } catch {
+     throw new Error("Не удалось очистить Matrix-сессию браузера.");
+   }
+@@ -359,6 +375,18 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
+ 
+   const key = sessionKey(session);
+   if (clientPromise && currentSessionKey === key) {
++    // Same device, possibly a rotated access token (refresh, recovery re-login,
++    // another tab). Hand the new token to the running client instead of
++    // rebuilding it, which would interrupt sync and re-open the crypto store.
++    if (currentSessionToken !== session.accessToken) {
++      const pending = clientPromise;
++      currentSessionToken = session.accessToken;
++      void pending.then((existing) => {
++        if (existing.getAccessToken() !== session.accessToken) {
++          existing.setAccessToken(session.accessToken);
++        }
++      }).catch(() => undefined);
++    }
+     return clientPromise;
+   }
+ 
+@@ -377,6 +405,7 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
+   }
+ 
+   currentSessionKey = key;
++  currentSessionToken = session.accessToken;
+   clientPromise = (async () => {
+     const cryptoCallbacks: CryptoCallbacks = {
+       getSecretStorageKey: async ({ keys }) => {
+@@ -402,6 +431,28 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
+       accessToken: session.accessToken,
+       deviceId: session.deviceId,
+       cryptoCallbacks,
++      ...(session.refreshToken
++        ? {
++            refreshToken: session.refreshToken,
++            // The SDK's token manager refreshes *before* the access token
++            // expires, so sync never enters the terminal M_UNKNOWN_TOKEN state.
++            // Rotated tokens are single-use, so they must land in browser
++            // storage immediately - including for the other tabs.
++            onTokenRefresh: (tokens: { accessToken: string; refreshToken?: string; expiry?: Date }) => {
++              currentSessionToken = tokens.accessToken;
++              const nextSession: MatrixSession = {
++                baseUrl: session.baseUrl,
++                userId: session.userId,
++                accessToken: tokens.accessToken,
++                deviceId: session.deviceId,
++                ...(tokens.refreshToken ? { refreshToken: tokens.refreshToken } : {}),
++                ...(tokens.expiry ? { expiresAt: tokens.expiry.getTime() } : {}),
++              };
++              const appUserId = appUserIdFromMatrixUserId(session.userId);
++              if (appUserId !== null) saveMatrixSession(appUserId, nextSession);
++            },
++          }
++        : {}),
+     });
+ 
+     const cryptoDatabasePrefix = `secret-chat-${session.userId}-${session.deviceId}`
+@@ -441,6 +492,7 @@ export async function getMatrixClient(session: MatrixSession): Promise<MatrixCli
+   } catch (error) {
+     clientPromise = null;
+     currentSessionKey = null;
++    currentSessionToken = null;
+     throw error;
+   }
+ }
+@@ -450,12 +502,32 @@ export async function restartMatrixClient(session: MatrixSession): Promise<Matri
+   if (clientPromise && currentSessionKey === sessionKey(session)) {
+     const current = await clientPromise.catch(() => null);
+     const state = current?.getSyncState();
+-    if (current && state !== SyncState.Error && state !== SyncState.Stopped) return current;
++    if (current && state !== SyncState.Error && state !== SyncState.Stopped) {
++      // Reuse the running client, but still adopt a rotated token.
++      if (currentSessionToken !== session.accessToken) {
++        currentSessionToken = session.accessToken;
++        if (current.getAccessToken() !== session.accessToken) current.setAccessToken(session.accessToken);
++      }
++      return current;
++    }
+     await stopMatrixClient(false);
+   }
+   return getMatrixClient(session);
+ }
+ 
++/**
++ * Errors that genuinely mean the local crypto store is unusable and must be
++ * rebuilt. Deliberately narrow: the previous pattern also matched "decryption"
++ * and "invalid session", both of which appear during normal operation (history
++ * keys still restoring, an expired access token) and must NOT wipe the device
++ * identity, which is what turned a bad reload into a permanent Matrix outage.
++ */
++export function isFatalMatrixCryptoError(error: unknown): boolean {
++  if (!(error instanceof Error)) return false;
++  return /corrupt|unreadable|version conflict|database is not open|cannot open database|InvalidStateError|Storage is not initialized|indexeddb.*(?:blocked|closed|denied)/i
++    .test(error.message);
++}
++
+ const MATRIX_INITIAL_SYNC_TIMEOUT_MS = 45_000;
+ 
+ function createInitialSyncPromise(client: MatrixClient): Promise<void> {
+@@ -1255,32 +1327,118 @@ function formatMatrixReplyBody(body: string, reply: MatrixReplyReference): strin
+   return `${fallback}\n\n${body}`;
+ }
+ 
++function logPrivatePushResult(result: unknown, chatId: number): void {
++  if (!result || typeof result !== "object") return;
++  const data = result as Record<string, unknown>;
++  if (typeof data.sent !== "number" || data.sent > 0) return;
++  const safeNumber = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : null;
++  console.warn("Private chat push accepted without a successful delivery", {
++    chatId,
++    configured: data.configured === true,
++    recipients: safeNumber(data.recipients),
++    mutedRecipients: safeNumber(data.mutedRecipients),
++    failed: safeNumber(data.failed),
++  });
++}
++
+ async function relayEncryptedMessagePush(
+   session: MatrixSession,
+   chatId: number,
+   roomId: string,
+   eventId: string,
++): Promise<boolean> {
++  // A push relay failure must never fail a send that already succeeded - the
++  // encrypted message is on the homeserver. But it used to be a single
++  // fire-and-forget request, so any 401/403 from an access token that a reload
++  // or another tab rotated meant "no notifications for this chat", silently.
++  const appUserId = appUserIdFromMatrixUserId(session.userId);
++  let activeSession = session;
++  let attemptedRefresh = false;
++
++  for (let attempt = 0; attempt < 3; attempt += 1) {
++    const stored = appUserId === null ? null : loadMatrixSession(appUserId);
++    if (stored?.accessToken) activeSession = stored;
++
++    try {
++      const response = await fetch("/api/messages/matrix-push", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          chatId,
++          roomId,
++          eventId,
++          accessToken: activeSession.accessToken,
++          deviceId: activeSession.deviceId,
++        }),
++        cache: "no-store",
++      });
++      if (response.ok) {
++        const result: unknown = await response.json().catch(() => null);
++        logPrivatePushResult(result, chatId);
++        return true;
++      }
++
++      const statusCode = response.status;
++      if ((statusCode === 401 || statusCode === 403) && !attemptedRefresh) {
++        attemptedRefresh = true;
++        try {
++          const refreshed = await refreshMatrixSessionFromServer(activeSession);
++          if (refreshed) {
++            activeSession = refreshed;
++            await delay(250);
++            continue;
++          }
++        } catch {
++          // Refresh is best effort too; fall through to the generic warning.
++        }
++      }
++      console.warn("Encrypted message push relay failed", { statusCode, chatId });
++    } catch {
++      console.warn("Encrypted message push relay failed", { reason: "network", chatId });
++    }
++
++    if (attempt < 2) await delay(1_000 * (attempt + 1));
++  }
++  return false;
++}
++
++async function notifyPrivateMessagePush(
++  session: MatrixSession,
++  chatId: number,
++  roomId: string,
++  eventId: string,
+ ): Promise<void> {
++  // Prefer the relay that proves the event with Synapse. If that check fails
++  // (for example, because the sender's Matrix token just expired or the room
++  // metadata changed), use the authenticated membership-only ping as a fallback
++  // so a successfully sent E2EE message can still notify its recipient.
++  if (await relayEncryptedMessagePush(session, chatId, roomId, eventId)) return;
++
+   try {
+-    const response = await fetch("/api/messages/matrix-push", {
++    const response = await fetch("/api/messages/private-ping", {
+       method: "POST",
+       headers: { "Content-Type": "application/json" },
+-      body: JSON.stringify({
+-        chatId,
+-        roomId,
+-        eventId,
+-        accessToken: session.accessToken,
+-        deviceId: session.deviceId,
+-      }),
++      body: JSON.stringify({ chatId, eventId }),
+       cache: "no-store",
+     });
+-    if (!response.ok) {
+-      console.warn("Encrypted message push relay failed", { statusCode: response.status });
++    if (response.ok) {
++      const result: unknown = await response.json().catch(() => null);
++      logPrivatePushResult(result, chatId);
++      return;
++    }
++    if (response.status === 429) {
++      console.warn("Private chat push fallback was throttled", { chatId });
++      return;
+     }
++    console.warn("Private chat push fallback failed", {
++      statusCode: response.status,
++      chatId,
++    });
+   } catch {
+-    console.warn("Encrypted message push relay failed", { reason: "network" });
+-    // The encrypted message has already been sent. Push is best-effort and
+-    // must never turn a successful Matrix send into an outbox failure.
++    console.warn("Private chat push fallback failed", {
++      reason: "network",
++      chatId,
++    });
+   }
+ }
+ 
+@@ -1370,7 +1528,7 @@ async function runEncryptedOutboxMessage(
+           item.replyTo,
+           item.mentionUserIds,
+         );
+-        await relayEncryptedMessagePush(session, item.chatId, item.roomId, eventId);
++        await notifyPrivateMessagePush(session, item.chatId, item.roomId, eventId);
+         try {
+           removeEncryptedOutboxMessage(appUserId, item.id);
+         } catch {
+@@ -1516,7 +1674,7 @@ export async function sendEncryptedAttachment(
+     ...(input.replyTo ? { "m.relates_to": { "m.in_reply_to": { event_id: input.replyTo.eventId } } } : {}),
+     ...(input.mentionUserIds?.length ? { "m.mentions": { user_ids: input.mentionUserIds } } : {}),
+   } satisfies RoomMessageEventContent);
+-  await relayEncryptedMessagePush(session, input.chatId, roomId, response.event_id);
++  await notifyPrivateMessagePush(session, input.chatId, roomId, response.event_id);
+ }
+ 
+ export async function joinRoomIfInvited(
+@@ -1712,6 +1870,7 @@ export async function sendMatrixReadReceipt(
+ export async function stopMatrixClient(logout = false): Promise<void> {
+   const stoppedSessionKey = currentSessionKey;
+   if (!clientPromise) {
++    currentSessionToken = null;
+     if (stoppedSessionKey) clearSecretStorageKey(stoppedSessionKey);
+     roomPreparationPromises.clear();
+     directHistoryVisibilityPromises.clear();
+@@ -1729,6 +1888,7 @@ export async function stopMatrixClient(logout = false): Promise<void> {
+   }
+   clientPromise = null;
+   currentSessionKey = null;
++  currentSessionToken = null;
+   if (stoppedSessionKey) clearSecretStorageKey(stoppedSessionKey);
+   backfilledRoomIds.clear();
+   roomPreparationPromises.clear();
+diff --git a/src/lib/matrix/recover-session.ts b/src/lib/matrix/recover-session.ts
+new file mode 100644
+index 0000000..f565b86
+--- /dev/null
++++ b/src/lib/matrix/recover-session.ts
+@@ -0,0 +1,113 @@
++"use client";
++
++import { getMatrixDeviceId } from "./device-id";
++import type { MatrixAvailability, MatrixSession } from "./types";
++import { normalizeMatrixSession, saveMatrixAvailability, saveMatrixSession } from "./session-store";
++import { clearLocalMatrixCryptoStores } from "./client";
++
++export interface RecoverMatrixSessionResult {
++  session: MatrixSession;
++  /** False when the old crypto device had to be discarded and replaced. */
++  reusedDevice: boolean;
++  localKeysKept: boolean;
++  notice?: string;
++}
++
++async function requestSession(password: string, deviceId: string): Promise<
++  { ok: true; session: MatrixSession; availability: MatrixAvailability } | { ok: false; status: number; error: string }
++> {
++  const response = await fetch("/api/auth/matrix-session", {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ password, deviceId }),
++    cache: "no-store",
++  });
++  const data = (await response.json().catch(() => ({}))) as {
++    error?: string;
++    matrixAvailability?: MatrixAvailability;
++    matrixSession?: unknown;
++  };
++  if (!response.ok) {
++    return {
++      ok: false,
++      status: response.status,
++      error: data.error || "Не удалось восстановить Matrix-сессию",
++    };
++  }
++
++  const session = normalizeMatrixSession(data.matrixSession);
++  if (!session) {
++    return { ok: false, status: 503, error: "Matrix пока недоступен. Повторите попытку позже." };
++  }
++  return { ok: true, session, availability: data.matrixAvailability || "unavailable" };
++}
++
++/**
++ * Restores a Matrix session for the device this browser already owns.
++ *
++ * Recovery used to always mint a brand-new device ID and wipe the local crypto
++ * store, which threw away the room keys that history is decrypted with. When the
++ * homeserver revoked the device but kept its record, re-authenticating the *same*
++ * device ID is enough - and the IndexedDB store stays valid, so the old
++ * conversations keep opening. A fresh device is now only used when the server
++ * reports that this device ID is already taken.
++ */
++export async function recoverMatrixSession(input: {
++  username: string;
++  appUserId: number;
++  password: string;
++  resetRequired?: boolean;
++}): Promise<RecoverMatrixSessionResult> {
++  const existingDeviceId = getMatrixDeviceId(input.username);
++  const attempt = await requestSession(input.password, existingDeviceId);
++
++  if (attempt.ok) {
++    await finishReset(input.appUserId, attempt.session);
++    return {
++      session: attempt.session,
++      reusedDevice: true,
++      localKeysKept: true,
++      notice: "Matrix-сессия восстановлена на прежнем устройстве; локальные ключи E2EE сохранены.",
++    };
++  }
++
++  // 409 from the reset guard: the device still exists on the homeserver, so it
++  // must be replaced. Clearing the local store is best effort - if another tab
++  // holds IndexedDB open, the new device ID alone already keeps the store apart.
++  if (input.resetRequired && attempt.status === 409) {
++    const freshDeviceId = getMatrixDeviceId(input.username, true);
++    let localKeysKept = false;
++    try {
++      await clearLocalMatrixCryptoStores(input.appUserId);
++    } catch {
++      localKeysKept = false;
++    }
++    const retry = await requestSession(input.password, freshDeviceId);
++    if (!retry.ok) throw new Error(retry.error);
++    await finishReset(input.appUserId, retry.session);
++    return {
++      session: retry.session,
++      reusedDevice: false,
++      localKeysKept,
++      notice: "Пришлось создать новое Matrix-устройство: старое ещё числится на homeserver. "
++        + (localKeysKept
++          ? "Старые сообщения доступны, если ключи есть в резервной копии Matrix."
++          : "Старые сообщения потребуется восстановить по recovery key."),
++    };
++  }
++
++  throw new Error(attempt.error);
++}
++
++async function finishReset(appUserId: number, session: MatrixSession): Promise<void> {
++  saveMatrixSession(appUserId, session);
++  saveMatrixAvailability("ready");
++  // Older deployments clear the reset flag only through this endpoint; it is a
++  // no-op once `/api/auth/matrix-session` cleared it itself.
++  await fetch("/api/auth/matrix-reset-complete", {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ deviceId: session.deviceId }),
++    cache: "no-store",
++  }).catch(() => undefined);
++}
+diff --git a/src/lib/matrix/server.ts b/src/lib/matrix/server.ts
+index d4e4820..c8eb382 100644
+--- a/src/lib/matrix/server.ts
++++ b/src/lib/matrix/server.ts
+@@ -67,6 +67,22 @@ export function isMatrixConfigured(): boolean {
+   }
+ }
+ 
++/**
++ * Opt-in refresh tokens.
++ *
++ * When a client asks Synapse for refresh tokens it is issued a *short-lived*
++ * access token: `refreshable_access_token_lifetime` defaults to 5 minutes,
++ * while `nonrefreshable_access_token_lifetime` defaults to infinite. A browser
++ * session that only re-authenticates on `M_UNKNOWN_TOKEN` therefore dies on
++ * almost every reload. Refreshing is only useful when the client refreshes
++ * proactively (the matrix-js-sdk `TokenManager` does), so it stays off unless
++ * `MATRIX_REFRESH_TOKENS` is explicitly enabled.
++ */
++export function matrixRefreshTokensEnabled(): boolean {
++  const flag = process.env.MATRIX_REFRESH_TOKENS?.trim().toLowerCase();
++  return flag === "1" || flag === "true" || flag === "yes" || flag === "on";
++}
++
+ /** A secret-free probe for the app host's configured Synapse client API. */
+ export async function getMatrixHealthStatus(): Promise<"ok" | "not_configured" | "unavailable"> {
+   let config: MatrixConfig | null;
+@@ -528,9 +544,10 @@ export async function createMatrixSession(
+       password: options.password,
+       device_id: deviceId,
+       initial_device_display_name: `Secret Chat — ${options.username}`,
+-      // Homeservers that support Matrix refresh tokens can keep a long-lived
+-      // device session alive without making the user sign out and back in.
+-      refresh_token: true,
++      // Only when explicitly enabled: see `matrixRefreshTokensEnabled()`.
++      // With refresh tokens the homeserver issues expiring access tokens, so a
++      // client that cannot refresh them loses its session shortly after login.
++      ...(matrixRefreshTokensEnabled() ? { refresh_token: true } : {}),
+     }),
+     cache: "no-store",
+   });
+@@ -572,3 +589,73 @@ export async function createMatrixSession(
+     },
+   };
+ }
++
++/**
++ * Exchanges a stored refresh token for a new Matrix access token, server-side.
++ *
++ * This is what makes a reload recoverable without typing the account password:
++ * the browser only ever needs the (single-use) refresh token, and the rotated
++ * pair is validated against `/whoami` before it is handed back, so a token from
++ * another device or another app account can never be adopted.
++ */
++export async function refreshMatrixSession(input: {
++  appUserId: number;
++  deviceId: string;
++  refreshToken: string;
++}): Promise<MatrixSession> {
++  const config = getMatrixConfig();
++  if (!config) throw new Error("Matrix is not configured");
++  if (!/^[A-Za-z0-9._=-]{1,255}$/u.test(input.deviceId)) {
++    throw new Error("Invalid Matrix device ID");
++  }
++  if (typeof input.refreshToken !== "string" || !input.refreshToken || input.refreshToken.length > 8192) {
++    throw new Error("Invalid Matrix refresh token");
++  }
++
++  const response = await fetch(`${config.internalUrl}/_matrix/client/v3/refresh`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ refresh_token: input.refreshToken }),
++    cache: "no-store",
++  });
++  if (!response.ok) {
++    // 401/M_UNKNOWN_TOKEN means the refresh token was already rotated away or the
++    // device was revoked; only a password login can recover from that.
++    throw new Error(`Matrix refresh rejected (${response.status})`);
++  }
++
++  const data = (await response.json()) as {
++    access_token?: string;
++    refresh_token?: string;
++    expires_in_ms?: number;
++  };
++  if (!data.access_token) throw new Error("Matrix refresh returned no access token");
++
++  const headers = { Authorization: `Bearer ${data.access_token}` };
++  const whoami = await fetch(`${config.internalUrl}/_matrix/client/v3/account/whoami`, {
++    headers,
++    cache: "no-store",
++  });
++  if (!whoami.ok) throw new Error("Matrix session could not be verified");
++  const identity = (await whoami.json()) as { user_id?: unknown; device_id?: unknown };
++  const expectedMxid = matrixUserId(config, input.appUserId);
++  if (identity.user_id !== expectedMxid) {
++    throw new Error("Matrix session does not match the authenticated app user");
++  }
++  if (typeof identity.device_id === "string" && identity.device_id !== input.deviceId) {
++    throw new Error("Matrix session does not match the authenticated app device");
++  }
++
++  return {
++    baseUrl: config.publicUrl,
++    userId: expectedMxid,
++    accessToken: data.access_token,
++    deviceId: input.deviceId,
++    ...(typeof data.refresh_token === "string" && data.refresh_token
++      ? { refreshToken: data.refresh_token }
++      : {}),
++    ...(typeof data.expires_in_ms === "number" && Number.isFinite(data.expires_in_ms) && data.expires_in_ms > 0
++      ? { expiresAt: Date.now() + data.expires_in_ms }
++      : {}),
++  };
++}
+diff --git a/src/lib/matrix/session-store.ts b/src/lib/matrix/session-store.ts
+new file mode 100644
+index 0000000..735bcbc
+--- /dev/null
++++ b/src/lib/matrix/session-store.ts
+@@ -0,0 +1,298 @@
++"use client";
++
++import type { MatrixSession } from "./types";
++
++/**
++ * Matrix session persistence.
++ *
++ * The session used to live only in `sessionStorage`, which is tab-scoped: every
++ * new tab, PWA window, browser restart (and every mobile tab discard) lost the
++ * Matrix access token, and because creating a session requires the account
++ * password the app could not recover silently. The access token is now kept in
++ * `localStorage`, keyed by app user ID so multiple accounts in one browser do
++ * not overwrite each other.
++ *
++ * Security note: this is not a weakening of the existing posture. The E2EE
++ * account keys already live unencrypted in IndexedDB for the same origin (see
++ * docs/e2ee-implementation.md), so an XSS that could read a persistent token
++ * could already read the keys that protect the history. Logging out of the app
++ * removes every copy (see `clearMatrixSession`).
++ */
++const SESSION_KEY_PREFIX = "chata_matrix_session_v2";
++const LEGACY_SESSION_KEY = "chata_matrix_session";
++export const MATRIX_AVAILABILITY_KEY = "chata_matrix_availability";
++export const MATRIX_SESSION_CHANGED_EVENT = "chata:matrix-session-update";
++
++function sessionStorageKey(appUserId: number): string {
++  return `${SESSION_KEY_PREFIX}_u${appUserId}`;
++}
++
++/** `@chata_u123:example.com` -> 123; null for any MXID that is not ours. */
++export function appUserIdFromMatrixUserId(userId: string): number | null {
++  const match = userId.match(/^@chata_u(\d+):/);
++  if (!match) return null;
++  const id = Number(match[1]);
++  return Number.isSafeInteger(id) && id > 0 ? id : null;
++}
++
++/**
++ * Validates and repairs a stored session.
++ *
++ * `expiresAt` is intentionally forgiving: a homeserver that omits
++ * `expires_in_ms` used to produce `Date.now() + undefined === NaN`, which
++ * `JSON.stringify` writes as `null`, and the strict shape check in `page.tsx`
++ * then threw the whole session away on the next reload.
++ */
++export function normalizeMatrixSession(raw: unknown): MatrixSession | null {
++  if (!raw || typeof raw !== "object") return null;
++  const candidate = raw as Record<string, unknown>;
++  if (
++    typeof candidate.baseUrl !== "string" || !candidate.baseUrl ||
++    typeof candidate.userId !== "string" || !candidate.userId ||
++    typeof candidate.accessToken !== "string" || !candidate.accessToken ||
++    typeof candidate.deviceId !== "string" || !candidate.deviceId
++  ) {
++    return null;
++  }
++
++  const refreshToken = typeof candidate.refreshToken === "string" && candidate.refreshToken
++    ? candidate.refreshToken
++    : undefined;
++  const expiresAt = typeof candidate.expiresAt === "number" && Number.isFinite(candidate.expiresAt) && candidate.expiresAt > 0
++    ? candidate.expiresAt
++    : undefined;
++
++  return {
++    baseUrl: candidate.baseUrl,
++    userId: candidate.userId,
++    accessToken: candidate.accessToken,
++    deviceId: candidate.deviceId,
++    ...(refreshToken ? { refreshToken } : {}),
++    ...(expiresAt ? { expiresAt } : {}),
++  };
++}
++
++function parseStoredSession(serialized: string | null): MatrixSession | null {
++  if (!serialized) return null;
++  try {
++    return normalizeMatrixSession(JSON.parse(serialized));
++  } catch {
++    return null;
++  }
++}
++
++/** True when the token is gone or expires within `skewMs` (default 60s). */
++export function isMatrixSessionExpired(session: MatrixSession, skewMs = 60_000): boolean {
++  return typeof session.expiresAt === "number" && Date.now() + skewMs >= session.expiresAt;
++}
++
++/**
++ * Reads the session for one app user. Falls back to the legacy tab-scoped key
++ * and migrates it, so an in-flight session survives the upgrade without
++ * asking for the password again.
++ */
++export function loadMatrixSession(appUserId: number): MatrixSession | null {
++  if (typeof window === "undefined") return null;
++  const key = sessionStorageKey(appUserId);
++
++  let fromPersistent: MatrixSession | null = null;
++  try {
++    fromPersistent = parseStoredSession(window.localStorage.getItem(key));
++  } catch {
++    fromPersistent = null;
++  }
++  if (fromPersistent) {
++    // Keep the tab copy in sync so other tabs' `storage` events stay meaningful.
++    try {
++      window.sessionStorage.setItem(key, JSON.stringify(fromPersistent));
++    } catch {
++      // Private mode / disabled storage: the persistent copy is enough.
++    }
++    return fromPersistent;
++  }
++
++  let fromTab: MatrixSession | null = null;
++  try {
++    fromTab = parseStoredSession(window.sessionStorage.getItem(key))
++      ?? parseStoredSession(window.sessionStorage.getItem(LEGACY_SESSION_KEY));
++  } catch {
++    fromTab = null;
++  }
++  if (!fromTab) return null;
++  if (appUserIdFromMatrixUserId(fromTab.userId) !== appUserId) {
++    // Never hand a session over to a different app account.
++    clearMatrixSession(appUserId);
++    return null;
++  }
++  saveMatrixSession(appUserId, fromTab);
++  return fromTab;
++}
++
++/** Persists to both stores and notifies other tabs/listeners. */
++export function saveMatrixSession(appUserId: number, session: MatrixSession | null): void {
++  if (typeof window === "undefined") return;
++  const key = sessionStorageKey(appUserId);
++
++  try {
++    if (session) {
++      const serialized = JSON.stringify(session);
++      window.localStorage.setItem(key, serialized);
++      window.sessionStorage.setItem(key, serialized);
++    } else {
++      window.localStorage.removeItem(key);
++      window.sessionStorage.removeItem(key);
++    }
++    window.localStorage.removeItem(LEGACY_SESSION_KEY);
++    window.sessionStorage.removeItem(LEGACY_SESSION_KEY);
++  } catch {
++    // A full or disabled persistent store must not break the running tab, so
++    // fall back to the tab-scoped copy only.
++    try {
++      if (session) window.sessionStorage.setItem(key, JSON.stringify(session));
++      else window.sessionStorage.removeItem(key);
++    } catch {
++      // Nothing else to do; the in-memory session still works.
++    }
++  }
++
++  if (typeof window.CustomEvent === "function") {
++    window.dispatchEvent(new CustomEvent(MATRIX_SESSION_CHANGED_EVENT, { detail: { appUserId } }));
++  }
++}
++
++export function loadMatrixAvailability(): "ready" | "not_configured" | "unavailable" | null {
++  if (typeof window === "undefined") return null;
++  for (const storage of [window.localStorage, window.sessionStorage]) {
++    try {
++      const value = storage.getItem(MATRIX_AVAILABILITY_KEY);
++      if (value === "ready" || value === "not_configured" || value === "unavailable") return value;
++    } catch {
++      // Try the next storage.
++    }
++  }
++  return null;
++}
++
++export function saveMatrixAvailability(availability: "ready" | "not_configured" | "unavailable"): void {
++  if (typeof window === "undefined") return;
++  for (const storage of [window.localStorage, window.sessionStorage]) {
++    try {
++      storage.setItem(MATRIX_AVAILABILITY_KEY, availability);
++    } catch {
++      // Best effort.
++    }
++  }
++}
++
++/** Removes every stored copy of the session for this app user. */
++export function clearMatrixSession(appUserId?: number): void {
++  if (typeof window === "undefined") return;
++  for (const storage of [window.localStorage, window.sessionStorage]) {
++    try {
++      storage.removeItem(LEGACY_SESSION_KEY);
++      storage.removeItem(MATRIX_AVAILABILITY_KEY);
++      if (appUserId !== undefined) storage.removeItem(sessionStorageKey(appUserId));
++    } catch {
++      // Best effort.
++    }
++  }
++  if (appUserId === undefined) {
++    // Logout: drop sessions for all users that were ever stored in this browser.
++    for (const storage of [window.localStorage, window.sessionStorage]) {
++      try {
++        const doomed: string[] = [];
++        for (let index = 0; index < storage.length; index += 1) {
++          const key = storage.key(index);
++          if (key?.startsWith(SESSION_KEY_PREFIX)) doomed.push(key);
++        }
++        doomed.forEach((key) => storage.removeItem(key));
++      } catch {
++        // Best effort.
++      }
++    }
++  }
++}
++
++/**
++ * Rotates the access token through the app server, without a password prompt.
++ *
++ * Returns null when the session cannot be refreshed at all (no refresh token),
++ * and throws when the homeserver rejects the single-use token, so callers can
++ * distinguish "nothing to do" from "ask for the password once".
++ */
++export async function refreshMatrixSessionFromServer(
++  session: MatrixSession,
++): Promise<MatrixSession | null> {
++  if (typeof window === "undefined") return null;
++  const refreshToken = typeof session.refreshToken === "string" && session.refreshToken
++    ? session.refreshToken
++    : null;
++  if (!refreshToken) return null;
++
++  const response = await fetch("/api/auth/matrix-refresh", {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ refreshToken, deviceId: session.deviceId }),
++    cache: "no-store",
++  });
++  const data = (await response.json().catch(() => ({}))) as {
++    matrixSession?: unknown;
++    error?: string;
++  };
++  if (!response.ok) throw new Error(data.error || "Не удалось обновить Matrix-сессию");
++
++  const next = normalizeMatrixSession(data.matrixSession);
++  if (!next) throw new Error("Сервер вернул некорректную Matrix-сессию");
++  const appUserId = appUserIdFromMatrixUserId(next.userId);
++  if (appUserId !== null) saveMatrixSession(appUserId, next);
++  return next;
++}
++
++/**
++ * Reads the stored session and refreshes it first when the access token has
++ * expired or expires within a minute. This is the silent recovery path that a
++ * page reload used to lack.
++ */
++export async function loadUsableMatrixSession(appUserId: number): Promise<{
++  session: MatrixSession | null;
++  refreshFailed: boolean;
++  error?: string;
++}> {
++  const stored = loadMatrixSession(appUserId);
++  if (!stored) return { session: null, refreshFailed: false };
++  if (!isMatrixSessionExpired(stored)) return { session: stored, refreshFailed: false };
++
++  try {
++    const refreshed = await refreshMatrixSessionFromServer(stored);
++    if (refreshed) return { session: refreshed, refreshFailed: false };
++    // No refresh token: the token may still be accepted by the homeserver, so
++    // hand it over and let the sync layer report the real outcome.
++    return { session: stored, refreshFailed: false };
++  } catch (error) {
++    return {
++      session: null,
++      refreshFailed: true,
++      error: error instanceof Error ? error.message : "Не удалось обновить Matrix-сессию",
++    };
++  }
++}
++
++/**
++ * Lets other tabs adopt rotated tokens (a refresh token is single-use, so two
++ * tabs refreshing independently always invalidate each other).
++ */
++export function subscribeToMatrixSessionChanges(handler: () => void): () => void {
++  if (typeof window === "undefined") return () => undefined;
++  const onStorage = (event: StorageEvent) => {
++    if (event.key === null || event.key.startsWith(SESSION_KEY_PREFIX) || event.key === LEGACY_SESSION_KEY) {
++      handler();
++    }
++  };
++  const onLocal = () => handler();
++  window.addEventListener("storage", onStorage);
++  window.addEventListener(MATRIX_SESSION_CHANGED_EVENT, onLocal);
++  return () => {
++    window.removeEventListener("storage", onStorage);
++    window.removeEventListener(MATRIX_SESSION_CHANGED_EVENT, onLocal);
++  };
++}
+diff --git a/src/lib/notifications.ts b/src/lib/notifications.ts
+index 80e619c..1a1cc4c 100644
+--- a/src/lib/notifications.ts
++++ b/src/lib/notifications.ts
+@@ -12,6 +12,23 @@ interface NotifyChatMessageParams {
+   url?: string;
+ }
+ 
++export interface ChatPushFanOutResult {
++  configured: boolean;
++  recipients: number;
++  mutedRecipients: number;
++  sent: number;
++  failed: number;
++}
++
++interface FanOutParams {
++  chatId: number;
++  senderId: number;
++  title: string;
++  body: string;
++  url: string;
++  messageId?: number;
++}
++
+ /**
+  * Best-effort fan-out of a push notification to every chat member except the
+  * sender and muted members. Foreground suppression belongs in the service
+@@ -19,39 +36,47 @@ interface NotifyChatMessageParams {
+  * `lastSeen` is too coarse and used to drop pushes for up to a minute after a
+  * user backgrounds or closes the app. Failures are swallowed.
+  */
+-export async function notifyChatMessage({
++async function fanOutToChatMembers({
+   chatId,
+   senderId,
+-  textPreview,
+-  messageId,
+-  senderName,
++  title,
++  body,
+   url,
+-}: NotifyChatMessageParams) {
+-  try {
+-    const recipients = await db
+-      .select({
+-        id: users.id,
+-        muted: chatMembers.notificationsMuted,
+-      })
+-      .from(chatMembers)
+-      .innerJoin(users, eq(users.id, chatMembers.userId))
+-      .where(
+-        and(
+-          eq(chatMembers.chatId, chatId),
+-          ne(chatMembers.userId, senderId),
+-        ),
+-      );
++  messageId,
++}: FanOutParams): Promise<ChatPushFanOutResult> {
++  const recipients = await db
++    .select({
++      id: users.id,
++      muted: chatMembers.notificationsMuted,
++    })
++    .from(chatMembers)
++    .innerJoin(users, eq(users.id, chatMembers.userId))
++    .where(
++      and(
++        eq(chatMembers.chatId, chatId),
++        ne(chatMembers.userId, senderId),
++      ),
++    );
+ 
+-    await Promise.all(
+-      recipients.map(async (recipient) => {
+-        if (recipient.muted) return;
++  const eligibleRecipients = recipients.filter((recipient) => !recipient.muted);
++  const mutedRecipients = recipients.length - eligibleRecipients.length;
++  let sent = 0;
++  let failed = 0;
++  let configured = false;
++
++  await Promise.all(
++    eligibleRecipients.map(async (recipient) => {
++      try {
+         const result = await sendPushToUser(recipient.id, {
+-          title: senderName,
+-          body: textPreview.length > 100 ? `${textPreview.slice(0, 100)}…` : textPreview,
++          title,
++          body,
+           chatId,
+-          url: url || `/?chatId=${chatId}`,
++          url,
+           messageId,
+         });
++        configured = configured || result.configured;
++        sent += result.sent;
++        failed += result.failed;
+         if (result.configured && result.sent === 0) {
+           console.warn("No push delivery for chat message", {
+             chatId,
+@@ -60,13 +85,73 @@ export async function notifyChatMessage({
+             failed: result.failed,
+           });
+         }
+-      }),
+-    );
++      } catch (err) {
++        failed += 1;
++        console.error("Push recipient dispatch failed", {
++          chatId,
++          recipientId: recipient.id,
++          errorName: err instanceof Error ? err.name : "UnknownError",
++        });
++      }
++    }),
++  );
++
++  return { configured, recipients: eligibleRecipients.length, mutedRecipients, sent, failed };
++}
++
++export async function notifyChatMessage({
++  chatId,
++  senderId,
++  textPreview,
++  messageId,
++  senderName,
++  url,
++}: NotifyChatMessageParams): Promise<void> {
++  try {
++    await fanOutToChatMembers({
++      chatId,
++      senderId,
++      title: senderName,
++      body: textPreview.length > 100 ? `${textPreview.slice(0, 100)}…` : textPreview,
++      url: url || `/?chatId=${chatId}`,
++      messageId,
++    });
+   } catch (err) {
+     console.error("Push notification dispatch failed:", err);
+   }
+ }
+ 
++/**
++ * Notification for an end-to-end encrypted chat. Deliberately content-free:
++ * the plaintext never reaches this server, so the alert can only announce that
++ * something arrived. Unlike the encrypted relay in
++ * `/api/messages/matrix-push`, this path needs nothing but the app session, so
++ * a revoked Matrix device, a rotated access token or a re-created room can no
++ * longer turn into "private chats never notify".
++ */
++export async function notifyPrivateChatMessage({
++  chatId,
++  senderId,
++  senderName,
++}: {
++  chatId: number;
++  senderId: number;
++  senderName: string;
++}): Promise<ChatPushFanOutResult> {
++  try {
++    return await fanOutToChatMembers({
++      chatId,
++      senderId,
++      title: senderName,
++      body: "Новое сообщение в приватном чате",
++      url: `/?chatId=${chatId}`,
++    });
++  } catch (err) {
++    console.error("Private chat push fan-out failed:", err instanceof Error ? err.name : "UnknownError");
++    return { configured: false, recipients: 0, mutedRecipients: 0, sent: 0, failed: 1 };
++  }
++}
++
+ export function messagePreview(kind: string, content: string | null, fileName: string | null) {
+   if (kind === "text") return content?.trim() || "";
+   if (kind === "image") return `📷 ${fileName || "Фото"}`;
+diff --git a/src/lib/push-client.ts b/src/lib/push-client.ts
+index b6ff7c9..0374ba2 100644
+--- a/src/lib/push-client.ts
++++ b/src/lib/push-client.ts
+@@ -62,27 +62,27 @@ export async function getPushPermissionState(): Promise<NotificationPermission |
+ 
+ export async function subscribeToPush(): Promise<{ ok: boolean; error?: string; publicKey?: string | null; denied?: boolean; iosHint?: boolean }> {
+   if (!arePushNotificationsSupported()) {
+-    return { ok: false, error: "Браузер не поддерживает push-уведомления" };
++    return {
++      ok: false,
++      error: typeof window !== "undefined" && window.isSecureContext === false
++        ? "Push требует HTTPS: откройте приложение по https:// (или localhost)."
++        : "Браузер не поддерживает push-уведомления",
++    };
+   }
+-  try {
+-    const configRes = await fetch("/api/push/subscribe", { cache: "no-store" });
+-    const config = await configRes.json().catch(() => ({}));
+-    if (!configRes.ok || !config.configured || !config.publicKey) {
+-      return { ok: false, error: config.error || "Push-уведомления не настроены на сервере (задайте VAPID-ключи в .env)" };
+-    }
+ 
+-    // ready may remain pending forever if registration failed; use a bounded
+-    // wait and give the user an actionable error instead of a stuck button.
+-    const registration = await waitForActiveServiceWorker();
+-    if (!registration) {
+-      return { ok: false, error: "Service Worker не активировался. Проверьте HTTPS и доступность /sw.js, затем обновите страницу." };
+-    }
+-
+-    // If user already denied permission, report it clearly.
++  try {
++    // 1) Permission FIRST, while the button click is still the active user
++    //    gesture. Chrome only shows the prompt with a transient user
++    //    activation (~5s) and otherwise leaves the promise pending forever, so
++    //    awaiting the config and the service worker *before* asking used to
++    //    make the button look dead.
+     if (Notification.permission === "denied") {
+-      return { ok: false, denied: true, error: "Уведомления заблокированы в настройках браузера. Разрешите их в адресной строке и повторите." };
++      return {
++        ok: false,
++        denied: true,
++        error: "Уведомления заблокированы в настройках браузера. Разрешите их в адресной строке и повторите.",
++      };
+     }
+-
+     let permission: NotificationPermission = Notification.permission;
+     if (permission === "default") {
+       try {
+@@ -90,12 +90,30 @@ export async function subscribeToPush(): Promise<{ ok: boolean; error?: string;
+       } catch {
+         permission = Notification.permission;
+       }
+-    }
+-    if (permission !== "granted") {
+-      if (permission === "denied") {
+-        return { ok: false, denied: true, error: "Уведомления заблокированы в настройках браузера." };
++      if (permission !== "granted") {
++        return permission === "denied"
++          ? { ok: false, denied: true, error: "Разрешение на уведомления не выдано." }
++          : { ok: false, error: "Разрешение на уведомления не выдано." };
+       }
+-      return { ok: false, error: "Разрешение на уведомления не выдано." };
++    }
++
++    // 2) Now the server config and the service worker.
++    const configRes = await fetch("/api/push/subscribe", { cache: "no-store" });
++    const config = await configRes.json().catch(() => ({}));
++    if (!configRes.ok || !config.configured || !config.publicKey) {
++      const missing = Array.isArray(config.missingEnv) ? (config.missingEnv as string[]).join(", ") : "";
++      return {
++        ok: false,
++        error: config.error
++          || `Push-уведомления не настроены на сервере${missing ? ` (не задано: ${missing})` : " (задайте VAPID-ключи и VAPID_EMAIL в .env)"}`,
++      };
++    }
++
++    // ready may remain pending forever if registration failed; use a bounded
++    // wait and give the user an actionable error instead of a stuck button.
++    const registration = await waitForActiveServiceWorker();
++    if (!registration) {
++      return { ok: false, error: "Service Worker не активировался. Проверьте HTTPS и доступность /sw.js, затем обновите страницу." };
+     }
+ 
+     const { isIOS, isStandalone } = isIosSafari();
+diff --git a/src/lib/push.ts b/src/lib/push.ts
+index e018995..7ad3f70 100644
+--- a/src/lib/push.ts
++++ b/src/lib/push.ts
+@@ -3,24 +3,56 @@ import { eq } from "drizzle-orm";
+ import { db } from "@/db";
+ import { pushSubscriptions } from "@/db/schema";
+ 
++/**
++ * Per-delivery deadline. A VPS that cannot reach FCM/Mozilla push would
++ * otherwise keep `POST /api/messages` awaiting forever, which looks like "the
++ * message never sends" rather than "push is broken".
++ */
++const PUSH_SEND_TIMEOUT_MS = 10_000;
++
++function envValue(name: string): string {
++  // Trailing spaces/CR from a hand-edited .env silently break base64 decoding
++  // on the client, so every VAPID value is trimmed here.
++  return process.env[name]?.trim() ?? "";
++}
++
++/** Which VAPID variables are missing - surfaced by /api/push/status and /api/health. */
++export function missingPushEnv(): string[] {
++  const missing: string[] = [];
++  if (!getVapidPublicKey()) missing.push("VAPID_PUBLIC_KEY");
++  if (!envValue("VAPID_PRIVATE_KEY")) missing.push("VAPID_PRIVATE_KEY");
++  if (!vapidSubject()) missing.push("VAPID_EMAIL");
++  return missing;
++}
++
+ export function isPushConfigured(): boolean {
+-  return Boolean(
+-    (process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY)
+-    && process.env.VAPID_PRIVATE_KEY
+-    && process.env.VAPID_EMAIL,
+-  );
++  return missingPushEnv().length === 0;
+ }
+ 
+-export function getVapidPublicKey(): string | null {
+-  return process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY || null;
++export function getVapidPublicKey(): string {
++  return envValue("VAPID_PUBLIC_KEY") || envValue("NEXT_PUBLIC_VAPID_PUBLIC_KEY");
+ }
+ 
+-function configureWebPush() {
+-  const email = process.env.VAPID_EMAIL || "mailto:admin@example.com";
+-  const pub = process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY || "";
+-  const priv = process.env.VAPID_PRIVATE_KEY || "";
+-  if (!pub || !priv) return false;
+-  webpush.setVapidDetails(email, pub, priv);
++/**
++ * `web-push` rejects anything that is not an `https:` or `mailto:` URL, and the
++ * error it throws escapes before any notification is sent - which is how a bare
++ * `VAPID_EMAIL=admin@example.com` disables push while the logs show nothing but
++ * `errorName: Error`.
++ */
++export function vapidSubject(): string {
++  const configured = envValue("VAPID_EMAIL");
++  if (!configured) return "";
++  if (/^(https?|mailto):/i.test(configured)) return configured;
++  if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(configured)) return `mailto:${configured}`;
++  return "";
++}
++
++function configureWebPush(): boolean {
++  const subject = vapidSubject();
++  const publicKey = getVapidPublicKey();
++  const privateKey = envValue("VAPID_PRIVATE_KEY");
++  if (!subject || !publicKey || !privateKey) return false;
++  webpush.setVapidDetails(subject, publicKey, privateKey);
+   return true;
+ }
+ 
+@@ -42,20 +74,43 @@ export interface PushSendResult {
+   failed: number;
+   removed: number;
+   failureStatusCodes: number[];
++  missingEnv?: string[];
+ }
+ 
+-const emptyPushResult = (configured: boolean): PushSendResult => ({
+-  configured,
++const emptyPushResult = (): PushSendResult => ({
++  configured: false,
+   subscriptions: 0,
+   sent: 0,
+   failed: 0,
+   removed: 0,
+   failureStatusCodes: [],
++  missingEnv: missingPushEnv(),
+ });
+ 
++async function sendWithTimeout(
++  subscription: { endpoint: string; keys: { p256dh: string; auth: string } },
++  payload: string,
++): Promise<void> {
++  let timer: ReturnType<typeof setTimeout> | undefined;
++  // `Promise.race` subscribes to the delivery promise immediately, so a provider
++  // error that arrives after the deadline cannot become an unhandled rejection.
++  const guard = new Promise<"timeout">((resolve) => {
++    timer = setTimeout(() => resolve("timeout"), PUSH_SEND_TIMEOUT_MS);
++  });
++  try {
++    const outcome = await Promise.race([
++      webpush.sendNotification(subscription, payload, { TTL: 60 * 15 }).then(() => "sent" as const),
++      guard,
++    ]);
++    if (outcome === "timeout") throw new Error("Push provider did not answer in time");
++  } finally {
++    if (timer !== undefined) clearTimeout(timer);
++  }
++}
++
+ export async function sendPushToUser(userId: number, payload: PushPayload): Promise<PushSendResult> {
+-  if (!isPushConfigured()) return emptyPushResult(false);
+-  if (!configureWebPush()) return emptyPushResult(false);
++  if (!isPushConfigured()) return emptyPushResult();
++  if (!configureWebPush()) return emptyPushResult();
+ 
+   const subs = await db
+     .select()
+@@ -71,10 +126,9 @@ export async function sendPushToUser(userId: number, payload: PushPayload): Prom
+   await Promise.all(
+     subs.map(async (sub) => {
+       try {
+-        await webpush.sendNotification(
++        await sendWithTimeout(
+           { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+           json,
+-          { TTL: 60 * 15 },
+         );
+         sent += 1;
+       } catch (err: unknown) {
+@@ -89,6 +143,9 @@ export async function sendPushToUser(userId: number, payload: PushPayload): Prom
+           userId,
+           statusCode: typeof status === "number" ? status : null,
+           errorName: err instanceof Error ? err.name : "UnknownError",
++          errorMessage: err instanceof Error && !("statusCode" in (err as object))
++            ? err.message.slice(0, 200)
++            : undefined,
+         });
+         // 404 / 410 = subscription expired or was revoked.
+         if (status === 404 || status === 410) toDelete.push(sub.id);
